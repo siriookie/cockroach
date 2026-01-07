@@ -741,113 +741,99 @@ var _ RestrictedInternalClient = internalClientAdapter{}
 // The caller can set separateTracers to indicate that the
 // caller and callee use separate tracers, so we can't
 // use a child tracing span directly.
-func makeInternalClientAdapter(
-	server kvpb.InternalServer,
-	clientTenantID roachpb.TenantID,
-	separateTracers bool,
-	clientUnaryInterceptors []grpc.UnaryClientInterceptor,
-	clientStreamInterceptors []grpc.StreamClientInterceptor,
-	serverUnaryInterceptors []grpc.UnaryServerInterceptor,
-	serverStreamInterceptors []grpc.StreamServerInterceptor,
-) internalClientAdapter {
-	// We're going to chain the unary interceptors together in single functions
-	// that run all of them, and we're going to memo-ize the resulting functions
-	// so that we don't need to generate them on the fly for every RPC call. We
-	// can't do that for the streaming interceptors, unfortunately, because the
-	// handler that these interceptors need to ultimately run needs to be
-	// allocated specifically for every call. For the client interceptors, the
-	// handler needs to capture a pipe used to communicate results, and for server
-	// interceptors the handler needs to capture the request arguments.
+// makeInternalClientAdapter constructs a internalClientAdapter.
+//
+// makeInternalClientAdapter 是 CockroachDB 中实现“本地内部客户端适配器”（internalClientAdapter）的核心函数。
+// 它的目标：**让本节点内部对自身的 RPC 调用（尤其是最常用的 Batch RPC）看起来像一个正常的 gRPC 调用**，
+// 但实际执行时完全绕过网络层、gRPC 序列化、ClientConn 等，直接本地函数调用，同时保留所有拦截器（interceptors）的功能。
+// 这是一种高性能优化：本地调用避免了不必要的开销，但行为必须与远程调用完全一致（tracing、限流、认证、租户隔离等）。
 
-	// batchServerHandler wraps a server.Batch() call with all the server
-	// interceptors.
+func makeInternalClientAdapter(
+	server kvpb.InternalServer, // 本地 KV 服务实现（s.node）
+	clientTenantID roachpb.TenantID, // 调用方的租户 ID（可能是 secondary tenant）
+	separateTracers bool, // 是否使用独立的 tracer（多租户共享进程时为 true）
+	clientUnaryInterceptors []grpc.UnaryClientInterceptor, // 客户端 unary 拦截器链
+	clientStreamInterceptors []grpc.StreamClientInterceptor, // 客户端 stream 拦截器链
+	serverUnaryInterceptors []grpc.UnaryServerInterceptor, // 服务端 unary 拦截器链
+	serverStreamInterceptors []grpc.StreamServerInterceptor, // 服务端 stream 拦截器链
+) internalClientAdapter {
+
+	// 注释解释了设计思路：
+	// - unary 拦截器可以预先链成一个函数并缓存（memoize），因为它们是无状态的。
+	// - stream 拦截器无法缓存，因为每次调用需要为特定的 stream 分配 handler（涉及 pipe、request 参数等）。
+
+	// 第一步：为 Batch RPC 构建服务端拦截器链
+	// chainUnaryServerInterceptors 将所有 serverUnaryInterceptors 串联起来，
+	// 最终调用 server.Batch()（真正的 KV 处理函数）
 	batchServerHandler := chainUnaryServerInterceptors(
 		&grpc.UnaryServerInfo{
 			Server:     server,
-			FullMethod: tracingutil.BatchMethodName,
+			FullMethod: tracingutil.BatchMethodName, // "/cockroach.roachpb.Internal/Batch"
 		},
 		serverUnaryInterceptors,
 		func(ctx context.Context, req interface{}) (interface{}, error) {
+			// 最底层的真实处理：调用 server.Batch()
 			br, err := server.Batch(ctx, req.(*kvpb.BatchRequest))
 			return br, err
 		},
 	)
-	// batchClientHandler wraps batchServer handler with all the client
-	// interceptors. So we're going to get a function that calls all the client
-	// interceptors, then all the server interceptors, and bottoms out with
-	// calling server.Batch().
+
+	// 第二步：再在服务端 handler 外面包裹客户端拦截器链
+	// getChainUnaryInvoker 递归构建客户端拦截器链，最终调用上面的 batchServerHandler
 	batchClientHandler := getChainUnaryInvoker(clientUnaryInterceptors, 0, /* curr */
 		func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+			// 这就是链的最底层：调用服务端 handler
 			resp, err := batchServerHandler(ctx, req)
 			if resp != nil {
 				br := resp.(*kvpb.BatchResponse)
 				if br != nil {
+					// 把服务端返回复制到客户端预分配的 reply 中
 					*(reply.(*kvpb.BatchResponse)) = *br
 				}
 			}
 			return err
 		})
 
+	// 返回适配器结构体，最重要的是 batchHandler：一个函数，外部代码通过它执行本地 Batch RPC
 	return internalClientAdapter{
 		server:                   server,
 		clientTenantID:           clientTenantID,
 		separateTracers:          separateTracers,
 		clientStreamInterceptors: clientStreamInterceptors,
 		serverStreamInterceptors: serverStreamInterceptors,
+
+		// 核心：本地 Batch RPC 的执行函数
 		batchHandler: func(ctx context.Context, ba *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
+			// 浅拷贝请求，防止外部修改影响内部
 			ba = ba.ShallowCopy()
-			// Mark this as originating locally, which is useful for the decision about
-			// memory allocation tracking.
+
+			// 标记为本地来源（用于内存会计、admission control 等区分本地/远程）
 			ba.AdmissionHeader.SourceLocation = kvpb.AdmissionHeader_LOCAL
-			// reply serves to communicate the RPC response from the RPC handler (through
-			// the server interceptors) to the client interceptors. The client
-			// interceptors will have a chance to modify it, and ultimately it will be
-			// returned to the caller. Unfortunately, we have to allocate here: because of
-			// how the gRPC client interceptor interface works, interceptors don't get
-			// a result from the next interceptor (and eventually from the server);
-			// instead, the result is allocated by the client. We'll copy the
-			// server-side result into reply in batchHandler().
+
+			// 预分配回复对象（gRPC 客户端拦截器接口要求客户端分配 reply）
 			reply := new(kvpb.BatchResponse)
 
-			// Create a new context from the existing one with the "local request"
-			// field set. This tells the handler that this is an in-process request,
-			// bypassing ctx.Peer checks. This call also overwrites any possibly
-			// existing info in the context. This is important in situations where a
-			// shared-process tenant calls into the local KV node, and that local RPC
-			// ends up performing another RPC to the local node. The inner RPC must
-			// carry the identity of the system tenant, not the one of the client of
-			// the outer RPC.
+			// 创建新的上下文，标记为“本地请求”（grpcutil.NewLocalRequestContext）
+			// 这会绕过某些检查（如 peer 检查），并确保租户 ID 正确传递
+			// 特别重要：在共享进程多租户模式下，内部嵌套调用时要用系统租户身份
 			ctx = grpcutil.NewLocalRequestContext(ctx, clientTenantID)
 
-			// Clear any leftover gRPC incoming metadata, if this call
-			// is originating from a RPC handler function called as
-			// a result of a tenant call. This is this case:
-			//
-			//    tenant -(rpc)-> tenant -(rpc)-> KV
-			//                            ^ YOU ARE HERE
-			//
-			// at this point, the left side RPC has left some incoming
-			// metadata in the context, but we need to get rid of it
-			// before we let the call go through KV.
+			// 清除上下文中的 incoming metadata（可能来自外部租户 RPC），防止污染内部调用
 			ctx = grpcutil.ClearIncomingContext(ctx)
 
-			// If the caller and callee use separate tracers, we make things
-			// look closer to a remote call from the tracing point of view.
+			// 多租户共享进程时，调用方和 KV 层使用不同 tracer
 			if separateTracers {
 				sp := tracing.SpanFromContext(ctx)
 				if sp != nil {
-					// Fill in ba.TraceInfo. For remote RPCs (not done throught the
-					// internalClientAdapter), this is done by the TracingInternalClient
+					// 把当前 span 的元数据塞到 BatchRequest.TraceInfo 中（模拟远程 RPC 的 tracing 传递）
 					ba = ba.ShallowCopy()
 					ba.TraceInfo = sp.Meta().ToProto()
 				}
-				// Wipe the span from context. The server will create a root span with a
-				// different Tracer, based on remote parent information provided by the
-				// TraceInfo above. If we didn't do this, the server would attempt to
-				// create a child span with its different Tracer, which is not allowed.
+				// 从 ctx 中移除当前 span，服务端会基于 TraceInfo 创建新的 root span（不同 tracer）
 				ctx = tracing.ContextWithSpan(ctx, nil)
 			}
 
+			// 执行完整的拦截器链：client interceptors → server interceptors → server.Batch()
 			err := batchClientHandler(ctx, tracingutil.BatchMethodName, ba, reply, nil /* ClientConn */)
 			return reply, err
 		},
@@ -1359,22 +1345,41 @@ func IsLocal(iface RestrictedInternalClient) bool {
 // SetLocalInternalServer links the local server to the Context, allowing some
 // RPCs to bypass gRPC.
 //
+// SetLocalInternalServer 方法的功能：
+// 为 RPC 上下文（rpcCtx）绑定一个本地内部服务器（internalServer），
+// 使某些 RPC 调用（尤其是节点内部对自身的调用）可以绕过完整的 gRPC 协议栈，直接本地执行。
+
 // serverInterceptors lists the interceptors that will be run on RPCs done
 // through this local server.
+// serverInterceptors 和 clientInterceptors：即使是本地调用，也会应用指定的 gRPC 拦截器（interceptors），
+// 确保日志、tracing、限流、认证等行为与远程 RPC 一致。
+
 func (rpcCtx *Context) SetLocalInternalServer(
-	internalServer kvpb.InternalServer,
-	serverInterceptors ServerInterceptorInfo,
-	clientInterceptors ClientInterceptorInfo,
+	internalServer kvpb.InternalServer, // 本地 KV 节点的服务实现（这里是 s.node）
+	serverInterceptors ServerInterceptorInfo, // 服务端拦截器信息
+	clientInterceptors ClientInterceptorInfo, // 客户端拦截器信息
 ) {
+	// 获取调用方的租户 ID（clientTenantID）
 	clientTenantID := rpcCtx.TenantID
+
+	// 是否使用独立的 tracer
 	separateTracers := false
 	if !clientTenantID.IsSystem() {
-		// This is a secondary tenant server in the same process as the KV
-		// layer (shared-process multitenancy). In this case, the caller
-		// and the callee use separate tracers, so we can't mix and match
-		// tracing spans.
+		// 情况：共享进程的多租户模式（shared-process multitenancy）
+		// 即 secondary tenant（非系统租户）和系统租户（KV 层）运行在同一个进程中
+		// 此时，调用方（tenant）和被调用方（KV 节点）使用不同的 OpenTelemetry tracer
+		// 如果混用 tracing span，会导致追踪混乱，因此必须标记为 separateTracers = true
 		separateTracers = true
 	}
+
+	// 创建一个“内部客户端适配器”（internal client adapter）
+	// 这个适配器包装了 internalServer，使其看起来像一个正常的 gRPC 客户端
+	// 但实际调用时直接本地执行 internalServer 的方法（不走网络）
+	// 参数包括：
+	//   - internalServer：真正的服务实现
+	//   - clientTenantID：调用方租户 ID（用于权限检查等）
+	//   - separateTracers：是否需要隔离 tracing
+	//   - 客户端和服务端的 unary/stream 拦截器（确保行为一致）
 	rpcCtx.localInternalClient = makeInternalClientAdapter(
 		internalServer,
 		clientTenantID,

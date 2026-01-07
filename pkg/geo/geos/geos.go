@@ -84,17 +84,38 @@ func ensureInitInternal() (*C.CR_GEOS, error) {
 
 // ensureInits behaves as described in EnsureInit, but also returns the GEOS
 // C object which should be hidden from the public eye.
+
+// ensureInit 是 CockroachDB 中 GEOS 库初始化的核心内部函数。
+// 它与更高层的 EnsureInit 行为类似，但额外返回了底层 C 的 GEOS 对象指针（*C.CR_GEOS），这个指针是 cgo 生成的 C 结构体，**绝不能暴露给公共 API**（因此函数名是小写的 ensureInit，表示内部使用）。
+
 func ensureInit(
-	errDisplay EnsureInitErrorDisplay, flagLibraryDirectoryValue string, crdbBinaryLoc string,
-) (*C.CR_GEOS, error) {
+	errDisplay EnsureInitErrorDisplay, // 错误显示策略：是否对外暴露详细错误（公共 vs 私有）
+	flagLibraryDirectoryValue string, // 用户通过 --geo-libs-dir 参数指定的外部 GEOS 库目录
+	crdbBinaryLoc string, // CockroachDB 二进制文件的路径（用于查找内置捆绑库）
+) (*C.CR_GEOS, error) { // 返回：GEOS 的 C 对象指针 + 可能的错误
+
+	// geosOnce 是一个 sync.Once 变量，确保整个进程生命周期中 GEOS 初始化只执行一次（线程安全）
 	geosOnce.once.Do(func() {
+		// 实际执行初始化的函数：initGEOS
+		// 参数：通过 findLibraryDirectories 查找可能的 GEOS 库目录列表
+		//   - 优先使用用户指定的 --geo-libs-dir
+		//   - 其次尝试二进制文件旁边的 bundled 目录（CockroachDB 自带的 GEOS）
 		geosOnce.geos, geosOnce.loc, geosOnce.err = initGEOS(
 			findLibraryDirectories(flagLibraryDirectoryValue, crdbBinaryLoc),
 		)
 	})
+
+	// 初始化失败后的错误处理策略
 	if geosOnce.err != nil && errDisplay == EnsureInitErrorDisplayPublic {
+		// 如果是“公共”错误显示模式（即 SQL 层调用时），不暴露底层加载失败的细节（如路径、系统错误）
+		// 而是返回一个简洁、用户友好的 PG 错误：操作不可用
+		// 这样可以防止敏感路径信息泄露到客户端
 		return nil, pgerror.Newf(pgcode.System, "geos: this operation is not available")
 	}
+
+	// 返回实际的 C 对象指针和原始错误（如果有）
+	// - 如果初始化成功：返回指针 + nil
+	// - 如果失败且是内部调用（EnsureInitErrorDisplayPrivate）：返回 nil + 原始错误（供日志使用）
 	return geosOnce.geos, geosOnce.err
 }
 
@@ -188,20 +209,65 @@ func findLibraryDirectoriesInParentingDirectories(dir string) []string {
 
 // initGEOS initializes the CR_GEOS by attempting to dlopen all
 // the paths as parsed in by locs.
-func initGEOS(dirs []string) (*C.CR_GEOS, string, error) {
-	var err error
+
+// initGEOS 是 CockroachDB 中实际执行 GEOS 库加载和初始化的底层函数。
+// 它会按顺序尝试从多个目录（dirs）中动态加载（dlopen）GEOS 的两个动态库：
+//   - libgeos_c.so（C 接口库）
+//   - libgeos.so（核心几何引擎库）
+// 只要有一对库加载成功并初始化成功，就返回对应的 C 对象指针。
+
+func initGEOS(dirs []string) (*C.CR_GEOS, string, error) { // 返回：GEOS 对象指针、成功加载的目录、错误
+	var err error // 用于累计所有尝试失败的错误
+
+	// 遍历所有候选目录（通常是：用户指定的 --geo-libs-dir + 二进制内置目录）
 	for _, dir := range dirs {
-		var ret *C.CR_GEOS
+		var ret *C.CR_GEOS // 用于接收 C.CR_GEOS_Init 返回的指针
+
+		// 调用 C 函数 CR_GEOS_Init 尝试初始化
+		// 参数：
+		//   - 第一个：libgeos_c.so 的完整路径（通过 getLibraryExt 处理平台差异，如 .so / .dylib）
+		//   - 第二个：libgeos.so 的完整路径
+		//   - 第三个：输出参数，接收初始化成功的 CR_GEOS 对象
+		//动态加载机制（dlopen）：
+		//使用 cgo 调用自定义的 C 函数 CR_GEOS_Init，内部会执行 dlopen 加载两个 GEOS 动态库。
+		//CockroachDB 没有直接链接 GEOS，而是运行时动态加载，这样可以：
+		//支持可选的空间功能（库缺失不影响启动）。
+		//允许用户替换为自定义版本的 GEOS（通过 --geo-libs-dir）。
+		//
+		//
+		//多路径尝试：
+		//dirs 通常包含：
+		//用户指定的目录（--geo-libs-dir）。
+		//CockroachDB 二进制文件内置的 bundled GEOS 目录。
+		//
+		//按顺序尝试，直到成功加载一对有效的 libgeos.so + libgeos_c.so。
+		//
+		//平台兼容性：
+		//getLibraryExt 会根据操作系统返回正确的库后缀（如 Linux: .so, macOS: .dylib）。
+		//goToCSlice 是 Go 字节切片转 C 字节数组的辅助函数（cgo 需要）。
+		//
+		//错误处理：
+		//每个目录失败都会累计错误（errors.CombineErrors），最终如果全失败，会包装成一个统一的错误。
+		//wrapGEOSInitError 可能是进一步清理或标记错误类型，供上层判断。
+		//
+		//成功返回：
+		//返回 *C.CR_GEOS：一个不透明的 C 结构体指针，后续所有空间函数（如 ST_Contains）都会通过这个对象调用 GEOS 的 C API。
+		//返回成功加载的目录：用于日志记录“GEOS loaded from directory ...”。
 		newErr := statusToError(
 			C.CR_GEOS_Init(
-				goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeoscFileName)))),
-				goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeosFileName)))),
+				goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeoscFileName)))), // libgeos_c
+				goToCSlice([]byte(filepath.Join(dir, getLibraryExt(libgeosFileName)))),  // libgeos
 				&ret,
 			),
 		)
+
+		// 如果初始化成功（newErr == nil）
 		if newErr == nil {
+			// 立即返回成功结果：GEOS 对象、加载目录、nil 错误
 			return ret, dir, nil
 		}
+
+		// 如果失败，记录本次错误（用 errors.CombineErrors 累计所有失败原因，便于调试）
 		err = errors.CombineErrors(
 			err,
 			errors.Wrapf(
@@ -211,12 +277,16 @@ func initGEOS(dirs []string) (*C.CR_GEOS, string, error) {
 			),
 		)
 	}
+
+	// 所有目录都尝试失败
 	if err != nil {
+		// 包装累计的错误，返回一个统一的 GEOS 初始化错误
 		return nil, "", wrapGEOSInitError(errors.Wrap(err, "geos: error during GEOS init"))
 	}
+
+	// dirs 为空（理论上不应该发生）
 	return nil, "", wrapGEOSInitError(errors.Newf("geos: no locations to init GEOS"))
 }
-
 func wrapGEOSInitError(err error) error {
 	page := "linux"
 	switch runtime.GOOS {

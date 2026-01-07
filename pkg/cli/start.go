@@ -184,6 +184,11 @@ func initTraceDir(ctx context.Context, dir string) {
 	}
 }
 
+// SQL 操作的磁盘溢出：比如排序（ORDER BY 无 LIMIT）、哈希连接（hash joins）、聚合、行容器（row containers）等 DistSQL 处理器，当处理的数据量太大、无法全部放进内存时，会把中间结果临时写到磁盘。
+// 大批量导入（IMPORT）：IMPORT 操作特别依赖它，所有导入的数据都会先缓冲到 temp store 中，进行排序和处理。
+// 其他需要临时缓冲大量数据的 SQL 操作。
+//
+// 它本质上是一个独立的存储实例（基于 Pebble/RocksDB），但使用模式和主存储不同：写一大批数据、读一遍就删，不需要持久化。节点启动时会清理旧的临时目录。
 func initTempStorageConfig(
 	ctx context.Context, st *cluster.Settings, stopper *stop.Stopper, stores base.StoreSpecList,
 ) (base.TempStorageConfig, error) {
@@ -196,6 +201,14 @@ func initTempStorageConfig(
 	// Note that we already cleaned up any abandoned temporary directories from
 	// the previous process earlier in the startup sequence (see
 	// reclaimDiskSpace).
+	//初始化临时存储的目标目录。
+	//如果系统中启用了任何形式的“静态加密”（encryption at rest，即数据在磁盘上存储时加密），
+	//那么临时存储目录也应该同样被加密。为了实现这一点，
+	//我们会优先选择列表中第一个已启用加密的存储（store）作为临时目录的目标。
+	//如果找不到任何加密的存储，就使用列表中的第一个 StoreSpec（存储规格）。
+	//注意： 在启动序列的早期，我们已经清理了上一个进程遗留的任何废弃临时目录（参见 reclaimDiskSpace 函数）。
+	//简单来说，这是数据库（如 CockroachDB）或其他分布式存储系统在启动时，选择临时文件目录的逻辑，
+	//目的是确保如果主存储支持加密，临时文件也不会泄露明文数据，同时提到之前已经处理了旧的临时垃圾目录。
 	specIdxDisk := -1
 	specIdxEncrypted := -1
 	for i, spec := range stores.Specs {
@@ -249,16 +262,19 @@ func initTempStorageConfig(
 		return base.TempStorageConfig{}, err
 	}
 	if !startCtx.diskTempStorageSizeValue.IsSet() {
-		// The default temp storage size is different when the temp
-		// storage is in memory (which occurs when no temp directory
-		// is specified and the first store is in memory).
+		// 如果用户没有显式设置磁盘临时存储的大小（即 --max-disk-temp-storage 参数未被设置）
+		// 那么我们需要使用默认值
 		if startCtx.tempDir == "" && useStore.InMemory {
+			// 情况1：临时存储目录未指定（tempDir == ""），并且第一个主存储是内存存储（InMemory）
+			// 这意味着整个节点运行在纯内存模式，临时存储也会落在内存中
+			// 此时使用较小的默认上限，防止内存被临时数据耗尽
 			tempStorageMaxSizeBytes = base.DefaultInMemTempStorageMaxSizeBytes
 		} else {
+			// 情况2：其他所有情况（包括有指定 tempDir，或第一个 store 是磁盘存储）
+			// 临时存储会落在磁盘上，可以使用更大的默认上限
 			tempStorageMaxSizeBytes = base.DefaultTempStorageMaxSizeBytes
 		}
 	}
-
 	// If all stores are in-memory and no temp dir was specified, the temp
 	// store will also be in memory. This is a testing scenario.
 	if startCtx.tempDir == "" && useStore.InMemory {
@@ -406,6 +422,9 @@ func runStartInternal(
 	// If executing in the background, the function returns ok == true in
 	// the parent process (regardless of err) and the parent exits at
 	// this point.
+	//首先要处理的是： 如果用户想要在后台处理（运行），
+	//程序应通过 fork（派生子进程） 和 exit（退出当前进程） 的方式，尽快（ASAP）让出对终端控制台的控制权。
+	//如果程序设定为在后台执行，该函数在父进程中会返回 ok == true（无论是否报错），随后父进程会在此处直接退出。
 	if ok, err := maybeRerunBackground(); ok {
 		return err
 	}
@@ -415,6 +434,9 @@ func runStartInternal(
 	// We're considering everything produced by a cockroach node
 	// to potentially contain sensitive information, so it should
 	// not be world-readable.
+	//修改所有新建文件的权限掩码（permission mask）。
+	//我们认为 CockroachDB 节点生成的任何内容都可能包含敏感信息，
+	//因此这些内容不应该对系统中所有用户可见（world-readable）
 	disableOtherPermissionBits()
 
 	// Set up the signal handlers. This also ensures that any of these
@@ -424,6 +446,10 @@ func runStartInternal(
 	// logging uses buffering, and we want to be able to sync
 	// the buffers in the signal handler below. If we started capturing
 	// signals later, some startup logging might be lost.
+	//设置信号处理器（Signal Handlers）。
+	//这也确保了从此刻起收到的任何（系统）信号，在运行到下文具体的信号检查点之前，都不会中断程序的启动流程。
+	//我们希望在启动日志记录之前就设置好信号处理，因为日志记录使用了缓冲机制（buffering），
+	//而我们希望能在下文的信号处理器中同步（sync，即强制写入磁盘）这些缓冲区
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, DrainSignals...)
 	if exitAbruptlySignal != nil {
@@ -441,6 +467,9 @@ func runStartInternal(
 	// that the process continues to exit with the Disk Full exit code. A
 	// flapping exit code can affect alerting, including the alerting
 	// performed within CockroachCloud.
+	//检查存储目录（stores）是否存在磁盘空间已满的情况，如果已满，
+	//则带着一个**具有明确含义的退出状态码（exit code）**退出程序。这一检查必须在启动过程的早期阶段进行，
+	//要在对文件系统执行任何写入操作（包括日志滚动处理）之前完成。
 	if err := exitIfDiskFull(ctx, vfs.Default, serverCfg.Stores.Specs); err != nil {
 		return err
 	}
@@ -454,6 +483,7 @@ func runStartInternal(
 	// Set a MakeProcessUnavailableFunc that will close all sockets. This guards
 	// against a persistent disk stall that prevents the process from exiting or
 	// making progress.
+	//这段代码设置了一个“自杀预案”。如果日志系统发现磁盘长时间无响应（无法写日志），它会调用 closeAllSockets。
 	log.SetMakeProcessUnavailableFunc(closeAllSockets)
 
 	// The context annotation ensures that server identifiers show up
@@ -471,6 +501,10 @@ func runStartInternal(
 	// infrastructure below.  This span concludes when the startup
 	// goroutine started below has completed.  TODO(andrei): we don't
 	// close the span on the early returns below.
+	//：为“服务器启动”这个过程开启一个追踪跨度（Tracing Span）。
+	//
+	//意义：数据库启动包含成百上千个步骤（加载配置、初始化磁盘、开启网络等）。通过这个 Span，
+	//开发者可以在可视化界面（如 Jaeger 或 Zipkin）中清晰地看到启动过程中每一步花了多少时间，哪一步卡住了。
 	var startupSpan *tracing.Span
 	ctx, startupSpan = ambientCtx.AnnotateCtxWithSpan(ctx, "server start")
 
@@ -630,20 +664,51 @@ func runStartInternal(
 		return err
 	}
 
-	// The configuration is now ready to report to the user and the log
-	// file. We had to wait after InitNode() so that all configuration
-	// environment variables, which are reported too, have been read and
-	// registered.
+	// The configuration is now ready to report to the user and the log file.
+	// 配置现在已经完全就绪，可以向用户（例如通过启动日志或 --verbosity 输出）和日志文件报告当前的配置内容。
+
+	// We had to wait after InitNode() so that all configuration environment variables,
+	// which are reported too, have been read and registered.
+	// 之所以必须等到 InitNode() 执行完成后才能报告配置，是因为：
+	//   - CockroachDB 的很多配置参数可以通过环境变量（ENV VARIABLES）来覆盖命令行参数。
+	//   - 这些环境变量的解析和注册工作是在 InitNode()（或更早的初始化阶段）中完成的。
+	//   - 在 InitNode() 之前调用 reportConfiguration()，会导致部分环境变量覆盖的配置项还没有生效，报告出来的配置不准确或不完整。
+	//   - 因此，这里特意等到 InitNode() 之后，确保所有配置来源（命令行标志、环境变量、集群设置等）都已经完全加载和应用完毕，再统一打印/记录最终生效的配置。
+
+	// reportConfiguration(ctx)
+	// 这个函数会：
+	//   - 将所有生效的命令行参数、环境变量覆盖的配置、存储路径、临时存储配置等信息格式化输出。
+	//   - 通常出现在节点启动日志的最开头部分，便于用户和运维人员快速了解当前节点到底使用了哪些配置启动。
+	//   - 同时也会记录到日志文件中，方便后续排查问题。
 	reportConfiguration(ctx)
 
 	// ReadyFn will be called when the server has started listening on
 	// its network sockets, but perhaps before it has done bootstrapping
 	// and thus before Start() completes.
-	serverCfg.ReadyFn = func(waitForInit bool) { reportReadinessExternally(ctx, cmd, waitForInit) }
+	// ReadyFn 是一个回调函数（callback），会在服务器开始在网络端口上监听（即网络 socket 已就绪，能接受外部连接）时被调用，
+	// 但此时服务器可能还没有完成完整的初始化（bootstrapping），因此 Start() 方法可能还未返回。
 
-	// DelayedBootstrapFn will be called if the bootstrap process is
-	// taking a bit long.
+	// 具体来说：
+	//   - CockroachDB 节点启动时，Start() 方法会启动各种组件（gRPC/HTTP 服务、存储引擎初始化、集群引导等），这个过程可能需要几秒到几十秒。
+	//   - 一旦网络监听端口（SQL、RPC、HTTP 等）开启，外部客户端（如负载均衡器、Kubernetes、系统健康检查脚本）就能连接到该端口。
+	//   - 但此时节点可能还处于“初始化中”状态，还不能真正处理 SQL 请求或参与集群。
+
+	// 这里设置 ReadyFn 的目的：
+	//   - 让外部系统（如 Kubernetes 的 Readiness Probe）能够区分“端口已开放但节点未就绪”和“节点真正就绪”两种状态。
+	//   - 通过 reportReadinessExternally(ctx, cmd, waitForInit) 函数来报告节点的就绪状态。
+	// DelayedBootstrapFn will be called if the bootstrap process is taking a bit long.
+	// DelayedBootstrapFn 是一个延迟回调函数（delayed callback），
+	// 如果节点的“集群引导”（bootstrap）过程耗时过长（即尝试加入集群或初始化集群花了较长时间），这个函数就会被触发。
+
+	// 背景解释：
+	// CockroachDB 节点启动后，会尝试联系 --join 参数指定的其他节点来加入现有集群。
+	// - 如果是新集群的第一节点，它会等待其他节点加入，或等待用户手动执行 cockroach init 来初始化集群。
+	// - 如果是后续节点，它会主动尝试连接 --join 列表中的节点。
+	// 这个过程如果一直无法完成（例如网络不通、地址配置错、其他节点没启动），就会卡住一段时间。
+	// CockroachDB 为了帮助用户快速定位问题，会在等待一段时间后触发这个 DelayedBootstrapFn，打印一条友好的警告信息。
+
 	serverCfg.DelayedBootstrapFn = func() {
+		// 定义警告信息内容
 		const msg = `The server appears to be unable to contact the other nodes in the cluster. Please try:
 
 - starting the other nodes, if you haven't already;
@@ -651,12 +716,16 @@ func runStartInternal(
 - running the 'cockroach init' command if you are trying to initialize a new cluster.
 
 If problems persist, please see %s.`
+
+		// 生成官方文档的故障排查链接
 		docLink := docs.URL("cluster-setup-troubleshooting.html")
+
+		// 如果节点不是后台模式启动（即直接在前台运行 cockroach start），使用 Shoutf 高亮警告（会用大写加感叹号输出到 stderr）
 		if !startCtx.inBackground {
 			log.Ops.Shoutf(ctx, severity.WARNING, msg, docLink)
 		} else {
-			// Don't shout to stderr since the server will have detached by
-			// the time this function gets called.
+			// 如果是后台模式（--background 或 daemon 方式），进程可能已经 detached（脱离终端），
+			// 这时不能再向 stderr Shout（没人看得见），所以改用普通 Warningf，只写到日志文件
 			log.Ops.Warningf(ctx, msg, docLink)
 		}
 	}
@@ -666,13 +735,20 @@ If problems persist, please see %s.`
 	// Beyond this point, the configuration is set and the server is
 	// ready to start.
 
+	// 到这里为止，所有配置（命令行参数、环境变量、存储路径、临时存储、加密等）都已经解析、验证并应用完毕。
+	// 服务器（CockroachDB node）已经具备启动条件。
+
 	// Run the rest of the startup process in a goroutine separate from
 	// the main goroutine to avoid preventing proper handling of signals
 	// if we get stuck on something during initialization (#10138).
 
+	// 将后续的启动过程（真正创建并启动服务器）放到一个独立的 goroutine 中执行，而不是在主 goroutine 中直接运行。
+	// 原因：防止启动过程中某个步骤卡住（例如网络连接超时、存储初始化缓慢），导致主 goroutine 被阻塞，从而无法及时响应系统信号（SIGINT、SIGTERM 等）。
+	// 如果主 goroutine 被阻塞，进程就无法优雅关闭（graceful shutdown），可能导致强制 kill 或数据不一致。
+	// 参考 issue：#10138（历史问题，正是因为启动卡住导致信号处理失效）。
+
 	srvStatus, serverShutdownReqC := createAndStartServerAsync(ctx,
 		tBegin, &serverCfg, stopper, startupSpan, newServerFn, startSingleNode, serverType)
-
 	return waitForShutdown(
 		// NB: we delay the access to s, as it is assigned
 		// asynchronously in a goroutine above.
@@ -729,6 +805,11 @@ func getDefaultGoMemLimit(ctx context.Context) int64 {
 	if err != nil {
 		return 0
 	}
+	//$$maxGoMemLimit = (总内存 \times 比例) - (缓存大小 \times 冗余倍数)$$
+	//在数据库这种内存密集型应用中，如果 CGo 缓存 占了 10G，Go 堆内存 又占了 10G，而总内存只有 16G，系统就会因 OOM (Out of Memory) 杀掉进程。
+	//
+	//这段代码的作用：它动态计算出一个“天花板”。它告诉 Go 运行时：“嘿，扣掉那些 CGo 占用的固定缓存后，你最多只能用这么多 。
+	//快到这个数的时候，请拼命进行垃圾回收（GC），千万别让系统把我杀了！”
 	maxGoMemLimit := int64(defaultGoMemLimitMaxTotalSystemMemUsage*float64(sysMem) -
 		defaultGoMemLimitCacheSlopMultiple*float64(serverCfg.CacheSize))
 	if maxGoMemLimit < defaultGoMemLimitMinValue {
@@ -778,6 +859,10 @@ func getDefaultGoMemLimit(ctx context.Context) int64 {
 //   - newServerFn: a constructor function for the server object.
 //   - serverType: a title used for the type of server. This is used
 //     when reporting the startup messages on the terminal & logs.
+//
+// // createAndStartServerAsync 函数的作用：在独立的 goroutine 中异步执行 CockroachDB 服务器的创建和启动过程。
+// // 这样做的核心目的是：即使启动过程卡住（例如端口被占、join 集群超时、存储初始化慢），
+// 主 goroutine 仍能及时响应系统信号（Ctrl+C、SIGTERM），实现优雅关闭。
 func createAndStartServerAsync(
 	ctx context.Context,
 	tBegin time.Time,
@@ -1397,6 +1482,7 @@ func exitIfDiskFull(ctx context.Context, fs vfs.FS, specs []base.StoreSpec) erro
 	// First try to reclaim disk space by cleaning up obsolete files. It's
 	// possible this will free up enough space to allow us to start when we
 	// otherwise would not be able to.
+	//首先尝试通过清理陈旧（废弃）的文件来**回收（reclaim）**磁盘空间。
 	if err := reclaimDiskSpace(ctx, fs, specs); err != nil {
 		return err
 	}
@@ -1536,14 +1622,30 @@ func setupAndInitializeLoggingAndProfiling(
 }
 
 // initGEOS sets up the Geospatial library.
+// initGEOS 函数负责初始化 CockroachDB 内置的地理空间（Geospatial）库。
+// 地理空间功能依赖第三方库 GEOS（Geometry Engine - Open Source），它提供几何运算（如 ST_Contains、ST_Intersects、ST_DWithin 等）的底层实现。
+
 // We need to make sure this happens before any queries involving geospatial data is executed.
+// 必须确保这个初始化在任何涉及地理空间数据的 SQL 查询执行之前完成。
+// 因为一旦有查询调用空间函数（如 ST_AsText、ST_Distance 等），如果 GEOS 还没加载成功，这些函数会直接不可用或报错。
+
 func initGEOS(ctx context.Context) {
+	// geos.EnsureInit 是 CockroachDB 对 GEOS 库的封装初始化函数
+	// 参数：
+	//   - geos.EnsureInitErrorDisplayPrivate：错误处理策略，表示如果初始化失败，只记录警告日志，不对外暴露敏感路径细节
+	//   - startCtx.geoLibsDir：用户通过 --geo-libs-dir 参数指定的外部 GEOS 库目录（可选）
+	//     如果指定了这个目录，CockroachDB 会优先从这里加载 libgeos.so / libgeos_c.so
+	//     如果没指定，则使用内置的捆绑版本（bundled GEOS）
 	loc, err := geos.EnsureInit(geos.EnsureInitErrorDisplayPrivate, startCtx.geoLibsDir)
+
 	if err != nil {
+		// 初始化失败：记录警告日志
+		// 空间函数将不可用，但节点仍能正常启动（地理空间功能是可选特性）
 		log.Ops.Warningf(ctx,
 			"could not initialize GEOS - spatial functions may not be available: %v",
-			log.SafeManaged(err))
+			log.SafeManaged(err)) // SafeManaged 防止错误信息泄露敏感路径
 	} else {
+		// 初始化成功：记录信息日志，显示实际加载的 GEOS 库路径
 		log.Ops.Infof(ctx, "GEOS loaded from directory %s", log.SafeManaged(loc))
 	}
 }

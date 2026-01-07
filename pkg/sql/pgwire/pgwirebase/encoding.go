@@ -124,23 +124,28 @@ func MakeReadBuffer(opts ...ReadBufferOption) ReadBuffer {
 	return buf
 }
 
-// reset sets b.Msg to exactly size, attempting to use spare capacity
-// at the end of the existing slice when possible and allocating a new
-// slice when necessary.
+// reset 将 b.Msg 设置为指定的 size。
+// 尽量使用现有 slice 尾部的 spare capacity，如果不足则重新分配新的 slice。
 func (b *ReadBuffer) reset(size int) {
+	// 1. 如果 b.Msg 已经存在，先将它切片为空（保留底层数组容量）
+	// b.Msg[len(b.Msg):] 是从当前长度到长度的切片，即空 slice，但底层数组仍然保留
 	if b.Msg != nil {
 		b.Msg = b.Msg[len(b.Msg):]
 	}
 
+	// 2. 如果现有 slice 的容量足够容纳 size，则直接扩展到所需长度
 	if cap(b.Msg) >= size {
-		b.Msg = b.Msg[:size]
+		b.Msg = b.Msg[:size] // 将 slice 长度设置为 size
 		return
 	}
 
+	// 3. 否则，需要分配新的 slice
 	allocSize := size
+	// 最小分配 4096 字节，避免频繁小规模内存分配
 	if allocSize < 4096 {
 		allocSize = 4096
 	}
+	// 新建 slice，长度为 size，容量为 allocSize
 	b.Msg = make([]byte, size, allocSize)
 }
 
@@ -153,32 +158,52 @@ func (b *ReadBuffer) reset(size int) {
 //
 // If the error is related to consuming a buffer that is larger than the
 // maxMessageSize, the remaining bytes will be read but discarded.
+// ReadUntypedMsg 读取一个带长度前缀的未解析消息（仅用于认证阶段）。
+// 返回值：
+//
+//	int  - 实际读取的字节数（包含长度前缀和消息本身）
+//	error - 如果读取失败，会返回错误，但字节数可能非零
 func (b *ReadBuffer) ReadUntypedMsg(rd io.Reader) (int, error) {
+	// 先读取长度前缀（4字节）
+	// b.tmp[:] 是临时缓冲区，用于存储长度前缀
 	nread, err := io.ReadFull(rd, b.tmp[:])
 	if err != nil {
-		return nread, err
-	}
-	size := int(binary.BigEndian.Uint32(b.tmp[:]))
-	// size includes itself.
-	size -= 4
-	if size > b.maxMessageSize || size < 0 {
-		err := errors.WithHintf(
-			NewProtocolViolationErrorf(
-				"message size %s bigger than maximum allowed message size %s",
-				humanize.IBytes(uint64(size)),
-				humanize.IBytes(uint64(b.maxMessageSize)),
-			),
-			"the maximum message size can be configured using the %s cluster setting",
-			readBufferMaxMessageSizeClusterSettingName,
-		)
-		if size > 0 {
-			err = withMessageTooBigError(err, size)
-		}
+		// 如果读取失败（网络错误、EOF等），直接返回已读取的字节数和错误
 		return nread, err
 	}
 
-	b.reset(size)
+	// 将4字节大端整数转换为消息长度
+	size := int(binary.BigEndian.Uint32(b.tmp[:]))
+	// 注释说明：size 包含自身的4字节长度，所以需要减去4
+	size -= 4
+
+	//  检查消息长度是否合法
+	if size > b.maxMessageSize || size < 0 {
+		// 构造协议违规错误
+		err := errors.WithHintf(
+			NewProtocolViolationErrorf(
+				"message size %s bigger than maximum allowed message size %s",
+				humanize.IBytes(uint64(size)),             // 当前消息大小
+				humanize.IBytes(uint64(b.maxMessageSize)), // 最大允许消息大小
+			),
+			"the maximum message size can be configured using the %s cluster setting",
+			readBufferMaxMessageSizeClusterSettingName, // 提示用户可通过集群配置调整最大消息大小
+		)
+		if size > 0 {
+			// 如果消息长度大于0，进一步包装错误，记录消息长度
+			err = withMessageTooBigError(err, size)
+		}
+		// 返回已读取字节数和错误
+		return nread, err
+	}
+
+	// 分配缓冲区，准备存储完整消息
+	b.reset(size) // b.Msg 被分配大小为 size 的内存
+
+	//读取消息内容
 	n, err := io.ReadFull(rd, b.Msg)
+
+	// 返回总共读取的字节数（长度前缀 + 消息内容）以及错误
 	return nread + n, err
 }
 

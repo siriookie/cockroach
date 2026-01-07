@@ -92,29 +92,135 @@ func (e *schedulerLatencyListener) setCoord(coord *ElasticCPUGrantCoordinator) {
 //	limited to a well-defined range that can be tuned through cluster settings.
 //	This controller can be made more involved if we find good reasons for
 //	it; this is just the first version that worked well-enough.
+// SchedulerLatency 是 SchedulerLatencyListener 接口的一部分。
+// 它根据调度延迟（scheduling latency）和弹性 CPU 利用率数据，
+// 动态控制弹性 CPU 的百分比上限（elastic CPU % limit）。
+//
+// 在每一次周期性 tick 中，我们都会测量 scheduling_p99，
+// 并执行如下控制逻辑：
+//
+//     IF scheduling_p99 > target_p99:
+//         utilization_limit = max(utilization_limit – delta * factor, min_utilization)
+//     ELSE:
+//         IF requests_waiting:
+//             utilization_limit = min(utilization_limit + delta, max_utilization)
+//         ELSE:
+//             utilization_limit = max(utilization_limit – delta * inactive_factor, inactive_utilization)
+//
+// 变量定义：
+//
+//     scheduling_p99
+//         最近一个时间窗口内观测到的调度延迟 p99 值。
+//
+//     target_p99
+//         期望的调度延迟 p99 目标值。
+//
+//     min_utilization
+//         每个节点上弹性工作负载（elastic work）CPU 使用率的下限。
+//
+//     max_utilization
+//         每个节点上弹性工作负载（elastic work）CPU 使用率的上限。
+//
+//     inactive_utilization
+//         当没有利用率需求时，CPU 使用率会逐步下降到的目标值。
+//
+//     delta
+//         每个 tick 中 CPU 百分比的调整步长。
+//
+//     factor
+//         在降低利用率时，对 delta 进行放大的乘数因子。
+//
+//     inactive_factor
+//         在“无请求活动”情况下，降低利用率时使用的 delta 放大因子。
+//
+//     requests_waiting
+//         是否存在由于当前利用率上限不足而处于等待状态的请求。
+//
+//     utilization_limit
+//         弹性工作负载可使用的 CPU 百分比上限。
+//
+// 控制器采用固定步长（delta）来进行调整，并且在“向下调整”时
+// 比“向上调整”更加激进一些。这是因为该工作负载具有被节奏控制
+//（paced）的特性 —— 我们更关心的是能够快速引入一个 CPU 使用上限，
+// 而不是始终精确地贴近该上限（尽管从实验结果来看，实际上也能保持
+// 得相当接近）。
+//
+// 控制器只有在满足以下条件时才会向上调整利用率：
+// 在调度延迟 p99 未超过目标值的前提下，确实存在正在等待、
+// 且可以利用更多 CPU 配额的请求。
+//
+// 每次调整的幅度都被刻意设计得较小，以减少过冲（overshoot）和
+// 欠冲（undershoot）以及控制器的不稳定性，代价是响应会稍显迟缓。
+// 我们使用了相对较长的时间窗口来统计调度延迟数据；
+// 由于 p99 是基于直方图数据计算的，我们发现如果只使用较小
+// 的调度事件集合（例如最近 50ms），p99 曲线会非常“锯齿化”，
+// 而使用更大的时间窗口（例如最近 2500ms）来计算 p99，
+// 结果会平滑得多。
+//
+// 结合较小的调整步长，这种设计可能会使控制器的响应显得有些被“阻尼”
+//（dampened），但在节点前台 CPU 负载相对稳定的前提下，
+// 该策略运行效果良好。
+//
+// 控制器的输出被限制在一个明确定义的范围内，
+// 并且可以通过集群配置项进行调节。
+// 如果将来发现有充分的理由，
+// 这个控制器是可以进一步变得更加复杂的；
+// 目前这只是第一个“效果足够好”的版本。
+
 func (e *schedulerLatencyListener) SchedulerLatency(p99, period time.Duration) {
+	// 步骤 1: 加载动态配置参数
+	// Load dynamic configuration parameters
+	// 从 cluster.Settings 读取实时配置,支持在线调整
 	params := e.getParams(period)
 	if !params.enabled {
 		return // nothing to do
 	}
-
+	// 步骤 2: 记录 P99 到 Prometheus
+	// Record P99 to Prometheus for monitoring
 	e.metrics.P99SchedulerLatency.Update(p99.Nanoseconds())
 
+	// 步骤 3: 查询系统状态
+	// Query system state: are there waiting requests?
+	// 这是一个关键信号: 有需求 vs 无需求
 	hasWaitingRequests := e.elasticCPULimiter.hasWaitingRequests()
-	oldUtilizationLimit := e.elasticCPULimiter.getUtilizationLimit()
+	oldUtilizationLimit := e.elasticCPULimiter.getUtilizationLimit() //默认0.05
 	newUtilizationLimit := oldUtilizationLimit
 
+	// === 状态机核心 ===
+	// State Machine Core
 	if p99 > params.targetP99 { // over latency target; decrease limit
+		// 状态 1: 过载 → 快速降低配额
+		// State 1: Overloaded → Rapidly decrease quota
+		//
+		// 数学原理:
+		//   新配额 = 旧配额 - 步长 × 放大因子
+		//   例: 50% - 0.01% × 2 = 49.98%
+		//
+		// 设计理念:
+		//   宁可"误杀"(过度限制),不可"漏网"(延迟暴涨)
+		//   因为前台延迟直接影响用户体验
 		newUtilizationLimit = oldUtilizationLimit -
 			(params.adjustmentDelta * params.multiplicativeFactorOnDecrease)
+		// 裁剪到 [min, max] 区间
+		// Clamp to [min, max] range
 		newUtilizationLimit = clamp(params.minUtilization, params.maxUtilization, newUtilizationLimit)
 		if log.V(1) {
 			log.Dev.Infof(e.ctx, "clamp(%0.2f%% - %0.2f%%) => %0.2f%%",
 				100*oldUtilizationLimit, 100*params.adjustmentDelta*params.multiplicativeFactorOnDecrease,
 				100*newUtilizationLimit)
 		}
-	} else { // under latency target
+	} else { // under latency target// p99 <= target_p99
 		if hasWaitingRequests { // increase limit if there are waiting requests
+			// 状态 2: 延迟达标 + 有需求 → 缓慢增加配额
+			// State 2: Under target + demand → Slowly increase quota
+			//
+			// 数学原理:
+			//   新配额 = 旧配额 + 步长
+			//   例: 50% + 0.01% = 50.01%
+			//
+			// 设计理念:
+			//   保守增长,避免超调(overshoot)导致延迟突增
+			//   给系统足够时间适应新的 CPU 水平
 			newUtilizationLimit = oldUtilizationLimit + params.adjustmentDelta
 			newUtilizationLimit = clamp(params.minUtilization, params.maxUtilization, newUtilizationLimit)
 			if log.V(1) {
@@ -123,9 +229,25 @@ func (e *schedulerLatencyListener) SchedulerLatency(p99, period time.Duration) {
 					100*newUtilizationLimit)
 			}
 		} else { // unused limit; slowly decrease it
+			// 状态 3: 延迟达标 + 无需求 → 超慢衰减
+			// State 3: Under target + no demand → Ultra-slow decay
+			//
+			// 计算 inactive 目标值:
+			//   例: min=5%, max=75%, inactivePoint=0.1
+			//   → inactiveTarget = 5% + 0.1 × (75% - 5%) = 12%
 			inactiveUtilizationLimit := params.minUtilization +
 				params.inactivePoint*(params.maxUtilization-params.minUtilization)
 			if oldUtilizationLimit > inactiveUtilizationLimit {
+				// 只在高于 inactive 目标时才衰减
+				// Only decay if above inactive target
+				//
+				// 数学原理:
+				//   新配额 = 旧配额 - 步长 × 空闲因子
+				//   例: 50% - 0.01% × 0.25 = 49.9975%
+				//
+				// 设计理念:
+				//   极慢的衰减避免"抖动":
+				//   如果任务突然恢复,不必从很低的配额重新爬升
 				newUtilizationLimit = oldUtilizationLimit -
 					(params.adjustmentDelta * params.multiplicativeFactorOnInactiveDecrease)
 				newUtilizationLimit = clamp(inactiveUtilizationLimit, params.maxUtilization, newUtilizationLimit)
@@ -137,9 +259,18 @@ func (e *schedulerLatencyListener) SchedulerLatency(p99, period time.Duration) {
 			}
 		}
 	}
-
+	// 步骤 4: 应用新的配额限制
+	// Step 4: Apply new quota limit
+	// 这会立即影响后续的 CPU token 发放速率
 	e.elasticCPULimiter.setUtilizationLimit(newUtilizationLimit)
+	// 步骤 5: 更新监控指标
+	// Step 5: Update monitoring metrics
 	e.elasticCPULimiter.computeUtilizationMetric()
+	// 步骤 6: 触发准入控制协调器
+	// Step 6: Trigger admission control coordinator
+	// 这是一个"心跳"机制:
+	//   每次调度延迟回调都会尝试授予等待中的请求
+	//   如果配额增加,可能会立即释放被阻塞的任务
 	if e.coord != nil { // only nil in tests
 		// TODO(irfansharif): Right now this is the only ticking mechanism for
 		// elastic CPU grants; consider some form of explicit ticking instead.

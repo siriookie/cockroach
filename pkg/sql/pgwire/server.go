@@ -273,13 +273,52 @@ const (
 	//
 	// See: https://www.postgresql.org/docs/current/protocol-message-formats.html
 
-	// Protocol version components.
-	versionMajor          = 3
-	versionSupportedMinor = 0
-	version30             = (versionMajor << 16) + versionSupportedMinor
+	//下面这些常量，可能会出现在 客户端发给服务器的第一条消息 中。
+	//这些常量分成两类：
+	//协议版本号（protocol version） 和 请求码（request code）。
+	//协议版本号的计算方式是：
+	//(主版本号 << 16) + 次版本号
+	//也就是：
+	//高 16 位是主版本号，低 16 位是次版本号。
+	//请求码的计算方式是：
+	//(1234 << 16) + 5678 + N
+	//其中：
+	//N 从 0 开始
+	//每新增一种请求码，N 就加 1
+	//这种新增通常只会发生在 PostgreSQL 的大版本或小版本发布时，并不频繁
 
-	versionCancel = 80877102 // (1234 << 16) + 5678
-	versionSSL    = 80877103 // (1234 << 16) + 5679
+	//PostgreSQL 在客户端的第一条消息中，用一个 int32 值同时承载 协议版本 和 特殊请求类型。
+	//正常协议使用 (major << 16) + minor，而 SSL / Cancel 等特殊请求使用刻意构造的 magic number，
+	//从而在不增加额外字段的前提下，实现协议分支判断。
+	// Protocol version components.
+	versionMajor          = 3 //主版本号：3
+	versionSupportedMinor = 0 //次版本号：0
+	//这表示：
+	//PostgreSQL 协议 3.0（目前主流版本）
+	//客户端在第一次发消息时，会把这个值发给服务器，表示：
+	//“我要用 PostgreSQL 3.0 协议跟你通信”
+	version30 = (versionMajor << 16) + versionSupportedMinor
+
+	//⚠️ 注意一个非常关键的点：
+	//这些看起来像“版本号”，但实际上不是协议版本，而是 特殊请求类型。
+	//含义：
+	//客户端想取消一个正在执行的 SQL
+	//比如用户在客户端按了 Ctrl+C
+	//客户端会新开一个连接
+	//第一条消息里就发这个 magic number
+	versionCancel = 80877102 // (1234 << 16) + 5678	//Cancel 请求（取消正在执行的查询）
+	//含义：
+	//客户端在正式通信前，先问一句：
+	//“你支不支持 SSL？”
+	//服务器只回一个字节：
+	//S：支持
+	//N：不支持
+	//如果支持，后续连接就升级成 TLS。
+	versionSSL = 80877103 // (1234 << 16) + 5679	//SSL 请求（是否支持 SSL）
+	//含义：
+	//类似 SSL
+	//用于 GSSAPI 加密（Kerberos 体系）
+	//企业环境、内网、数据库认证场景会用到
 	versionGSSENC = 80877104 // (1234 << 16) + 5680
 )
 

@@ -458,90 +458,88 @@ func GetBootstrapSchemaForTest(
 ) bootstrap.MetadataSchema {
 	return bootstrap.MakeMetadataSchema(keys.SystemSQLCodec, defaultZoneConfig, defaultSystemZoneConfig, bootstrap.NoOffset)
 }
-
-// bootstrapCluster initializes the passed-in engines for a new cluster.
-// Returns the cluster ID.
+// bootstrapCluster 为新集群初始化传入的存储引擎（engines）。
+// 返回集群状态（initState）和可能的错误。
 //
-// The first engine will contain ranges for various static split points (i.e.
-// various system ranges and system tables). Note however that many of these
-// ranges cannot be accessed by KV in regular means until the node liveness is
-// written, since epoch-based leases cannot be granted until then. All other
-// engines are initialized with their StoreIdent.
+// 第一个引擎会包含一些静态拆分点的 range（系统表和系统范围）。
+// 注意：KV 不能直接访问很多 range，直到写入节点活跃信息（node liveness），
+// 因为基于 epoch 的 lease 还不能授予。其余的引擎只初始化 StoreIdent。
 func bootstrapCluster(
 	ctx context.Context, engines []storage.Engine, initCfg initServerCfg,
 ) (*initState, error) {
-	// We expect all the stores to be empty at this point, except for
-	// the store cluster version key. Assert so.
-	//
-	// TODO(jackson): Eventually we should be able to avoid opening the
-	// engines altogether until here.
+
+	// 1. 确认所有存储引擎为空（除了可能的 cluster version key）。
 	if err := assertEnginesEmpty(engines); err != nil {
 		return nil, err
 	}
 
-	// We use our binary version to bootstrap the cluster.
+	// 2. 使用当前二进制版本初始化集群版本
 	bootstrapVersion := clusterversion.ClusterVersion{Version: initCfg.latestVersion}
 	if err := kvstorage.WriteClusterVersionToEngines(ctx, engines, bootstrapVersion); err != nil {
 		return nil, err
 	}
 
+	// 3. 生成新的 clusterID
 	clusterID := uuid.MakeV4()
-	// TODO(andrei): It'd be cool if this method wouldn't do anything to engines
-	// other than the first one, and let regular node startup code deal with them.
+
+	// 4. 遍历每个存储引擎，初始化 StoreIdent 并写入集群版本
 	for i, eng := range engines {
 		sIdent := roachpb.StoreIdent{
 			ClusterID: clusterID,
-			NodeID:    kvstorage.FirstNodeID,
-			StoreID:   kvstorage.FirstStoreID + roachpb.StoreID(i),
+			NodeID:    kvstorage.FirstNodeID,                // 第一个节点 ID
+			StoreID:   kvstorage.FirstStoreID + roachpb.StoreID(i), // 每个引擎对应不同 store ID
 		}
 
-		// Initialize the engine backing the store with the store ident and cluster
-		// version.
+		// 初始化引擎：写入 StoreIdent 和集群版本
 		if err := kvstorage.InitEngine(ctx, eng, sIdent); err != nil {
 			return nil, err
 		}
 
-		// Create first range, writing directly to engine. Note this does
-		// not create the range, just its data. Only do this if this is the
-		// first store.
+		// 仅对第一个引擎写入初始 range 数据
 		if i == 0 {
+			// 5. 配置初始系统表和 zone 配置
 			initialValuesOpts := bootstrap.InitialValuesOpts{
 				DefaultZoneConfig:       &initCfg.defaultZoneConfig,
 				DefaultSystemZoneConfig: &initCfg.defaultSystemZoneConfig,
 				Codec:                   keys.SystemSQLCodec,
 			}
+
+			// 根据版本选择初始数据
 			for _, v := range bootstrap.VersionsWithInitialValues() {
 				if initCfg.latestVersion == v.Version() {
 					initialValuesOpts.OverrideKey = v
 					break
 				}
 			}
+
+			// 如果没有匹配的版本，使用最小支持版本
 			if initialValuesOpts.OverrideKey == 0 {
 				if initCfg.latestVersion.Less(clusterversion.MinSupported.Version()) {
-					// As an exception, we tolerate tests creating older versions; we just
-					// use the minimum supported version.
-					// TODO(radu): should we make sure there are no upgrades for versions
-					// earlier than this still registered?
 					initialValuesOpts.OverrideKey = clusterversion.MinSupported
 				} else {
 					return nil, errors.AssertionFailedf("cannot bootstrap at version %s", initCfg.latestVersion)
 				}
 			}
 
+			// 生成初始 KV 数据和系统表拆分点
 			initialValues, tableSplits, err := initialValuesOpts.GenerateInitialValues()
 			if err != nil {
 				return nil, err
 			}
 
+			// 合并静态拆分点和表拆分点，并排序
 			splits := append(config.StaticSplits(), tableSplits...)
 			sort.Slice(splits, func(i, j int) bool {
 				return splits[i].Less(splits[j])
 			})
 
+			// 获取 Store 测试参数
 			var storeKnobs kvserver.StoreTestingKnobs
 			if kn, ok := initCfg.testingKnobs.Store.(*kvserver.StoreTestingKnobs); ok {
 				storeKnobs = *kn
 			}
+
+			// 写入初始集群数据到第一个引擎
 			if err := kvserver.WriteInitialClusterData(
 				ctx, eng, initialValues,
 				bootstrapVersion.Version, len(engines), splits,
@@ -551,6 +549,12 @@ func bootstrapCluster(
 			}
 		}
 	}
+	return &initState{
+		// 返回初始化状态
+		clusterID:      clusterID,
+		clusterVersion: bootstrapVersion,
+	}, nil
+}
 
 	// Note that we wrote initcfg.binaryVersion, that will always be the version
 	// that inspectEngines determines.

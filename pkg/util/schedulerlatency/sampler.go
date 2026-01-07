@@ -63,6 +63,7 @@ func StartSampler(
 	listener LatencyObserver,
 ) error {
 	return stopper.RunAsyncTask(ctx, "scheduler-latency-sampler", func(ctx context.Context) {
+		//
 		settingsValuesMu := struct {
 			syncutil.Mutex
 			period, duration time.Duration
@@ -80,15 +81,18 @@ func StartSampler(
 			// range during normal operation. See TestHistogramBuckets for more
 			// details.
 			cpuSchedulerLatencyBuckets := reBucketExpAndTrim(
-				sample().Buckets,                   // original buckets
-				1.1,                                // base
-				(50 * time.Microsecond).Seconds(),  // min
-				(100 * time.Millisecond).Seconds(), // max
+				sample().Buckets,                   // 原始桶边界
+				1.1,                                // 基数
+				(50 * time.Microsecond).Seconds(),  // 最小值
+				(100 * time.Millisecond).Seconds(), // 最大值
 			)
-
+			//- 创建名为 `go.scheduler_latency` 的直方图
+			//- 注册到 `metric.Registry`，供 Prometheus 抓取
 			schedulerLatencyHistogram := newRuntimeHistogram(schedulerLatency, cpuSchedulerLatencyBuckets)
 			registry.AddMetric(schedulerLatencyHistogram)
-
+			//- 每隔 `statsInterval`（如 10 秒）触发一次
+			//- 调用 `s.getAndClearLastStatsHistogram()` 获取累积的延迟直方图
+			//- 调用 `schedulerLatencyHistogram.update(...)` 更新 Prometheus 指标
 			ticker := time.NewTicker(statsInterval) // compute periodic stats
 			defer ticker.Stop()
 			for {
@@ -106,9 +110,11 @@ func StartSampler(
 				}
 			}
 		})
-
+		//初始周期为 settingsValuesMu.period（默认 100ms）
 		ticker := time.NewTicker(settingsValuesMu.period)
 		defer ticker.Stop()
+		//- `samplePeriod.SetOnChange(...)`：当集群设置变化时，自动重置定时器
+		//- `sampleDuration.SetOnChange(...)`：当窗口大小变化时，调整环形缓冲区容量
 		samplePeriod.SetOnChange(&st.SV, func(ctx context.Context) {
 			period := samplePeriod.Get(&st.SV)
 			settingsValuesMu.Lock()
@@ -124,7 +130,8 @@ func StartSampler(
 			settingsValuesMu.duration = duration
 			s.setPeriodAndDuration(settingsValuesMu.period, settingsValuesMu.duration)
 		})
-
+		//- 每个 tick 触发 `s.sampleOnTickAndInvokeCallbacks(period)`
+		//- 这是整个系统的**心跳**，负责采样、计算 P99、触发回调
 		for {
 			select {
 			case <-ctx.Done():
@@ -179,19 +186,22 @@ func (s *sampler) setPeriodAndDuration(period, duration time.Duration) {
 func (s *sampler) sampleOnTickAndInvokeCallbacks(period time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
+	// 1. 捕获上一次采样
 	// Capture the previous sample before adding the new one.
 	var prevSample *metrics.Float64Histogram
 	if s.mu.ringBuffer.Len() > 0 {
 		prevSample = s.mu.ringBuffer.GetFirst()
 	}
-
+	// 2. 从 Go 运行时获取最新累积直方图
 	latestCumulative := sample()
 	oldestCumulative, ok := s.recordLocked(latestCumulative)
 	if !ok {
 		return
 	}
-
+	// 3. 计算增量（用于统计导出）
+	//- `sampleDelta = latestCumulative - prevSample` 是**这个 tick 周期内的新增延迟**
+	//- 累加到 `schedulerLatencyAccumulator`，在下次 Prometheus 导出时一次性使用
+	//- 这避免了每次 tick 都更新 Prometheus 指标（有锁开销）
 	// Compute the delta since the previous sample for stats accumulation.
 	if prevSample != nil {
 		sampleDelta := sub(latestCumulative, prevSample)
@@ -201,9 +211,12 @@ func (s *sampler) sampleOnTickAndInvokeCallbacks(period time.Duration) {
 			s.mu.schedulerLatencyAccumulator = add(s.mu.schedulerLatencyAccumulator, sampleDelta)
 		}
 	}
-
+	// 4. 触发延迟观察者回调
 	// Perform the callback if there's a listener.
 	if s.listener != nil {
+		//- `sub(latestCumulative, oldestCumulative)` 得到**滑动窗口内的增量直方图**（过去 2.5 秒）
+		//- `percentile(..., 0.99)` 计算 P99 延迟（99% 的 goroutine 调度延迟低于此值）
+		//- 调用 `listener.SchedulerLatency(p99, period)` 通知观察者
 		p99 := time.Duration(int64(percentile(sub(latestCumulative, oldestCumulative),
 			0.99) * float64(time.Second.Nanoseconds())))
 		s.listener.SchedulerLatency(p99, period)

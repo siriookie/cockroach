@@ -178,14 +178,22 @@ func (e *elasticCPUGranter) continueGrantChain(grantChainID) {
 
 // tryGrant is used to attempt to grant to waiting requests.
 func (e *elasticCPUGranter) tryGrant() {
+	// 循环尝试授权,直到:
+	//   1. 没有等待的请求,或
+	//   2. CPU token 配额耗尽
 	for e.hasWaitingRequests() && e.tryGet(canBurst /*arbitrary*/, 1) {
+		// ① 尝试授权 1 个 token 给等待队列
 		tokens := e.requester.granted(noGrantChain)
 		if tokens == 0 {
+			// ② requester 拒绝了授权 (例如队列为空)
 			e.returnGrantWithoutGrantingElsewhere(1)
 			return // requester didn't accept, nothing left to do; bow out
 		} else if tokens > 1 {
+			// ③ requester 实际使用了 > 1 个 token
+			//   (某些请求需要多个 token,如大批量操作)
 			e.tookWithoutPermission(tokens - 1)
 		}
+		// ④ 继续下一次循环,尝试授权下一个请求
 	}
 }
 

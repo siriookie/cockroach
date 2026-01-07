@@ -193,16 +193,15 @@ const (
 type StoreWorkType int8
 
 const (
-	// RegularStoreWorkType is for type of store-specific work that corresponds to
-	// RegularWorkClass.
+	// RegularStoreWorkType 是对应 RegularWorkClass 的存储特定工作类型
 	RegularStoreWorkType StoreWorkType = iota
-	// SnapshotIngestStoreWorkType is for snapshot work type. It is classified as
-	// ElasticWorkClass, but is prioritized higher than other work of that class.
+	// SnapshotIngestStoreWorkType 是快照工作类型，分类为 ElasticWorkClass
+	// 但优先级高于该类的其他工作
 	SnapshotIngestStoreWorkType = 1
-	// ElasticStoreWorkType is for store-specific work that corresponds to
-	// ElasticWorkClass, excluding SnapshotIngestStoreWorkType.
+	// ElasticStoreWorkType 是对应 ElasticWorkClass 的存储特定工作
+	// 不包括 SnapshotIngestStoreWorkType
 	ElasticStoreWorkType = 2
-	// NumStoreWorkTypes is the number of store work types.
+	// NumStoreWorkTypes 是存储工作类型的数量
 	NumStoreWorkTypes = 3
 )
 
@@ -210,6 +209,9 @@ const (
 func WorkClassFromStoreWorkType(workType StoreWorkType) WorkClass {
 	var class WorkClass
 	switch workType {
+	//- RegularStoreWorkType → RegularWorkClass（通吐量和延迟敏感的工作）
+	//- ElasticStoreWorkType → ElasticWorkClass（可以处理减少吐吐量的工作）
+	//- SnapshotIngestStoreWorkType → ElasticWorkClass（但具有更高优先级）
 	case RegularStoreWorkType:
 		class = RegularWorkClass
 	case ElasticStoreWorkType:

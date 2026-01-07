@@ -564,24 +564,35 @@ type Options struct {
 }
 
 // NewMonitor creates a new monitor.
+// NewMonitor 用于创建一个新的 BytesMonitor 实例，用于监控和管理某种资源的字节使用量（通常是内存或磁盘）。
 func NewMonitor(args Options) *BytesMonitor {
+	// 如果用户传入的 Limit（资源上限） <= 0，则视为“无限制”，设置为 math.MaxInt64（实际上无限大）
 	if args.Limit <= 0 {
 		args.Limit = math.MaxInt64
 	}
+
+	// 如果用户传入的 Increment（内存池分配增量） <= 0，则使用默认值 DefaultPoolAllocationSize
+	// 这个增量决定了每次从内存池申请额外空间时的步长，通常是 64KB 或类似值
 	if args.Increment <= 0 {
 		args.Increment = DefaultPoolAllocationSize
 	}
+
+	// 创建 BytesMonitor 结构体实例，并填充基本字段
 	m := &BytesMonitor{
-		name:               args.Name,
-		configLimit:        args.Limit,
-		limit:              args.Limit,
-		poolAllocationSize: args.Increment,
-		settings:           args.Settings,
+		name:               args.Name,      // 监控器的名称，用于日志和指标展示
+		configLimit:        args.Limit,     // 配置中原始的上限值（保留原始配置）
+		limit:              args.Limit,     // 当前生效的上限（后续可能被动态调整）
+		poolAllocationSize: args.Increment, // 内存池每次分配的增量大小
+		settings:           args.Settings,  // 集群设置（可能用于动态调整限额）
 	}
-	m.mu.curBytesCount = args.CurCount
-	m.mu.maxBytesHist = args.MaxHist
-	m.mu.tracksDisk = args.Res == DiskResource
-	m.mu.longLiving = args.LongLiving
+
+	// 初始化互斥锁保护的字段
+	m.mu.curBytesCount = args.CurCount         // 当前已使用的字节数（初始计数，可非0，用于导入已有数据）
+	m.mu.maxBytesHist = args.MaxHist           // 历史最大使用量直方图（用于指标统计）
+	m.mu.tracksDisk = args.Res == DiskResource // 是否监控磁盘资源（true 表示监控磁盘临时存储，false 表示内存）
+	m.mu.longLiving = args.LongLiving          // 是否为长生命周期的对象（影响会计方式和回收策略）
+
+	// 返回创建好的监控器实例
 	return m
 }
 
@@ -631,24 +642,36 @@ func (mm *BytesMonitor) StartNoReserved(ctx context.Context, pool *BytesMonitor)
 }
 
 // Start begins a monitoring region.
-// Arguments:
-//   - pool is the upstream monitor that provision allocations exceeding the
-//     pre-reserved budget. If pool is nil, no upstream allocations are possible
-//     and the pre-reserved budget determines the entire capacity of this monitor.
-//
-// - reserved is the pre-reserved budget (see above).
+// Start 方法用于启动一个监控区域（monitoring region），标志着从此刻起，这个 BytesMonitor 开始正式跟踪资源使用。
+// 参数：
+//   - pool: 上级监控器（parent monitor）。如果超过预留预算（reserved），会向上级申请额外配额。
+//     如果 pool 为 nil，则该监控器完全独立，只能使用预留预算，无法向上扩展。
+//   - reserved: 预分配的预算（BoundAccount 类型），用于保证该监控器至少有一定的资源可用，即使上级紧张。
 func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved *BoundAccount) {
+	// 防御性检查：如果当前还有未释放的分配字节数，说明上次监控未正确结束，直接 panic
 	if mm.mu.curAllocated != 0 {
 		panic(errors.AssertionFailedf("%s: started with %d bytes left over", mm.name, mm.mu.curAllocated))
 	}
+
+	// 防御性检查：如果已经绑定了上级监控器，说明已经 Start 过了，不能重复启动
 	if mm.mu.curBudget.mon != nil {
 		panic(errors.AssertionFailedf("%s: already started with pool %s", mm.name, mm.mu.curBudget.mon.name))
 	}
+
+	// 初始化当前已分配字节数和历史最大分配字节数
 	mm.mu.curAllocated = 0
 	mm.mu.maxAllocated = 0
+
+	// 如果有上级监控器，创建当前监控器到上级的 BoundAccount（用于向上级申请/归还资源）
 	mm.mu.curBudget = pool.MakeBoundAccount()
+
+	// 标记监控器尚未停止
 	mm.mu.stopped = false
+
+	// 保存预留预算（reserved），后续可直接从中扣除
 	mm.reserved = reserved
+
+	// 详细日志（V(2) 级别）：记录启动信息，包括预留大小和上级监控器名称
 	if log.V(2) {
 		poolname := redact.SafeString("(none)")
 		if pool != nil {
@@ -662,14 +685,13 @@ func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved 
 
 	var effectiveLimit int64
 	if pool != nil {
-		// mm.settings can be nil in tests in which case we use the default
-		// value of enableMonitorTreeTrackingSetting cluster setting (true).
+		// 如果有上级监控器，且集群设置启用了监控树跟踪（默认开启），则将当前监控器注册为上级的子节点
+		// 这会构建一个监控器树结构，便于调试和观察内存使用层次
 		if enableMonitorTreeTrackingEnvVar && (mm.settings == nil || enableMonitorTreeTrackingSetting.Get(&mm.settings.SV)) {
-			// If we have a "parent" monitor, then register mm as its child by
-			// making it the head of the doubly-linked list.
 			func() {
 				pool.mu.Lock()
 				defer pool.mu.Unlock()
+				// 双向链表插入：将当前 mm 插入到 pool 的子节点链表头部
 				if s := pool.mu.head; s != nil {
 					s.parentMu.prevSibling = mm
 					mm.parentMu.nextSibling = s
@@ -677,13 +699,13 @@ func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved 
 				pool.mu.head = mm
 			}()
 		}
+		// 初始有效上限 = 上级监控器的上限
 		effectiveLimit = pool.limit
 	}
 
+	// 如果有预留预算（reserved），可以在上级上限基础上额外加上预留量
 	if reserved != nil {
-		// In addition to the limit of the parent monitor, we can also
-		// allocate from our reserved budget.
-		// We do need to take care of overflows though.
+		// 防止整数溢出
 		if effectiveLimit < math.MaxInt64-reserved.used {
 			effectiveLimit += reserved.used
 		} else {
@@ -691,9 +713,11 @@ func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved 
 		}
 	}
 
+	// 最终有效上限不能超过该监控器自身配置的上限（configLimit）
 	if effectiveLimit > mm.configLimit {
 		effectiveLimit = mm.configLimit
 	}
+	// 设置当前生效的上限
 	mm.limit = effectiveLimit
 }
 

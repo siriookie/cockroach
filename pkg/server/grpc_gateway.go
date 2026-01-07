@@ -1,7 +1,5 @@
 // Copyright 2022 The Cockroach Authors.
-//
-// Use of this software is governed by the CockroachDB Software License
-// included in the /LICENSE file.
+// CockroachDB 的软件许可说明见 /LICENSE 文件
 
 package server
 
@@ -22,41 +20,48 @@ import (
 	"google.golang.org/grpc"
 )
 
-// grpcGatewayServer represents a grpc service with HTTP endpoints through GRPC
-// gateway.
+// grpcGatewayServer 表示一个 gRPC 服务，同时通过 grpc-gateway 提供 HTTP/JSON 端点
 type grpcGatewayServer interface {
-	RegisterService(g *grpc.Server)
+	RegisterService(g *grpc.Server) // 注册 gRPC 服务
 	RegisterGateway(
 		ctx context.Context,
-		mux *gwruntime.ServeMux,
-		conn *grpc.ClientConn,
+		mux *gwruntime.ServeMux, // grpc-gateway 的 ServeMux
+		conn *grpc.ClientConn, // gRPC 客户端连接
 	) error
 }
 
+// 确保以下类型实现了 grpcGatewayServer 接口
 var _ grpcGatewayServer = (*adminServer)(nil)
 var _ grpcGatewayServer = (*statusServer)(nil)
 var _ grpcGatewayServer = authserver.Server(nil)
 var _ grpcGatewayServer = (*ts.Server)(nil)
 
-// configureGRPCGateway initializes services necessary for running the
-// GRPC Gateway services proxied against the server at `grpcAddr`.
-//
-// The function returns 3 arguments that are necessary to call
-// `RegisterGateway` which generated for each of your gRPC services
-// by grpc-gateway.
+// configureGRPCGateway 初始化 grpc-gateway 所需的服务
+// grpcAddr 是服务器的 gRPC 地址
+// 返回值：
+// - ServeMux：HTTP/JSON 转发到 gRPC 的路由器
+// - 上下文：供注册 Gateway 时使用
+// - gRPC 客户端连接
+// - 错误信息
 func configureGRPCGateway(
 	ctx, workersCtx context.Context,
-	ambientCtx log.AmbientContext,
-	rpcContext *rpc.Context,
-	stopper *stop.Stopper,
-	grpcAddr string,
+	ambientCtx log.AmbientContext, // 用于日志和上下文注释
+	rpcContext *rpc.Context, // RPC 上下文
+	stopper *stop.Stopper, // 用于管理 goroutine 生命周期
+	grpcAddr string, // gRPC 服务器地址
 ) (*gwruntime.ServeMux, context.Context, *grpc.ClientConn, error) {
+
+	// JSON 序列化配置：枚举以 int 表示，输出默认值，并使用缩进
 	jsonpb := &protoutil.JSONPb{
 		EnumsAsInts:  true,
 		EmitDefaults: true,
 		Indent:       "  ",
 	}
+
+	// Proto 序列化配置
 	protopb := new(protoutil.ProtoPb)
+
+	// 创建 grpc-gateway 的 ServeMux，并配置各种 Content-Type 的序列化器
 	gwMux := gwruntime.NewServeMux(
 		gwruntime.WithMarshalerOption(gwruntime.MIMEWildcard, jsonpb),
 		gwruntime.WithMarshalerOption(httputil.JSONContentType, jsonpb),
@@ -67,16 +72,18 @@ func configureGRPCGateway(
 		gwruntime.WithMetadata(authserver.TranslateHTTPAuthInfoToGRPCMetadata),
 		gwruntime.WithMetadata(rpc.MarkGatewayRequest),
 	)
+
+	// 创建一个可取消的上下文，Stopper 在关闭时会调用 cancel
 	gwCtx, gwCancel := context.WithCancel(ambientCtx.AnnotateCtx(context.Background()))
 	stopper.AddCloser(stop.CloserFn(gwCancel))
 
-	// Eschew `(*rpc.Context).GRPCDial` to avoid unnecessary moving parts on the
-	// uniquely in-process connection.
+	// 获取 gRPC 连接配置（不使用 rpcContext.GRPCDial 避免不必要的中间层）
 	dialOpts, err := rpcContext.GRPCDialOptions(ctx, grpcAddr, rpcbase.DefaultClass)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
+	// 拦截器：统计每个 gRPC 方法的调用次数
 	callCountInterceptor := func(
 		ctx context.Context,
 		method string,
@@ -85,9 +92,11 @@ func configureGRPCGateway(
 		invoker grpc.UnaryInvoker,
 		opts ...grpc.CallOption,
 	) error {
-		telemetry.Inc(getServerEndpointCounter(method))
+		telemetry.Inc(getServerEndpointCounter(method)) // 统计方法调用次数
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
+
+	// 建立 gRPC 客户端连接
 	conn, err := grpc.DialContext(ctx, grpcAddr, append(
 		dialOpts,
 		grpc.WithUnaryInterceptor(callCountInterceptor),
@@ -95,14 +104,13 @@ func configureGRPCGateway(
 	if err != nil {
 		return nil, nil, nil, err
 	}
+
+	// 启动一个 goroutine，在 Stopper 发出 quiesce 信号时关闭 gRPC 连接
 	{
 		waitQuiesce := func(workersCtx context.Context) {
-			<-stopper.ShouldQuiesce()
-			// NB: we can't do this as a Closer because (*Server).ServeWith is
-			// running in a worker and usually sits on accept() which unblocks
-			// only when the listener closes. In other words, the listener needs
-			// to close when quiescing starts to allow that worker to shut down.
-			err := conn.Close() // nolint:grpcconnclose
+			<-stopper.ShouldQuiesce() // 等待停止信号
+			// 注意：不能作为 Closer，因为 ServeWith 可能阻塞在 accept() 上
+			err := conn.Close() // 关闭 gRPC 连接
 			if err != nil {
 				log.Ops.Fatalf(workersCtx, "%v", err)
 			}
@@ -111,11 +119,12 @@ func configureGRPCGateway(
 			waitQuiesce(workersCtx)
 		}
 	}
+
+	// 返回 grpc-gateway ServeMux，上下文，gRPC 连接
 	return gwMux, gwCtx, conn, nil
 }
 
-// getServerEndpointCounter returns a telemetry Counter corresponding to the
-// given grpc method.
+// getServerEndpointCounter 返回对应 gRPC 方法的 telemetry Counter
 func getServerEndpointCounter(method string) telemetry.Counter {
 	const counterPrefix = "http.grpc-gateway"
 	return telemetry.GetCounter(fmt.Sprintf("%s.%s", counterPrefix, method))

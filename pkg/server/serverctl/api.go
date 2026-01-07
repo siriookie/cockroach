@@ -28,6 +28,37 @@ type ServerStartupInterface interface {
 	// socket, which is done by the AcceptClients() method. The separation
 	// between the two exists so that SQL initialization can take place
 	// before the first client is accepted.
+	// PreStart starts the server on the specified port(s) and
+	// initializes subsystems.
+	// PreStart 方法的作用：在指定的端口上启动服务器，并初始化各种子系统（subsystems）。
+	// 具体包括：
+	//   - 绑定并监听网络端口（RPC、HTTP、SQL 等端口）
+	//   - 初始化存储引擎（Pebble/RocksDB）
+	//   - 加载或创建集群 ID、节点 ID
+	//- 检查 license、加密设置
+	//- 启动后台任务（如 GC、replication、statistics 等）
+	//   - 尝试加入现有集群（join）或准备 bootstrapping
+	//   - 等等
+
+	// It does not activate the pgwire listener over the network / unix
+	// socket, which is done by the AcceptClients() method.
+	// PreStart **不会**激活 pgwire（PostgreSQL wire protocol）监听器，即不会真正开始接受外部 SQL 客户端的连接（无论是 TCP 还是 Unix socket）。
+	// pgwire 监听器的真正激活是由后续的 AcceptClients() 方法完成的。
+
+	// The separation between the two exists so that SQL initialization can take place
+	// before the first client is accepted.
+	// 为什么要把 PreStart 和 AcceptClients 分开？
+	// 核心原因：**为了在接受第一个外部 SQL 客户端连接之前，先完成必要的 SQL 系统初始化工作**。
+	// 这些初始化工作包括：
+	//   - 创建 system database 和系统表（如果这是新集群的第一节点）
+	//   - 执行初始 SQL（如创建默认用户、设置、权限等）—— 见 RunInitialSQL()
+	//   - 等待集群完全 bootstrapped（例如执行 cockroach init 或加入现有集群成功）
+	//   - 确保系统表已就绪、range 已分配、replication 正常
+	// 如果在这些初始化完成前就接受客户端连接，客户端可能会：
+	//   - 连接成功但执行 SQL 时发现系统表不存在 → 报错
+	//   - 看到集群处于不一致状态
+	//   - 触发不必要的重试或超时
+	// 通过 PreStart 先把端口绑好、内部准备就绪，但暂时不接受外部 SQL 连接；等到 AcceptClients() 时再放行，确保客户端一连接上来就能正常使用。
 	PreStart(ctx context.Context) error
 
 	// AcceptClients starts listening for incoming SQL clients over the network.

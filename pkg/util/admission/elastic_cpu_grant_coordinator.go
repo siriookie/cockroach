@@ -30,6 +30,7 @@ func makeElasticCPUGrantCoordinator(
 	schedulerLatencyListener := newSchedulerLatencyListener(ambientCtx, st, schedulerLatencyListenerMetrics, elasticCPUGranter)
 
 	elasticCPUInternalWorkQueue := &WorkQueue{}
+	//明确指定为"kv-elastic-cpu-queue"，用于处理弹性CPU工作。
 	initWorkQueue(elasticCPUInternalWorkQueue, ambientCtx, KVWork, "kv-elastic-cpu-queue", elasticCPUGranter, st,
 		elasticWorkQueueMetrics,
 		workQueueOptions{usesTokens: true}, nil /* knobs */) // will be closed by the embedding *ElasticCPUWorkQueue

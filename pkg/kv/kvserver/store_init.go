@@ -21,36 +21,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 )
 
-// WriteInitialClusterData writes initialization data to an engine. It creates
-// system ranges (filling in meta1 and meta2) and the default zone config.
-//
-// Args:
-// eng: the engine to which data is to be written.
-// initialValues: an optional list of k/v to be written as well after each
-//
-//	value's checksum is initialized.
-//
-// bootstrapVersion: the version at which the cluster is bootstrapped.
-// numStores: the number of stores this node will have.
-// splits: an optional list of split points. Range addressing will be created
-//
-//	for all the splits. The list needs to be sorted.
-//
-// nowNanos: the timestamp at which to write the initial engine data.
 func WriteInitialClusterData(
 	ctx context.Context,
-	eng storage.Engine,
-	initialValues []roachpb.KeyValue,
-	bootstrapVersion roachpb.Version,
-	numStores int,
-	splits []roachpb.RKey,
-	nowNanos int64,
+	eng storage.Engine, // 要写入初始化数据的底层 Engine（一个 store / 一个磁盘）
+	initialValues []roachpb.KeyValue, // 额外需要写入的初始 KV（比如 zone config）
+	bootstrapVersion roachpb.Version, // 集群 bootsServeAndWaittrap 时使用的版本
+	numStores int, // 当前节点包含的 store 数量
+	splits []roachpb.RKey, // 初始 Range 切分点（已排序）
+	nowNanos int64, // 初始化写入时使用的时间戳
 	knobs StoreTestingKnobs,
 ) error {
+
 	// Bootstrap version information. We'll add the "bootstrap version" to the
 	// list of initialValues, so that we don't have to handle it specially
 	// (particularly since we don't want to manually figure out which range it
 	// falls into).
+
+	// 中文：把 bootstrapVersion 当成一个普通 KV，写进系统 keyspace
 	bootstrapVal := roachpb.Value{}
 	if err := bootstrapVal.SetProto(&bootstrapVersion); err != nil {
 		return err
@@ -59,40 +46,37 @@ func WriteInitialClusterData(
 		roachpb.KeyValue{Key: keys.BootstrapVersionKey, Value: bootstrapVal})
 
 	// Initialize various sequence generators.
+
+	// 中文：初始化各种 ID 生成器（NodeID / StoreID / RangeID）
 	var nodeIDVal, storeIDVal, rangeIDVal, livenessVal roachpb.Value
 
+	// 第一个节点的 NodeID 固定是 FirstNodeID（通常是 1）
 	nodeIDVal.SetInt(int64(kvstorage.FirstNodeID))
-	// The caller will initialize the stores with ids FirstStoreID, ..., FirstStoreID+numStores-1.
+
+	// 当前节点会拥有 [FirstStoreID, FirstStoreID + numStores - 1]
 	storeIDVal.SetInt(int64(kvstorage.FirstStoreID) + int64(numStores) - 1)
-	// The last range has id = len(splits) + 1
+
+	// RangeID 是连续的，最后一个 range 的 ID = splits + 1
 	rangeIDVal.SetInt(int64(len(splits) + 1))
 
 	// We're the first node in the cluster, let's seed our liveness record.
-	// It's crucial that we do to maintain the invariant that there's always a
-	// liveness record for a given node. We'll do something similar through the
-	// join RPC when adding new nodes to an already bootstrapped cluster [1].
-	//
-	// We start off at epoch=0; when nodes heartbeat their liveness records for
-	// the first time it'll get incremented to epoch=1 [2].
-	//
-	// [1]: See `(*NodeLiveness).CreateLivenessRecord` and usages for where that happens.
-	// [2]: See `(*NodeLiveness).Start` for where that happens.
+	// 中文：初始化第一个 Node 的 liveness 记录（epoch=0）
 	livenessRecord := livenesspb.Liveness{NodeID: kvstorage.FirstNodeID, Epoch: 0}
 	if err := livenessVal.SetProto(&livenessRecord); err != nil {
 		return err
 	}
+
+	// 中文：把 ID 生成器和 liveness 都写成初始 KV
 	initialValues = append(initialValues,
 		roachpb.KeyValue{Key: keys.NodeIDGenerator, Value: nodeIDVal},
 		roachpb.KeyValue{Key: keys.StoreIDGenerator, Value: storeIDVal},
 		roachpb.KeyValue{Key: keys.RangeIDGenerator, Value: rangeIDVal},
 		roachpb.KeyValue{Key: keys.NodeLivenessKey(kvstorage.FirstNodeID), Value: livenessVal})
 
-	// meta2RangeMS is going to accumulate the stats for the second range
-	// (meta2), as we write the meta records for all the other ranges.
+	// meta2RangeMS 用来累积 meta2 range 的 MVCC 统计信息
 	meta2RangeMS := &enginepb.MVCCStats{}
 
-	// filter initial values for a given descriptor, returning only the ones that
-	// pertain to the respective range.
+	// 中文：根据 RangeDescriptor 过滤 initialValues，只留下属于该 Range 的 KV
 	filterInitialValues := func(desc *roachpb.RangeDescriptor) []roachpb.KeyValue {
 		var r []roachpb.KeyValue
 		for _, kv := range initialValues {
@@ -103,32 +87,31 @@ func WriteInitialClusterData(
 		return r
 	}
 
+	// 中文：初始 Replica 版本通常等于 bootstrapVersion
 	initialReplicaVersion := bootstrapVersion
 	if knobs.InitialReplicaVersionOverride != nil {
 		initialReplicaVersion = *knobs.InitialReplicaVersionOverride
 	}
 
-	// Some tests run this function without providing any splits. In that case, we
-	// don't split meta2. We explicitly record whether we're splitting meta2 or
-	// not because it will be used later when writing meta1 key range addressing.
+	// 中文：是否对 meta2 进行 split（某些测试场景不会）
 	shouldSplitMeta2 := slices.ContainsFunc(splits, func(split roachpb.RKey) bool {
 		return split.Equal(keys.Meta2Prefix)
 	})
 
-	// We iterate through the ranges backwards, since they all need to contribute
-	// to the stats of the second range (i.e. because they all write meta2 records
-	// in the second range), and so we want to create the second range at the end
-	// so that the stats we compute for it are correct.
+	// We iterate through the ranges backwards
+	// 中文：倒序创建 Range，因为所有 Range 都会往 meta2 写记录，
+	//       meta2 自身的 stats 必须在最后计算完成
 	startKey := roachpb.RKeyMax
 	for i := len(splits) - 1; i >= -1; i-- {
 		endKey := startKey
-		rangeID := roachpb.RangeID(i + 2) // RangeIDs are 1-based.
+		rangeID := roachpb.RangeID(i + 2) // RangeID 从 1 开始
 		if i >= 0 {
 			startKey = splits[i]
 		} else {
 			startKey = roachpb.RKeyMin
 		}
 
+		// 中文：构造 RangeDescriptor（定义这个 Range 管哪些 key）
 		desc := &roachpb.RangeDescriptor{
 			RangeID:       rangeID,
 			StartKey:      startKey,
@@ -137,6 +120,8 @@ func WriteInitialClusterData(
 		}
 
 		const firstReplicaID = 1
+
+		// 中文：第一个 Range 的第一个 Replica，放在 node=1, store=1
 		replicas := []roachpb.ReplicaDescriptor{
 			{
 				NodeID:    kvstorage.FirstNodeID,
@@ -148,11 +133,10 @@ func WriteInitialClusterData(
 		if err := desc.Validate(); err != nil {
 			return err
 		}
-		rangeInitialValues := filterInitialValues(desc)
-		log.VEventf(
-			ctx, 2, "creating range %d [%s, %s). Initial values: %d",
-			desc.RangeID, desc.StartKey, desc.EndKey, len(rangeInitialValues))
 
+		rangeInitialValues := filterInitialValues(desc)
+
+		// 中文：真正开始往 Engine 写数据
 		err := func() error {
 			batch := eng.NewBatch()
 			defer batch.Close()
@@ -162,18 +146,7 @@ func WriteInitialClusterData(
 				Logical:  0,
 			}
 
-			// NOTE: We don't do stats computations in any of the puts below. Instead,
-			// we write everything and then compute the stats over the whole range.
-
-			// If requested, write an MVCC range tombstone at the bottom of the
-			// keyspace, for performance and correctness testing.
-			if knobs.GlobalMVCCRangeTombstone {
-				if err := writeGlobalMVCCRangeTombstone(ctx, batch, desc, now.Prev()); err != nil {
-					return err
-				}
-			}
-
-			// Range descriptor.
+			// 写 RangeDescriptor
 			if err := storage.MVCCPutProto(
 				ctx, batch, keys.RangeDescriptorKey(desc.StartKey),
 				now, desc, storage.MVCCWriteOptions{},
@@ -181,7 +154,7 @@ func WriteInitialClusterData(
 				return err
 			}
 
-			// Replica GC timestamp.
+			// 写 Replica GC 时间戳
 			if err := storage.MVCCPutProto(
 				ctx, batch, keys.RangeLastReplicaGCTimestampKey(desc.RangeID),
 				hlc.Timestamp{}, &now, storage.MVCCWriteOptions{},
@@ -189,25 +162,7 @@ func WriteInitialClusterData(
 				return err
 			}
 
-			// Set the last processed timestamp for the consistency checker as "now".
-			// This helps delay running the consistency checker for
-			// 'server.consistency_check.interval'. Note that splitting this range
-			// will copy the last processed timestamp to the right hand side, so newly
-			// split ranges will also delay running the consistency checker. This
-			// should improve the performance in workloads that cause many range
-			// splits by delaying the consistency checker.
-			if err := storage.MVCCPutProto(
-				ctx, batch, keys.QueueLastProcessedKey(desc.StartKey, "consistencyChecker"),
-				hlc.Timestamp{}, &now, storage.MVCCWriteOptions{},
-			); err != nil {
-				return err
-			}
-
-			// All range descriptors are stored in meta2. Note that we're also storing
-			// the range descriptor for the second range in meta2 as well. This is
-			// because the second range doesn't end at the end of meta2 -- there's
-			// still some keys between the end of meta2 and the start of node
-			// liveness.
+			// 在 meta2 中写入 range addressing
 			metaKey := keys.RangeMetaKey(endKey)
 			if err := storage.MVCCPutProto(
 				ctx, batch, metaKey.AsRawKey(),
@@ -216,15 +171,9 @@ func WriteInitialClusterData(
 				return err
 			}
 
-			// If we want to split meta2 range, we need to write the meta1 record
-			// for it.
-			// Also, some tests call this function with an empty splits list. In that
-			// case, we also need to write the meta1 but for the range, except that
-			// range is the one starting at KeyMin since both meta1 and meta2 are on
-			// the same range.
+			// 写 meta1（用于定位 meta2）
 			if startKey.Equal(keys.Meta2Prefix) || !shouldSplitMeta2 {
-				// The range descriptor is stored in meta1.
-				meta1Key := keys.RangeMetaKey(keys.RangeMetaKey(roachpb.RKeyMax)) // range addressing for meta1
+				meta1Key := keys.RangeMetaKey(keys.RangeMetaKey(roachpb.RKeyMax))
 				if err := storage.MVCCPutProto(
 					ctx, batch, meta1Key.AsRawKey(), now, desc, storage.MVCCWriteOptions{},
 				); err != nil {
@@ -232,9 +181,8 @@ func WriteInitialClusterData(
 				}
 			}
 
-			// Now add all passed-in default entries.
+			// 写入 default / initial KV（如 zone config）
 			for _, kv := range rangeInitialValues {
-				// Initialize the checksums.
 				kv.Value.InitChecksum(kv.Key)
 				if _, err := storage.MVCCPut(
 					ctx, batch, kv.Key, now, kv.Value, storage.MVCCWriteOptions{},
@@ -243,13 +191,19 @@ func WriteInitialClusterData(
 				}
 			}
 
+			// 写入 RangeState（raft 状态 / applied index 等）
 			if err := kvstorage.WriteInitialRangeState(
 				ctx, batch, batch,
 				*desc, firstReplicaID, initialReplicaVersion,
 			); err != nil {
 				return err
 			}
-			computedStats, err := rditer.ComputeStatsForRange(ctx, desc, batch, fs.UnknownReadCategory, now.WallTime)
+
+			// 计算并写入 MVCCStats
+			//虽然我们刚写入了数据，但写入操作本身也会产生 MVCC 元数据（如时间戳、校验和）。
+			//ComputeStatsForRange 通过扫描整个 Range，精确计算统计信息，确保数据一致性
+			computedStats, err := rditer.ComputeStatsForRange(
+				ctx, desc, batch, fs.UnknownReadCategory, now.WallTime)
 			if err != nil {
 				return err
 			}

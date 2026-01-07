@@ -960,26 +960,50 @@ func (cfg *Config) InitNode(ctx context.Context) error {
 
 // FilterGossipBootstrapAddresses removes any gossip bootstrap addresses which
 // match either this node's listen address or its advertised host address.
-func (cfg *Config) FilterGossipBootstrapAddresses(ctx context.Context) []util.UnresolvedAddr {
-	var listen, advert net.Addr
-	listen = util.NewUnresolvedAddr("tcp", cfg.Addr)
-	advert = util.NewUnresolvedAddr("tcp", cfg.AdvertiseAddr)
-	filtered := make([]util.UnresolvedAddr, 0, len(cfg.GossipBootstrapAddresses))
-	addrs := make([]string, 0, len(cfg.GossipBootstrapAddresses))
 
+// FilterGossipBootstrapAddresses 的作用：
+// 移除所有与本节点匹配的 Gossip bootstrap 地址。
+// 匹配标准：
+//   - 本节点的监听地址（--listen-addr 或默认的 cfg.Addr）
+//   - 本节点的广告地址（--advertise-addr 或默认的 cfg.AdvertiseAddr）
+// 为什么需要区分 listen 和 advertise？
+//   - listenAddr：节点实际绑定的本地网络接口地址（通常是 0.0.0.0 或内网 IP）。
+//   - advertiseAddr：节点告诉其他节点“用这个地址来连接我”（通常是公网 IP 或可路由地址）。
+//   在容器、NAT、云环境等复杂网络中，两者可能不同，用户可能在 --join 中写 advertiseAddr。
+
+func (cfg *Config) FilterGossipBootstrapAddresses(ctx context.Context) []util.UnresolvedAddr {
+	// 创建本节点的监听地址和广告地址对象（UnresolvedAddr 是 CockroachDB 自定义的地址类型，支持未解析的字符串形式）
+	var listen, advert net.Addr
+	listen = util.NewUnresolvedAddr("tcp", cfg.Addr)          // 如 "tcp://0.0.0.0:26257"
+	advert = util.NewUnresolvedAddr("tcp", cfg.AdvertiseAddr) // 如 "tcp://public-ip:26257"
+
+	// 预分配过滤后的列表容量
+	filtered := make([]util.UnresolvedAddr, 0, len(cfg.GossipBootstrapAddresses))
+	addrs := make([]string, 0, len(cfg.GossipBootstrapAddresses)) // 用于日志打印的字符串列表
+
+	// 遍历用户通过 --join 参数提供的所有 bootstrap 地址
 	for _, addr := range cfg.GossipBootstrapAddresses {
+		// 如果这个地址等于本节点的 advertiseAddr 或 listenAddr
 		if addr.String() == advert.String() || addr.String() == listen.String() {
-			if log.V(1) {
+			// 跳过它（过滤掉）
+			if log.V(1) { // 详细日志级别
 				log.Dev.Infof(ctx, "skipping -join address %q, because a node cannot join itself", addr)
+				// 示例日志：skipping -join address "192.168.1.100:26257", because a node cannot join itself
 			}
 		} else {
+			// 保留这个地址，用于后续 Gossip 连接
 			filtered = append(filtered, addr)
 			addrs = append(addrs, addr.String())
 		}
 	}
+
+	// 打印最终有效的 bootstrap 地址列表（详细日志）
 	if log.V(1) {
 		log.Dev.Infof(ctx, "initial addresses: %v", addrs)
+		// 示例：initial addresses: [node2:26257 node3:26257]
 	}
+
+	// 返回过滤后的地址列表，后续会用于 Gossip 尝试连接这些节点以加入集群
 	return filtered
 }
 

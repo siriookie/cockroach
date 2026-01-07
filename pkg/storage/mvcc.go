@@ -7491,6 +7491,10 @@ func ComputeStatsWithVisitors(
 	var ms enginepb.MVCCStats
 	firstIter := true
 	iterFunc := func() error {
+		//底层存储引擎（Pebble）会利用 bounds 信息：
+		//- 跳过不在范围内的 SST 文件
+		//- 在 memtable 中提前终止搜索
+		//- 优化 bloom filter 查询
 		iter, err := r.NewMVCCIterator(ctx, MVCCKeyAndIntentsIterKind, IterOptions{
 			KeyTypes:     IterKeyTypePointsAndRanges,
 			LowerBound:   *resumeKey,
@@ -7577,6 +7581,40 @@ func ComputeStatsForIter(iter SimpleMVCCIterator, nowNanos int64) (enginepb.MVCC
 // permissible from a correctness perspective (the caller has the capability
 // to create another iterator and call this function again). The
 // allowResumptionForTesting  is set to true by the caller in that case.
+// computeStatsForIterWithVisitors 执行真正的统计计算逻辑，供其他 ComputeStats 相关方法调用。
+// 传入的迭代器必须已经完成过一次 seek。
+// 这样设计是为了满足 spanset 断言 的要求：
+// ComputeStats 会先 seek 到指定的 start key（以满足 spanset 校验）
+// 而 ComputeStatsForIter 则可以直接 seek 到 MinKey
+// （也就是迭代器的下界）
+// 这是因为 ComputeStatsForIter 主要用于 SST 迭代器，而 SST 迭代器不受 spanset 断言约束。
+// 这里刻意不接收 start / end key 参数，而是依赖迭代器本身的边界，
+// 目的是 避免昂贵的 key 比较操作，提升性能。
+// 可选的 pointKeyVisitor 和 rangeKeyVisitor 回调函数：
+// 会在 遍历到每一个 point key 或 range key 时被调用
+// 除了执行实际逻辑外，这些回调还可能主动限制（throttle）迭代速度
+// 当进行节流时，回调函数可能在运行一段时间后返回：
+// resumeSoon = true
+// 用于限制当前 iterator 的生命周期（避免单次扫描太久）
+// 一旦发现 resumeSoon == true：
+// 本函数会尽快结束遍历
+// 结束点会选在 roachpb.Key 与 range key 的边界处
+// 这样可以避免 重复统计同一个 range key
+// 在这种提前终止的情况下：
+// 返回值 resumeKey 会包含一个 roachpb.Key
+// 调用方在下一次调用本函数前，必须先 seek 到这个 key
+// 如果：
+// visitor 为 nil
+// 或 visitor 从不返回 resumeSoon = true
+// 那么：
+// resumeKey 永远不会被设置（始终为 nil）
+// 在某些测试场景中，即使回调函数没有返回 resumeSoon = true，
+// 我们也希望 强制测试这种“中断 + 恢复”的行为，前提是：
+// 从正确性角度是安全的
+// 调用方能够重新创建 iterator，并再次调用该函数
+// 在上述测试场景中：
+// 调用方会将 allowResumptionForTesting 设为 true
+// 用于显式允许这种测试性的中断与恢复
 func computeStatsForIterWithVisitors(
 	iter SimpleMVCCIterator,
 	nowNanos int64,
@@ -7586,38 +7624,47 @@ func computeStatsForIterWithVisitors(
 ) (_ enginepb.MVCCStats, resumeKey *roachpb.Key, _ error) {
 	var ms enginepb.MVCCStats
 	ms.LastUpdateNanos = nowNanos
-	// meta is used to store the MVCCMetadata for the current key but is only
-	// reset and initialized for a subset of keys. Specifically, meta gets
-	// initialized below when:
+	// meta 用于存储当前 key 的 MVCCMetadata，但它只会在一部分 key 上
+	// 被重置并初始化。具体来说，meta 会在以下几种情况下被初始化：
 	//
-	// implicitMeta=true [isValue=true && key != prevKey]: When we encounter a
-	// key that a) has a non-empty timestamp and b) is a new user key, its
-	// MVCCMetadata is implicit. The loop below will reset meta and synthesize
-	// its fields.
+	// implicitMeta = true [isValue = true && key != prevKey]：
+	// 当我们遇到一个 key，满足：
+	//   a) 它的时间戳非空
+	//   b) 它是一个新的用户 key
+	// 此时，它的 MVCCMetadata 是“隐式”的。
+	// 下面的循环会重置 meta 并合成（synthesize）它的各个字段。
 	//
-	// isValue=false && !isSys: When we encounter a key that has a zero
-	// timestamp and it's not a system key, we read and unmarshal the value into
-	// the MVCCMetadata struct.
+	// isValue = false && !isSys：
+	// 当我们遇到一个时间戳为 0 且不是系统 key 的 key 时，
+	// 我们会读取它的 value，并反序列化到 MVCCMetadata 结构体中。
 	var meta enginepb.MVCCMetadata
+
 	var prevKey roachpb.Key
-	// When versions of prevKey are being iterated over, pointSeenAtKey
-	// transitions (at most) once from false to true, when a point is
-	// encountered at prevKey. This is used to determine when we are at the most
-	// recent point version for prevKey. The value transitions back to false
-	// when we step to a new key.
+
+	// 当我们在遍历 prevKey 的多个版本时，pointSeenAtKey
+	// 最多只会从 false 变为 true 一次：
+	// 即在 prevKey 上第一次遇到 point（点版本）时。
+	// 这个变量用于判断我们当前是否位于 prevKey 的
+	// “最新的 point 版本”。
+	// 当我们切换到一个新的 key 时，该值会重置为 false。
 	pointSeenAtKey := false
-	// When versions of prevKey are being iterated over, first is set to true
-	// for the first point version encountered, and subsequently transitions to
-	// false. The initial transition to true is derived from various inputs,
-	// including pointSeenAtKey being false.
+
+	// 当遍历 prevKey 的多个版本时，first 会在
+	// 遇到第一个 point 版本时被设置为 true，
+	// 随后会变为 false。
+	// 第一次被设置为 true 的条件来源于多个输入，
+	// 包括 pointSeenAtKey 为 false 等。
 	var first bool
 
-	// Values start accruing GCBytesAge at the timestamp at which they
-	// are shadowed (i.e. overwritten) whereas deletion tombstones
-	// use their own timestamp. We're iterating through versions in
-	// reverse chronological order and use this variable to keep track
-	// of the point in time at which the current key begins to age.
+	// value 从它们被“遮蔽”（即被覆盖）时对应的时间戳开始，
+	// 累积 GCBytesAge；
+	// 而删除墓碑（deletion tombstone）则使用它们自身的时间戳。
+	//
+	// 我们是按时间的逆序（从新到旧）遍历各个版本的，
+	// 这个变量用于记录：
+	// 当前 key 从哪个时间点开始“老化”（用于 GC 统计）。
 	var accrueGCAgeNanos int64
+
 	var rangeTombstones MVCCRangeKeyVersions
 
 	resumeSoon := false
@@ -7630,6 +7677,7 @@ func computeStatsForIterWithVisitors(
 		unsafeKey := iter.UnsafeKey()
 		sameKey := bytes.Equal(unsafeKey.Key, prevKey)
 		if !sameKey {
+			// 切换到新的逻辑 key
 			prevKey = append(prevKey[:0], unsafeKey.Key...)
 			pointSeenAtKey = false
 		}
@@ -7647,11 +7695,19 @@ func computeStatsForIterWithVisitors(
 		}
 		// Process MVCC range tombstones, and buffer them in rangeTombstones
 		// for all overlapping point keys.
+		//Range tombstone 是 CockroachDB 的一个高级特性。当存在 Range tombstone 时，它可能**影响 point key 的存活状态**。
+		//**Range tombstone 的存储方式**
+		//Range tombstone 存储为 MVCC range key:
+		//`[startKey, endKey)@ts = <empty value>`
+		//例如:
+		//`["user/100", "user/200")@ts10 = <>`
+		//
+		//表示在时间戳 10，将 `["user/100", "user/200")` 范围内的所有数据标记为删除。
 		if iter.RangeKeyChanged() {
 			if hasPoint, hasRange := iter.HasPointAndRange(); hasRange {
 				rangeKeys := iter.RangeKeys()
 				rangeKeys.Versions.CloneInto(&rangeTombstones)
-
+				// 统计每个 Range key 版本
 				for i, v := range rangeTombstones {
 					// Only the top-most fragment contributes the key and its bounds, but
 					// all versions contribute timestamps and values.
@@ -7663,6 +7719,7 @@ func computeStatsForIterWithVisitors(
 					keyBytes := int64(mvccencoding.EncodedMVCCTimestampSuffixLength(v.Timestamp))
 					valBytes := int64(len(v.Value))
 					if i == 0 {
+						// 只有最顶层的 fragment 贡献 key bounds
 						ms.RangeKeyCount++
 						keyBytes += int64(mvccencoding.EncodedMVCCKeyPrefixLength(rangeKeys.Bounds.Key) +
 							mvccencoding.EncodedMVCCKeyPrefixLength(rangeKeys.Bounds.EndKey))
@@ -7670,6 +7727,7 @@ func computeStatsForIterWithVisitors(
 					ms.RangeKeyBytes += keyBytes
 					ms.RangeValCount++
 					ms.RangeValBytes += valBytes
+					// 计算 GC 年龄
 					ms.GCBytesAge += (keyBytes + valBytes) * (nowNanos/1e9 - v.Timestamp.WallTime/1e9)
 
 					if rangeKeyVisitor != nil {
@@ -7707,6 +7765,8 @@ func computeStatsForIterWithVisitors(
 
 		isSys := isSysLocal(unsafeKey.Key)
 		if isSys {
+			//RangeAppliedState 是 Raft 的应用状态，
+			//它本身的大小不应该影响 MVCC 统计，因为它不是用户数据，也不是需要复制的元数据。
 			// Check for ignored keys.
 			if bytes.HasPrefix(unsafeKey.Key, keys.LocalRangeIDPrefix) {
 				// RangeID-local key.
@@ -7728,16 +7788,29 @@ func computeStatsForIterWithVisitors(
 			// Check for lock table keys, which are not handled by this
 			// function. They are handled by computeLockTableStatsWithVisitors
 			// instead.
+			//Lock table key 的编码不同于普通 MVCC key，需要单独处理:
+			//这个断言确保普通的 `ComputeStatsWithVisitors` 不会处理 lock table key。
+			//Lock table 由 `computeLockTableStatsWithVisitors` 单独处理
+			//（使用 `EngineIterator` 而非 `MVCCIterator`）。
 			if bytes.HasPrefix(unsafeKey.Key, keys.LocalRangeLockTablePrefix) {
 				return enginepb.MVCCStats{}, nil, errors.AssertionFailedf(
 					"lock table key encountered by ComputeStats: %s", unsafeKey.Key)
 			}
 		}
-
+		//MVCC 中，每个逻辑 key 可能有两种物理存储形式：
+		//**形式 1: 显式 Meta Key（用于 Intent）**
+		//`"user/123"            → MVCCMetadata{Txn: ..., Timestamp: ts10}  (meta key)
+		//"user/123"@ts10       → MVCCValue{Value: "alice"}                (value key)`
+		//当存在未提交事务时，meta key 包含事务信息。
+		//**形式 2: 隐式 Meta（普通提交的值）**
+		//`"user/123"@ts10       → MVCCValue{Value: "alice"}
+		//"user/123"@ts5        → MVCCValue{Value: "bob"}`
+		//没有显式的 meta key，元数据是隐式的。
 		isValue := unsafeKey.IsValue()
 		implicitMeta := isValue && firstPointAtKey
 
 		if !isValue {
+			// 这是一个 meta key（时间戳为空）
 			// The key-value is not a MVCC value (i.e., the key has a zero
 			// timestamp). The stats accounting for non-MVCC values is simpler.
 			metaKeySize := int64(len(unsafeKey.Key)) + 1
@@ -7752,6 +7825,7 @@ func computeStatsForIterWithVisitors(
 			if isSys {
 				// The key is an internal system key. It contributes to
 				// Sys{Bytes,Count} instead of {Key,Val}{Count,Bytes}.
+				// 系统 key，计入 SysBytes
 				ms.SysBytes += totalBytes
 				ms.SysCount++
 				if isAbortSpanKey(unsafeKey.Key) {
@@ -7760,6 +7834,7 @@ func computeStatsForIterWithVisitors(
 				continue
 			}
 			// A non-system key. Decode the value as a MVCCMetadata.
+			// 用户 meta key，解析 MVCCMetadata
 			v, err := iter.UnsafeValue()
 			if err != nil {
 				return enginepb.MVCCStats{}, nil, err
@@ -7767,6 +7842,7 @@ func computeStatsForIterWithVisitors(
 			if err := protoutil.Unmarshal(v, &meta); err != nil {
 				return enginepb.MVCCStats{}, nil, errors.Wrap(err, "unable to decode MVCCMetadata")
 			}
+			// 判断是否是删除
 			if meta.Deleted {
 				// First value is deleted, so it's GC'able; add meta key & value
 				// bytes to age stat.
@@ -7795,6 +7871,8 @@ func computeStatsForIterWithVisitors(
 		// point, we can keep track of the current index and move downwards in the
 		// stack as we descend through older versions, resetting once we hit a new
 		// key.
+		// 找到覆盖当前 point key 的最近 range tombstone
+		// 后续在判断 LiveBytes 时使用:
 		var nextRangeTombstone hlc.Timestamp
 		if !rangeTombstones.IsEmpty() && unsafeKey.Timestamp.LessEq(rangeTombstones.Newest()) {
 			if v, ok := rangeTombstones.FirstAtOrAbove(unsafeKey.Timestamp); ok {
@@ -7807,6 +7885,7 @@ func computeStatsForIterWithVisitors(
 			return enginepb.MVCCStats{}, nil, errors.Wrap(err, "unable to decode MVCCValue")
 		}
 		if implicitMeta {
+			// 这是隐式 meta（第一个版本，没有显式 meta key）
 			// INVARIANT: implicitMeta => isValue.
 			// No MVCCMetadata entry for this series of keys.
 			meta.Reset()
@@ -7817,6 +7896,7 @@ func computeStatsForIterWithVisitors(
 
 			metaKeySize := int64(len(unsafeKey.Key)) + 1
 			totalBytes := metaKeySize
+			// 更新统计
 			first = true
 
 			if isSys {
@@ -7833,16 +7913,19 @@ func computeStatsForIterWithVisitors(
 					// First value is deleted, so it's GC'able; add meta key & value bytes to age stat.
 					ms.GCBytesAge += totalBytes * (nowNanos/1e9 - meta.Timestamp.WallTime/1e9)
 				} else if nextRangeTombstone.IsSet() {
+					// 这个值被 range tombstone 删除了，属于垃圾
 					// First value was deleted by a range tombstone, so it accumulates GC age from
 					// the range tombstone's timestamp.
 					ms.GCBytesAge += totalBytes * (nowNanos/1e9 - nextRangeTombstone.WallTime/1e9)
 				} else {
+					// 这个值还活着
 					ms.LiveBytes += totalBytes
 					ms.LiveCount++
 				}
 				ms.KeyBytes += metaKeySize
 				ms.KeyCount++
 				if meta.IsInline() {
+					// Inline value 只有一个版本，直接计入 ValCount
 					ms.ValCount++
 				}
 			}
@@ -7857,17 +7940,22 @@ func computeStatsForIterWithVisitors(
 		ms.ValBytes += int64(valueLen)
 		ms.ValCount++
 		if first {
+			// 第一个版本（最新）
 			first = false
 			if meta.Deleted {
+				// 最新版本是删除墓碑，从它自己的时间戳开始累积年龄
 				// First value is deleted, so it's GC'able; add key & value bytes to age stat.
 				ms.GCBytesAge += totalBytes * (nowNanos/1e9 - meta.Timestamp.WallTime/1e9)
 			} else if nextRangeTombstone.IsSet() {
 				// First value was deleted by a range tombstone; add key & value bytes to
 				// age stat from range tombstone onwards.
+				// 被 Range tombstone 删除，从 Range tombstone 时间戳开始累积
 				ms.GCBytesAge += totalBytes * (nowNanos/1e9 - nextRangeTombstone.WallTime/1e9)
 			} else {
+				// 活着的值
 				ms.LiveBytes += totalBytes
 			}
+			// 如果是 Intent
 			if meta.Txn != nil {
 				ms.IntentBytes += totalBytes
 				ms.IntentCount++
@@ -7882,10 +7970,12 @@ func computeStatsForIterWithVisitors(
 				return enginepb.MVCCStats{}, nil, errors.Errorf("expected mvcc metadata val bytes to equal %d; got %d "+
 					"(meta: %s)", valueLen, meta.ValBytes, &meta)
 			}
+			// 记录这个版本的时间戳，作为下一个版本的"被覆盖时间"
 			accrueGCAgeNanos = meta.Timestamp.WallTime
 		} else {
 			// Overwritten value. Is it a deletion tombstone?
 			if mvccValueIsTombstone {
+				// 旧版本是删除墓碑，从它自己的时间戳累积年龄
 				// The contribution of the tombstone picks up GCByteAge from its own timestamp on.
 				ms.GCBytesAge += totalBytes * (nowNanos/1e9 - unsafeKey.Timestamp.WallTime/1e9)
 			} else if nextRangeTombstone.IsSet() && nextRangeTombstone.WallTime < accrueGCAgeNanos {
@@ -7893,11 +7983,13 @@ func computeStatsForIterWithVisitors(
 				// version, so it accumulates garbage from the range tombstone.
 				ms.GCBytesAge += totalBytes * (nowNanos/1e9 - nextRangeTombstone.WallTime/1e9)
 			} else {
+				// 正常的旧版本，从被下一个版本覆盖的时间开始累积
 				// The kv pair is an overwritten value, so it became non-live when the closest more
 				// recent value was written.
 				ms.GCBytesAge += totalBytes * (nowNanos/1e9 - accrueGCAgeNanos/1e9)
 			}
 			// Update for the next version we may end up looking at.
+			// 更新 accrueGCAgeNanos 为当前版本的时间戳
 			accrueGCAgeNanos = unsafeKey.Timestamp.WallTime
 		}
 	}

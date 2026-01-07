@@ -191,7 +191,10 @@ type joinResult struct {
 func (s *initServer) ServeAndWait(
 	ctx context.Context, stopper *stop.Stopper, sv *settings.Values,
 ) (state *initState, initialBoot bool, err error) {
-	// If we're restarting an already bootstrapped node, return early.
+
+	// 中文解释：
+	// 如果磁盘上已经检测到这是一个“已引导（bootstrapped）”的节点，
+	// 说明这是节点重启场景，直接返回已有的初始化状态即可。
 	if s.inspectedDiskState.bootstrapped() {
 		return s.inspectedDiskState, false, nil
 	}
@@ -199,17 +202,22 @@ func (s *initServer) ServeAndWait(
 	log.Dev.Info(ctx, "no stores initialized")
 	log.Dev.Info(ctx, "awaiting `cockroach init` or join with an already initialized node")
 
-	// If we end up joining a bootstrapped cluster, the resulting init state
-	// will be passed through this channel.
+	// 中文解释：
+	// joinCh 用于接收 Join RPC 成功后的结果（加入已有集群）
+	// cancelJoin 用于取消 Join 循环
+	// wg 用于等待 Join goroutine 正常退出
 	var joinCh chan joinResult
 	var cancelJoin = func() {}
 	var wg sync.WaitGroup
 
 	if len(s.config.bootstrapAddresses) == 0 {
-		// We're pointing to only ourselves or nothing at all, which (likely)
-		// suggests that we're going to be bootstrapped by the operator. Since
-		// we're not going to be sending out join RPCs, we don't bother spinning
-		// up the join loop.
+		// 中文解释：
+		// 如果没有配置 bootstrapAddresses，说明：
+		// 1）要么是单节点
+		// 2）要么只指向自己
+		// 这种情况下，节点不会主动去 Join 其他集群，
+		// 而是等待运维人员手动执行 `cockroach init`
+		// 所以不启动 join loop。
 	} else {
 		joinCh = make(chan joinResult, 1)
 		wg.Add(1)
@@ -218,6 +226,9 @@ func (s *initServer) ServeAndWait(
 		joinCtx, cancelJoin = context.WithCancel(ctx)
 		defer cancelJoin()
 
+		// 中文解释：
+		// 启动一个异步任务，循环尝试通过 Join RPC
+		// 加入一个已经存在的 CockroachDB 集群
 		err := stopper.RunAsyncTask(joinCtx, "init server: join loop",
 			func(ctx context.Context) {
 				defer wg.Done()
@@ -231,32 +242,25 @@ func (s *initServer) ServeAndWait(
 		}
 	}
 
+	// 中文解释：
+	// 进入主等待循环：
+	// 等待三种事件之一发生：
+	// 1）收到 Bootstrap 请求（我们自己创建新集群）
+	// 2）Join RPC 成功（加入已有集群）
+	// 3）节点被要求退出
 	for {
 		select {
 		case state := <-s.bootstrapReqCh:
-			// Ensure we're draining out the join attempt, if any. We're not
-			// going to need it anymore and it had no chance of joining
-			// elsewhere (since we are the ones bootstrapping the new cluster
-			// and have not started serving Join yet).
+			// 中文解释：
+			// 收到 bootstrap 请求，说明我们正在创建一个全新的集群。
+			// 既然是我们自己引导集群，就不需要再继续 join 其他集群了。
 			cancelJoin()
 			wg.Wait()
 
-			// Bootstrap() did its job. At this point, we know that the cluster
-			// version will be the bootstrap version (aka the binary version[1]),
-			// but the version setting does not know yet (it was initialized as
-			// MinSupportedVersion because the engines were all uninitialized). Given
-			// that the bootstrap version was persisted to all the engines, it's now
-			// safe for us to bump the version setting itself and start operating at
-			// the latest cluster version.
-			//
-			// TODO(irfansharif): We're calling Initialize a second time here.
-			// There's no real reason to anymore, we can use
-			// SetActiveVersion instead. This will let us make
-			// `Initialize` a bit stricter, which is a nice simplification to
-			// have.
-			//
-			// [1]: See the top-level comment in pkg/clusterversion to make
-			// sense of the many versions of ...versions.
+			// 中文解释：
+			// Bootstrap 已经把 bootstrapVersion 写入磁盘。
+			// 现在可以安全地初始化 cluster version setting，
+			// 将集群版本提升到 bootstrapVersion（通常就是当前二进制版本）。
 			if err := clusterversion.Initialize(ctx, state.clusterVersion.Version, sv); err != nil {
 				return nil, false, err
 			}
@@ -265,9 +269,15 @@ func (s *initServer) ServeAndWait(
 			log.Dev.Infof(ctx, "allocated node ID: n%d (for self)", state.nodeID)
 			log.Dev.Infof(ctx, "active cluster version: %s", state.clusterVersion)
 
+			// 中文解释：
+			// 返回初始化状态：
+			// - state：包含 clusterID、nodeID、clusterVersion
+			// - initialBoot=true：表示这是一次“首次引导”
 			return state, true, nil
+
 		case result := <-joinCh:
-			// Ensure we're draining out the join attempt.
+			// 中文解释：
+			// Join RPC 返回结果（成功或失败）
 			wg.Wait()
 
 			if err := result.err; err != nil {
@@ -275,10 +285,10 @@ func (s *initServer) ServeAndWait(
 					return nil, false, err
 				}
 
-				// We expect the join RPC to blindly retry on all
-				// "connection" errors save for one above. If we're
-				// here, we failed to initialize our first store after a
-				// successful join attempt.
+				// 中文解释：
+				// 理论上 Join RPC 会自动重试所有网络错误。
+				// 如果还能走到这里，说明发生了不该发生的错误，
+				// 属于断言失败级别的问题。
 				return nil, false, errors.NewAssertionErrorWithWrappedErrf(err, "unexpected error")
 			}
 
@@ -288,8 +298,16 @@ func (s *initServer) ServeAndWait(
 			log.Dev.Infof(ctx, "received node ID: %d", state.nodeID)
 			log.Dev.Infof(ctx, "received cluster version: %s", state.clusterVersion)
 
+			// 中文解释：
+			// 成功加入已有集群：
+			// - 获取 clusterID
+			// - 被分配 nodeID
+			// - 获取当前 cluster version
 			return state, true, nil
+
 		case <-stopper.ShouldQuiesce():
+			// 中文解释：
+			// 节点正在关闭（如进程退出、服务下线）
 			return nil, false, stop.ErrUnavailable
 		}
 	}
@@ -297,45 +315,59 @@ func (s *initServer) ServeAndWait(
 
 var errInternalBootstrapError = errors.New("unable to bootstrap due to internal error")
 
-// Bootstrap implements the serverpb.Init service. Users set up a new CRDB
-// cluster by calling this endpoint on exactly one node in the cluster
-// (typically retrying only on that node). This endpoint is what powers
-// `cockroach init`. Attempting to bootstrap a node that was already
-// bootstrapped will result in an `ErrClusterInitialized` error.
+// Bootstrap 实现了 serverpb.Init 服务接口。
+// 用户通过调用该接口在集群中 **恰好一个节点** 上初始化一个新的 CRDB 集群
+// （通常只在该节点上重试）。这个接口正是 `cockroach init` 命令的底层实现。
+// 如果尝试对已经初始化过的节点再次 bootstrap，会返回 ErrClusterInitialized 错误。
 //
-// NB: there is no protection against users erroneously bootstrapping multiple
-// nodes. In that case, they end up with more than one cluster, and nodes
-// panicking or refusing to connect to each other.
+// 注意：
+//   - 该接口 **没有防止用户在多个节点上重复 bootstrap** 的保护。
+//     如果用户错误地在多个节点上 bootstrap，会形成多个独立集群，
+//     节点之间可能会 panic 或拒绝互相连接。
 func (s *initServer) Bootstrap(
 	ctx context.Context, r *serverpb.BootstrapRequest,
 ) (*serverpb.BootstrapResponse, error) {
-	// Bootstrap() only responds once. Everyone else gets an error, either
-	// ErrClusterInitialized (in the success case) or errInternalBootstrapError.
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// 1. Bootstrap 只允许成功响应一次。
+	// 其他请求会返回错误：
+	//    - 成功 bootstrap 后：ErrClusterInitialized
+	//    - 内部错误：errInternalBootstrapError
 
+	s.mu.Lock()         // 加锁保护 initServer 的状态
+	defer s.mu.Unlock() // 函数返回时解锁
+
+	// 2. 如果已经 bootstrapped，返回错误
 	if s.mu.bootstrapped {
 		return nil, ErrClusterInitialized
 	}
 
+	// 3. 如果之前有拒绝的错误，返回该错误
 	if s.mu.rejectErr != nil {
 		return nil, s.mu.rejectErr
 	}
 
+	// 4. 调用 bootstrapCluster 执行真正的集群初始化逻辑
+	//    - inspectedDiskState.uninitializedEngines：未初始化的存储引擎
+	//    - s.config：节点配置
 	state, err := bootstrapCluster(ctx, s.inspectedDiskState.uninitializedEngines, s.config)
 	if err != nil {
+		// 初始化失败，记录日志
 		log.Dev.Errorf(ctx, "bootstrap: %v", err)
+		// 标记内部错误以拒绝后续请求
 		s.mu.rejectErr = errInternalBootstrapError
 		return nil, s.mu.rejectErr
 	}
+
+	// 5. 设置初始化类型（单节点 / 多节点等）
 	state.initType = r.InitType
 
-	// We've successfully bootstrapped (we've initialized at least one engine).
-	// We mark ourselves as bootstrapped to prevent future bootstrap attempts.
+	// 6. 成功 bootstrap，标记状态，防止未来再次 bootstrap
 	s.mu.bootstrapped = true
+
+	// 7. 将初始化状态发送到 bootstrapReqCh 通道供其他组件使用
 	s.bootstrapReqCh <- state
 
+	// 8. 返回成功响应
 	return &serverpb.BootstrapResponse{}, nil
 }
 
@@ -526,36 +558,46 @@ func (s *initServer) initializeFirstStoreAfterJoin(
 	)
 }
 
+// assertEnginesEmpty 确认传入的每个存储引擎（Engine）都是“空的”，
+// 除了可能存在的 store cluster version key。用于在集群初始化前
+// 验证引擎状态，确保不会在已有数据的引擎上执行 bootstrap。
 func assertEnginesEmpty(engines []storage.Engine) error {
+	// 旧的存储集群版本 key，可能已经写入，但不算作非空
 	storeClusterVersionKey := keys.DeprecatedStoreClusterVersionKey()
 
-	// TODO(sumeer): plumb a context if necessary.
+	// TODO(sumeer): 如果必要的话，应该传入上下文
 	ctx := context.Background()
+
+	// 遍历每个引擎
 	for _, engine := range engines {
 		err := func() error {
+			// 创建一个迭代器，扫描整个引擎
 			iter, err := engine.NewEngineIterator(ctx, storage.IterOptions{
-				KeyTypes:   storage.IterKeyTypePointsAndRanges,
-				UpperBound: roachpb.KeyMax,
+				KeyTypes:   storage.IterKeyTypePointsAndRanges, // 遍历 point key 和 range key
+				UpperBound: roachpb.KeyMax,                     // 遍历到最大 key
 			})
 			if err != nil {
 				return err
 			}
 			defer iter.Close()
 
+			// 从最小 key 开始查找
 			valid, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: roachpb.KeyMin})
 			for ; valid && err == nil; valid, err = iter.NextEngineKey() {
+				// 获取当前 key
 				k, err := iter.UnsafeEngineKey()
 				if err != nil {
 					return err
 				}
+				// 判断当前 key 是 point key 还是 range key
 				hasPoint, hasRange := iter.HasPointAndRange()
 
-				// The store cluster version key is written multiple times,
-				// including before bootstrapping or joining a cluster.
-				// Skip it if it exists.
+				// 如果 key 是 store cluster version key，忽略它
 				if hasPoint && !hasRange && storeClusterVersionKey.Equal(k.Key) {
 					continue
 				}
+
+				// 如果遇到其他 key，则认为引擎不为空
 				return errors.New("engine is not empty")
 			}
 			return err
@@ -684,6 +726,14 @@ func newInitServerConfig(
 // initState returned by this method will reflect a zero NodeID if none has
 // been assigned yet (i.e. if none of the engines is initialized). See
 // commentary on initState for the intended usage of inspectEngines.
+// inspectEngines 是 CockroachDB 节点启动过程中最关键的初始化检查函数之一，它遍历节点的所有存储引擎（engines，通常是多个磁盘目录），检查它们的初始化状态，并汇总出一个 initState 结构体，用于后续决定节点该如何启动。
+// 简单来说：它回答了三个问题：
+//
+// 这个节点属于哪个集群？（ClusterID）
+// 这个节点的 NodeID 是多少？（如果还没分配，返回 0）
+// 哪些引擎已经初始化（有 StoreIdent），哪些还是全新的？
+// 当前集群版本是什么？（用于版本升级检查）
+// 有没有初始的集群设置（cached settings）？
 func inspectEngines(
 	ctx context.Context, engines []storage.Engine, latestVersion, minSupportedVersion roachpb.Version,
 ) (*initState, error) {
@@ -693,22 +743,20 @@ func inspectEngines(
 	var initialSettingsKVs []roachpb.KeyValue
 
 	for _, eng := range engines {
-		// Once cached settings are loaded from any engine we can stop.
+		// 从任意一个引擎加载缓存的集群设置（只需加载一次）
 		if len(initialSettingsKVs) == 0 {
-			var err error
-			// TODO(sep-raft-log): inspect only the log engines here.
-			initialSettingsKVs, err = loadCachedSettingsKVs(ctx, eng)
-			if err != nil {
-				return nil, err
-			}
+			initialSettingsKVs, _ = loadCachedSettingsKVs(ctx, eng)
 		}
 
+		// 读取引擎的 StoreIdent（关键标识：ClusterID、NodeID、StoreID）
 		storeIdent, err := kvstorage.ReadStoreIdent(ctx, eng)
+
 		if errors.HasType(err, (*kvstorage.NotBootstrappedError)(nil)) {
+			// 这个引擎是全新的（从未初始化过）
 			uninitializedEngines = append(uninitializedEngines, eng)
 			continue
 		} else if err != nil {
-			return nil, err
+			return nil, err // 其他错误，直接失败
 		}
 
 		if clusterID != uuid.Nil && clusterID != storeIdent.ClusterID {

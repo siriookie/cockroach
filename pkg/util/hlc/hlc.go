@@ -262,60 +262,86 @@ func (c *Clock) toleratedForwardClockJump() time.Duration {
 // forwardClockJumpCheckEnabled based on the values pushed in
 // forwardClockJumpCheckEnabledCh.
 //
+// StartMonitoringForwardClockJumps 方法的作用：
+// 启动一个后台 goroutine，负责根据传入的通道（forwardClockJumpCheckEnabledCh）动态控制是否启用“向前时钟跳跃”检测。
+// 同时周期性地读取物理时钟，保持 lastPhysicalTime（上次物理时间）最新，避免误报跳跃。
+
 // This also keeps lastPhysicalTime up to date to avoid spurious jump errors.
-//
+// 通过周期性读取物理时钟，确保 lastPhysicalTime 始终是最新的，防止由于长时间未读取导致的“虚假跳跃”报警。
+
 // A nil channel or a value of false pushed in forwardClockJumpCheckEnabledCh
 // disables checking clock jumps between two successive reads of the physical
 // clock.
-//
+// 如果通道为 nil，或收到 false 值，则禁用时钟跳跃检查。
+
 // This should only be called once per clock, and will return an error if called
 // more than once
-//
+// 每个 Clock 实例只能调用一次该方法，重复调用会返回错误（通过 atomic 标记 alreadyMonitoring）。
+
 // tickerFn is used to create a new ticker
-//
+// tickerFn 是创建定时器的工厂函数（传入 time.NewTicker，便于测试 mock）。
+
 // tickCallback is called whenever maxForwardClockJumpCh or a ticker tick is
 // processed
+// tickCallback（可选）：每次处理通道消息或 ticker tick 时都会调用（可用于额外统计或日志）。
+
 func (c *Clock) StartMonitoringForwardClockJumps(
 	ctx context.Context,
-	forwardClockJumpCheckEnabledCh <-chan bool,
-	tickerFn func(d time.Duration) *time.Ticker,
-	tickCallback func(),
+	forwardClockJumpCheckEnabledCh <-chan bool, // 控制是否启用的通道（来自集群设置）
+	tickerFn func(d time.Duration) *time.Ticker, // 定时器工厂
+	tickCallback func(), // 可选回调
 ) error {
+	// 原子标记：防止重复启动监控 goroutine
 	alreadyMonitoring := c.setMonitoringClockJump()
 	if alreadyMonitoring {
 		return errors.New("clock jumps are already being monitored")
 	}
 
+	// 创建一个子 tracing span，用于追踪这个后台监控 goroutine
 	ctx, sp := tracing.ForkSpan(ctx, "clock monitor")
+
+	// 启动后台监控 goroutine
 	go func() {
-		defer sp.Finish()
-		// Create a ticker object which can be used in selects.
-		// This ticker is turned on / off based on forwardClockJumpCheckEnabledCh
+		defer sp.Finish() // goroutine 结束时关闭 span
+
+		// 创建一个初始停止的 ticker（周期默认 1 小时，实际会动态替换）
 		ticker := tickerFn(time.Hour)
 		ticker.Stop()
+
+		// 计算刷新物理时钟的间隔：容忍向前跳跃阈值（toleratedForwardClockJump，默认 ~500ms）的一半
+		// 这样确保两次检查之间不会因为正常漂移误报
 		refreshPhysicalClockItvl := c.toleratedForwardClockJump() / 2
+
+		// 主循环：监听通道和 ticker
 		for {
 			select {
+			// 1. 收到启用/禁用信号
 			case forwardClockJumpEnabled, ok := <-forwardClockJumpCheckEnabledCh:
-				ticker.Stop()
+				ticker.Stop() // 先停止当前 ticker
+
 				if !ok {
+					// 通道关闭 → 监控任务结束（节点关闭时触发）
 					return
 				}
+
 				if forwardClockJumpEnabled {
-					// Forward jump check is enabled. Start the ticker
+					// 启用检测：重新创建 ticker，周期为 refreshPhysicalClockItvl
 					ticker = tickerFn(refreshPhysicalClockItvl)
 
-					// Fetch the clock once before we start enforcing forward
-					// jumps. Otherwise the gap between the previous call to
-					// Now() and the time of the first tick would look like a
-					// forward jump.
+					// 立即读取一次物理时钟，初始化 lastPhysicalTime
+					// 避免从上次 Now() 调用到第一次 tick 的时间差被误认为跳跃
 					c.getPhysicalClockAndCheck(ctx)
 				}
+
+				// 更新 Clock 内部状态：是否启用向前跳跃检查
 				c.setForwardJumpCheckEnabled(forwardClockJumpEnabled)
+
+			// 2. ticker 到期：周期性检查时钟
 			case <-ticker.C:
-				c.getPhysicalClockAndCheck(ctx)
+				c.getPhysicalClockAndCheck(ctx) // 核心检查函数：读取物理时钟并比较是否跳跃过大
 			}
 
+			// 如果提供了 tickCallback，每次处理完都执行（可用于 metrics 等）
 			if tickCallback != nil {
 				tickCallback()
 			}
@@ -355,47 +381,81 @@ func (c *Clock) ToleratedOffset() time.Duration {
 
 // getPhysicalClockAndCheck reads the physical time as nanos since epoch. It
 // also checks for backwards and forwards jumps, as configured.
+
+// getPhysicalClockAndCheck 是 CockroachDB HLC（Hybrid Logical Clock）中读取物理时钟的核心函数。
+// 作用：
+//   1. 安全地读取当前物理时间（wall clock，单位：纳秒）。
+//   2. 以原子方式更新 Clock 内部的 lastPhysicalTime（上次读取的物理时间）。
+//   3. 调用 checkPhysicalClock 检查时间是否发生异常跳跃（向前或向后）。
+//   4. 返回当前物理时间（newTime）。
+
 func (c *Clock) getPhysicalClockAndCheck(ctx context.Context) int64 {
+	// 读取上次记录的物理时间（原子操作，线程安全）
 	oldTime := atomic.LoadInt64(&c.lastPhysicalTime)
+
+	// 读取当前物理时间（UnixNano）
 	newTime := c.wallClock.Now().UnixNano()
+
 	lastPhysTime := oldTime
-	// Try to update c.lastPhysicalTime. When multiple updaters race, we want the
-	// highest clock reading to win, so keep retrying while we interleave with
-	// updaters with lower clock readings; bail if we interleave with a higher
-	// clock reading.
+
+	// 尝试原子更新 lastPhysicalTime
+	// 关键设计：多 goroutine 并发调用时，取**最大的时间值**胜出（时间只能前进，不能后退）
+	// 这是一个乐观并发更新循环：
 	for {
+		// 如果当前 lastPhysTime 仍是 oldTime，则成功替换为 newTime
 		if atomic.CompareAndSwapInt64(&c.lastPhysicalTime, lastPhysTime, newTime) {
 			break
 		}
+
+		// CAS 失败：说明有其他 goroutine 修改了 lastPhysicalTime
+		// 重新读取最新值
 		lastPhysTime = atomic.LoadInt64(&c.lastPhysicalTime)
+
 		if lastPhysTime >= newTime {
-			// Someone else updated to a later time than ours.
+			// 其他 goroutine 更新了一个**更晚**的时间 → 我们放弃更新（因为时间应单调递增）
 			break
 		}
-		// Someone else did an update to an earlier time than what we got in newTime.
-		// So try one more time to update.
+
+		// 其他 goroutine 更新了一个**更早**的时间 → 我们再尝试一次覆盖（因为我们有更新的时间）
+		// 继续循环
 	}
+
+	// 更新完成后，进行时间跳跃检查（oldTime 是更新前的值，newTime 是本次读取的值）
 	c.checkPhysicalClock(ctx, oldTime, newTime)
+
 	return newTime
 }
 
 // checkPhysicalClock checks for time jumps.
-// oldTime is the lastPhysicalTime before the call to get a new time.
-// newTime is the result of the call to get a new time.
+// oldTime: 更新前的 lastPhysicalTime
+// newTime: 本次读取的物理时间
 func (c *Clock) checkPhysicalClock(ctx context.Context, oldTime, newTime int64) {
+	// 第一次调用时 oldTime 为 0，直接跳过检查
 	if oldTime == 0 {
 		return
 	}
 
+	// 计算时间差：正值表示时间**向后跳**（newTime < oldTime）
 	interval := oldTime - newTime
+
+	// 向后跳跃检查（总是启用）
 	if interval > int64(c.maxOffset/10) {
+		// 如果向后跳跃超过 maxOffset 的 1/10（maxOffset 通常是节点间最大时钟偏差，如 500ms）
+		// 记录 monotonicity 错误计数，并打印警告日志
 		atomic.AddInt32(&c.monotonicityErrorsCount, 1)
 		c.logger.Warningf(ctx, "backward time jump detected (%f seconds)", float64(-interval)/1e9)
+		// 向后跳跃通常由 NTP 调整、虚拟机暂停等引起，CockroachDB 记录但不 panic
 	}
 
+	// 向前跳跃检查（仅当 forwardClockJumpCheckEnabled 为 true 时启用）
 	if atomic.LoadInt32(&c.forwardClockJumpCheckEnabled) != 0 {
-		toleratedForwardClockJump := c.toleratedForwardClockJump()
+		toleratedForwardClockJump := c.toleratedForwardClockJump() // 默认 ~500ms，可配置
+
+		// 注意这里是 -interval：因为 interval > 0 表示向后跳，interval < 0 表示向前跳
+		// 如果向前跳跃幅度 >= toleratedForwardClockJump（即 -interval >= tolerated）
 		if int64(toleratedForwardClockJump) <= -interval {
+			// 触发致命错误：直接 Fatalf → 节点 panic 并崩溃
+			// 因为向前大跳可能破坏 HLC 的因果性、租约有效性，导致数据不一致
 			c.logger.Fatalf(
 				ctx,
 				"detected forward time jump of %f seconds is not allowed with tolerance of %f seconds",

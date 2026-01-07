@@ -1178,6 +1178,8 @@ func GetTotalMemoryWithoutLogging() (int64, string, error) {
 	}
 	// Let's special case unlimited memory from cgroups to get a more accurate error message.
 	// When memory limit isn't set, cgroups returns 2^63-1 rounded to page size multiple (i.e., 4096).
+	//在 Linux 内核中，如果一个容器没有设置内存上限，cgroup 接口不会直接告诉你“无限”，
+	//而是返回一个极大的数字：$2^{63} - 1$。
 	if cgAvlMem == 0x7FFFFFFFFFFFF000 {
 		return checkTotal(totalMem,
 			fmt.Sprintf("available memory from cgroups (%s) is unlimited ('systemd' without MemoryMax?), using system memory %s instead: %s",

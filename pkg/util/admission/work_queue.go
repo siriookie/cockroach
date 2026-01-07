@@ -162,18 +162,22 @@ var rangeSequencerGCThreshold = settings.RegisterDurationSetting(
 type WorkInfo struct {
 	// TenantID is the id of the tenant. For single-tenant clusters, this will
 	// always be the SystemTenantID.
+	// 租户ID
 	TenantID roachpb.TenantID
 	// Priority is utilized within a tenant.
+	// 优先级（在租户内部使用）
 	Priority admissionpb.WorkPriority
 	// CreateTime is equivalent to Time.UnixNano() at the creation time of this
 	// work or a parent work (e.g. could be the start time of the transaction,
 	// if this work was created as part of a transaction). It is used to order
 	// work within a (TenantID, Priority) pair -- earlier CreateTime is given
 	// preference.
+	// 是否绕过准入控制
 	CreateTime int64
 	// BypassAdmission allows the work to bypass admission control, but allows for
 	// it to be accounted for. It should be used for high-priority intra-KV work,
 	// and when KV work generates other KV work (to avoid deadlock).
+	// 是否绕过准入控制
 	BypassAdmission bool
 	// RequestedCount is the requested number of tokens or slots. If unset:
 	// - For slot-based queues we treat it as an implicit request of 1;
@@ -183,9 +187,11 @@ type WorkInfo struct {
 	//   replicated writes (done so asynchronously, below-raft; see
 	//   ReplicatedWrite below), we do know the size of the write being
 	//   admitted, so RequestedCount is set accordingly.
+	// 请求的令牌/槽位数量
 	RequestedCount int64
 	// ReplicatedWorkInfo groups everything needed to admit replicated writes, done
 	// so asynchronously below-raft as part of replication admission control.
+	// 复制工作信息（用于below-raft异步准入）
 	ReplicatedWorkInfo ReplicatedWorkInfo
 }
 
@@ -194,30 +200,37 @@ type WorkInfo struct {
 type ReplicatedWorkInfo struct {
 	// Enabled captures whether this work represents a replicated write,
 	// subject to below-raft asynchronous admission control.
+	//标志位，表示是否启用复制写入的异步准入控制
 	Enabled bool
 	// RangeID identifies the raft group on behalf of which work is being
 	// admitted.
+	//标识工作所属的 Raft 组
 	RangeID roachpb.RangeID
 	// Replica that asked for admission.
+	//请求准入的副本 ID
 	ReplicaID roachpb.ReplicaID
 	// LeaderTerm is the term of the leader that asked for this entry to be
 	// appended.
+	//请求追加该条目的 Leader 的任期号
 	LeaderTerm uint64
 	// LogPosition is the point on the raft log where the write was replicated.
+	//写入在 Raft 日志中的位置
 	LogPosition LogPosition
 	// RaftPri is the raft priority of the entry. Only populated for RACv2.
+	//Raft 条目的优先级（仅用于 RACv2）
 	RaftPri raftpb.Priority
 	// Ingested captures whether the write work corresponds to an ingest
 	// (for sstables, for example). This is used alongside RequestedCount to
 	// maintain accurate linear models for L0 growth due to ingests and
 	// regular write batches.
+	//标志位，表示写入是否对应于摄入操作（如 SSTable）
 	Ingested bool
 }
 
 // LogPosition is a point on the raft log, identified by a term and an index.
 type LogPosition struct {
-	Term  uint64
-	Index uint64
+	Term  uint64 // Raft 任期号
+	Index uint64 // 日志索引
 }
 
 func (r LogPosition) String() string {
@@ -259,12 +272,12 @@ func (r LogPosition) Less(o LogPosition) bool {
 //	}
 type WorkQueue struct {
 	ambientCtx     context.Context
-	workKind       WorkKind
-	queueKind      QueueKind
-	granter        granter
-	usesTokens     bool
-	tiedToRange    bool
-	usesAsyncAdmit bool
+	workKind       WorkKind  // 工作类型（架构层次）
+	queueKind      QueueKind // 队列标识（实例级别）用于日志和指标标识
+	granter        granter   // 资源授予器
+	usesTokens     bool      // 是否使用令牌（vs槽位）
+	tiedToRange    bool      // 是否绑定到Range
+	usesAsyncAdmit bool      // 是否使用异步准入
 	settings       *cluster.Settings
 
 	onAdmittedReplicatedWork onAdmittedReplicatedWork
@@ -274,7 +287,7 @@ type WorkQueue struct {
 		// Tenants with waiting work.
 		tenantHeap tenantHeap
 		// All tenants, including those without waiting work. Periodically cleaned.
-		tenants       map[uint64]*tenantInfo
+		tenants       map[uint64]*tenantInfo //(所有租户)
 		tenantWeights struct {
 			mu syncutil.Mutex
 			// active refers to the currently active weights. mu is held for updates
@@ -288,11 +301,12 @@ type WorkQueue struct {
 			active, inactive map[uint64]uint32
 		}
 		// The highest epoch that is closed.
-		closedEpochThreshold int64
+		closedEpochThreshold int64 // 已关闭的最高 epoch 编号
 		// Following values are copied from the cluster settings.
-		epochLengthNanos            int64
-		epochClosingDeltaNanos      int64
-		maxQueueDelayToSwitchToLifo time.Duration
+		// epoch 配置参数（从集群配置复制
+		epochLengthNanos            int64         // epoch 长度（默认 100ms）
+		epochClosingDeltaNanos      int64         // 关闭提前量（默认 5ms）
+		maxQueueDelayToSwitchToLifo time.Duration // 切换到 LIFO 的延迟阈值
 	}
 	logThreshold log.EveryN
 	metrics      *WorkQueueMetrics
@@ -319,6 +333,10 @@ type workQueueOptions struct {
 	disableGCTenantsAndResetUsed bool
 }
 
+// 这个函数根据`workKind`决定队列的行为特性：
+// - **usesTokens**：所有类型都使用令牌（而非槽位）
+// - **tiedToRange**：是否绑定到特定Range（用于复制工作）
+// - **usesAsyncAdmit**：是否使用异步准入（Store队列特有）
 func makeWorkQueueOptions(workKind WorkKind) workQueueOptions {
 	switch workKind {
 	case KVWork:
@@ -344,46 +362,45 @@ func makeWorkQueue(
 	q := &WorkQueue{}
 	var queueKind QueueKind
 	if workKind == KVWork {
-		queueKind = "kv-regular-cpu-queue"
+		queueKind = "kv-regular-cpu-queue" // 默认为常规CPU队列
 	}
 	initWorkQueue(q, ambientCtx, workKind, queueKind, granter, settings, metrics, opts, nil)
 	return q
 }
 
 func initWorkQueue(
-	q *WorkQueue,
-	ambientCtx log.AmbientContext,
-	workKind WorkKind,
-	queueKind QueueKind,
-	granter granter,
-	settings *cluster.Settings,
-	metrics *WorkQueueMetrics,
-	opts workQueueOptions,
-	knobs *TestingKnobs,
+	q *WorkQueue, // 要初始化的队列指针
+	ambientCtx log.AmbientContext, // 日志上下文
+	workKind WorkKind, // 工作类型（KVWork/SQLKVResponseWork/SQLSQLResponseWork）
+	queueKind QueueKind, // 队列标识（"kv-regular-cpu-queue"等）
+	granter granter, // 资源授予器
+	settings *cluster.Settings, // 集群配置
+	metrics *WorkQueueMetrics, // 指标收集器
+	opts workQueueOptions, // 初始化选项
+	knobs *TestingKnobs, // 测试钩子
 ) {
 	if knobs == nil {
-		knobs = &TestingKnobs{}
+		knobs = &TestingKnobs{} // 确保非空
 	}
-	stopCh := make(chan struct{})
+	stopCh := make(chan struct{}) // 用于通知后台 goroutine 停止
 
 	timeSource := opts.timeSource
 	if timeSource == nil {
-		timeSource = timeutil.DefaultTimeSource{}
+		timeSource = timeutil.DefaultTimeSource{} // 默认时间源
 	}
 
 	if queueKind == "" {
-		queueKind = QueueKind(workKind.String())
+		queueKind = QueueKind(workKind.String()) // 使用 workKind 的字符串表示
 	}
-
 	q.ambientCtx = ambientCtx.AnnotateCtx(context.Background())
-	q.workKind = workKind
-	q.queueKind = queueKind
-	q.granter = granter
-	q.usesTokens = opts.usesTokens
-	q.tiedToRange = opts.tiedToRange
-	q.usesAsyncAdmit = opts.usesAsyncAdmit
+	q.workKind = workKind                  // 架构层次（KVWork/SQL...）
+	q.queueKind = queueKind                // 队列实例标识
+	q.granter = granter                    // 资源授予器
+	q.usesTokens = opts.usesTokens         // 槽位 vs 令牌
+	q.tiedToRange = opts.tiedToRange       // 是否绑定到 Range
+	q.usesAsyncAdmit = opts.usesAsyncAdmit // 异步准入
 	q.settings = settings
-	q.logThreshold = log.Every(5 * time.Minute)
+	q.logThreshold = log.Every(5 * time.Minute) // 日志限流
 	q.metrics = metrics
 	q.stopCh = stopCh
 	q.timeSource = timeSource
@@ -392,8 +409,13 @@ func initWorkQueue(
 	func() {
 		q.mu.Lock()
 		defer q.mu.Unlock()
-		q.mu.tenants = make(map[uint64]*tenantInfo)
-		q.sampleEpochLIFOSettingsLocked()
+		// 这个 map 用于跟踪所有活跃租户的：
+		// - 已使用资源量 (used)
+		// - 等待工作队列 (waitingWorkHeap, openEpochsHeap)
+		// - 优先级统计 (priorityStates)
+		// - FIFO/LIFO 阈值 (fifoPriorityThreshold)
+		q.mu.tenants = make(map[uint64]*tenantInfo) // 租户信息映射
+		q.sampleEpochLIFOSettingsLocked()           // 采样 Epoch-LIFO 配置
 	}()
 	if !opts.disableGCTenantsAndResetUsed {
 		go func() {
@@ -401,7 +423,7 @@ func initWorkQueue(
 			for {
 				select {
 				case <-ticker.C:
-					q.gcTenantsAndResetUsed()
+					q.gcTenantsAndResetUsed() // GC 租户信息并重置 used 计数
 				case <-stopCh:
 					// Channel closed.
 					return
@@ -409,6 +431,7 @@ func initWorkQueue(
 			}
 		}()
 	}
+	//立即关闭当前 epoch：
 	q.tryCloseEpoch(q.timeNow())
 	if !opts.disableEpochClosingGoroutine {
 		q.startClosingEpochs()
@@ -431,14 +454,36 @@ func (q *WorkQueue) epochLIFOEnabled() bool {
 }
 
 // Samples the latest cluster settings for epoch-LIFO.
+// - epochLengthNanos：默认 100ms（epochLength）
+// - epochClosingDeltaNanos：默认 5ms（提前关闭时间）
+// - maxQueueDelayToSwitchToLifo：默认 105ms（切换到 LIFO 的延迟阈值）
+// 场景：epoch 长度从 100ms 增加到 200ms
+//
+// 变更前：
+// - epochLengthNanos = 100ms
+// - 当前时间 = 500ms
+// - 当前 epoch = 500 / 100 = 5
+// - closedEpochThreshold = 4
+//
+// 变更后：
+// - epochLengthNanos = 200ms
+// - 当前时间 = 500ms
+// - 当前 epoch = 500 / 200 = 2  ← 编号倒退！
+//
+// 问题：
+// - 已关闭的 epoch 4 > 当前 epoch 2
+// - 所有新工作的 epoch 都 <= closedEpochThreshold
+// - 所有工作都会立即进入 waitingWorkHeap
+// - Epoch-LIFO 机制失效
+//
+// 解决方案：
+// - 重置 closedEpochThreshold = 0
+// - 所有 LIFO 工作进入 openEpochsHeap
+// - 等待新的 epoch 关闭周期建立
 func (q *WorkQueue) sampleEpochLIFOSettingsLocked() {
 	epochLengthNanos := int64(epochLIFOEpochDuration.Get(&q.settings.SV))
 	if epochLengthNanos != q.mu.epochLengthNanos {
-		// Reset what is closed. A proper closed value will be calculated when the
-		// next epoch closes. This ensures that if we are increasing the epoch
-		// length, we will regress what epoch number is closed. Meanwhile, all
-		// work subject to LIFO queueing will get queued in the openEpochsHeap,
-		// which is fine (we admit from there too).
+		// 如果 epoch 长度改变，重置关闭阈值
 		q.mu.closedEpochThreshold = 0
 	}
 	q.mu.epochLengthNanos = epochLengthNanos
@@ -446,6 +491,7 @@ func (q *WorkQueue) sampleEpochLIFOSettingsLocked() {
 	q.mu.maxQueueDelayToSwitchToLifo = epochLIFOQueueDelayThresholdToSwitchToLIFO.Get(&q.settings.SV)
 }
 
+// 定时器驱动的 Epoch 关闭：
 func (q *WorkQueue) startClosingEpochs() {
 	go func() {
 		// If someone sets the epoch length to a huge value by mistake, we will
@@ -457,15 +503,17 @@ func (q *WorkQueue) startClosingEpochs() {
 		const minTimerDur = time.Millisecond
 		var timer *time.Timer
 		for {
+			// 计算下一次 epoch 关闭时间
 			nextCloseTime := func() time.Time {
 				q.mu.Lock()
 				defer q.mu.Unlock()
-				q.sampleEpochLIFOSettingsLocked()
+				q.sampleEpochLIFOSettingsLocked() // 采样最新配置
 				return q.nextEpochCloseTimeLocked()
 			}()
 			timeNow := q.timeNow()
 			timerDur := nextCloseTime.Sub(timeNow)
 			if timerDur > 0 {
+				// 限制 timer 在 [1ms, 1s] 范围内
 				if timerDur > maxTimerDur {
 					timerDur = maxTimerDur
 				} else if timerDur < minTimerDur {
@@ -478,18 +526,40 @@ func (q *WorkQueue) startClosingEpochs() {
 				}
 				select {
 				case <-timer.C:
+					// Timer 触发，继续循环
 				case <-q.stopCh:
 					// Channel closed.
-					return
+					return // 停止
 				}
 			} else {
+				// 已经过期，立即关闭
 				q.tryCloseEpoch(timeNow)
 			}
 		}
 	}()
 }
 
+// 假设：
+// - epochLengthNanos = 100ms
+// - epochClosingDeltaNanos = 5ms
+// - closedEpochThreshold = 100
+//
+// 时间线：
+//
+//	Epoch 100:  [10000ms - 10100ms]  ← 已关闭
+//	Epoch 101:  [10100ms - 10200ms]  ← 下一个要关闭的
+//
+// 下一次关闭时间：
+//
+//	= (100 + 2) * 100ms + 5ms
+//	= 10200ms + 5ms
+//	= 10205ms
+//
+// 含义：在 Epoch 101 结束后 5ms（10205ms）关闭它
 func (q *WorkQueue) nextEpochCloseTimeLocked() time.Time {
+	// +2 的原因：
+	// - +1：从当前关闭的 epoch 前进到下一个
+	// - +1：epoch 在其"结束时刻"关闭，而非开始时刻
 	// +2 since we need to advance the threshold by 1, and another 1 since the
 	// epoch closes at its end time.
 	timeUnixNanos :=
@@ -504,7 +574,7 @@ func (q *WorkQueue) tryCloseEpoch(timeNow time.Time) {
 	epochClosingTimeNanos := timeNow.UnixNano() - q.mu.epochLengthNanos - q.mu.epochClosingDeltaNanos
 	epoch := epochForTimeNanos(epochClosingTimeNanos, q.mu.epochLengthNanos)
 	if epoch <= q.mu.closedEpochThreshold {
-		return
+		return // 已经关闭过了
 	}
 	q.mu.closedEpochThreshold = epoch
 	initializedDoLog := false
@@ -521,8 +591,10 @@ func (q *WorkQueue) tryCloseEpoch(timeNow time.Time) {
 		doLog = epochLIFOEnabled && q.logThreshold.ShouldLog()
 		return doLog
 	}
+	// 遍历所有租户，更新 FIFO/LIFO 阈值
 	for _, tenant := range q.mu.tenants {
 		prevThreshold := tenant.fifoPriorityThreshold
+		//  计算切换queue的阈值
 		tenant.fifoPriorityThreshold =
 			tenant.priorityStates.getFIFOPriorityThresholdAndReset(
 				tenant.fifoPriorityThreshold, q.mu.epochLengthNanos, q.mu.maxQueueDelayToSwitchToLifo)
@@ -548,10 +620,11 @@ func (q *WorkQueue) tryCloseEpoch(timeNow time.Time) {
 		// makes them no longer subject to LIFO, but they will need to wait here
 		// until their epochs close. This is considered acceptable since the
 		// priority threshold should not fluctuate rapidly.
+		// 将 openEpochsHeap 中已关闭 epoch 的工作移到 waitingWorkHeap
 		for len(tenant.openEpochsHeap) > 0 {
 			work := tenant.openEpochsHeap[0]
 			if work.epoch > epoch {
-				break
+				break // 还没到关闭时间
 			}
 			heap.Pop(&tenant.openEpochsHeap)
 			heap.Push(&tenant.waitingWorkHeap, work)
@@ -564,15 +637,90 @@ func (q *WorkQueue) tryCloseEpoch(timeNow time.Time) {
 // The enabled return value is relevant when err=nil, and represents whether
 // admission control is enabled. AdmittedWorkDone must be called iff
 // enabled=true && err!=nil, and the WorkKind for this queue uses slots.
+// **参数**：
+// - `ctx context.Context`：上下文，用于超时和取消控制
+// - `info WorkInfo`：工作信息，包含租户ID、优先级、创建时间等
+//
+// **返回值**：
+// - `enabled bool`：准入控制是否启用
+// - `false`：准入控制未启用，直接执行工作
+// - `true`：准入控制已启用，需要等待准入
+// - `err error`：错误信息
+// - `nil`：成功准入
+// - 非nil：准入失败（超时、取消等）
+//
+// **重要约定**：
+// > 只有当 `enabled=true && err==nil` 时，工作被成功准入，调用者必须在工作完成后调用 `AdmittedWorkDone()`
+// Admit() 入口
+//
+//	│
+//	├─► [阶段1] 准入控制启用检查
+//	│       ├─► 未启用 → 返回 (enabled=false, err=nil)
+//	│       └─► 已启用 → 继续
+//	│
+//	├─► [阶段2] 参数验证与初始化
+//	│       ├─► 检查 RequestedCount
+//	│       ├─► 获取租户信息
+//	│       └─► 检查是否需要旁路
+//	│
+//	├─► [阶段3] 旁路处理（仅KVWork）
+//	│       ├─► BypassAdmission=true → 直接占用资源
+//	│       └─► BypassAdmission=false → 继续
+//	│
+//	├─► [阶段4] 快速路径尝试（Fast Path）
+//	│       ├─► 队列为空 → 尝试 tryGet()
+//	│       │   ├─► 成功 → 返回 (enabled=true, err=nil)
+//	│       │   └─► 失败 → 进入慢路径
+//	│       └─► 队列非空 → 直接进入慢路径
+//	│
+//	├─► [阶段5] 慢路径入队（Slow Path）
+//	│       ├─► 取消检查
+//	│       ├─► 创建 waitingWork
+//	│       ├─► 选择排序方式（FIFO/LIFO）
+//	│       └─► 入队到租户堆
+//	│
+//	└─► [阶段6] 等待准入
+//	        ├─► 异步准入 → 立即返回 (enabled=false, err=nil)
+//	        └─► 同步准入 → 阻塞等待
+//	            ├─► 超时/取消 → 返回 (enabled=true, err!=nil)
+//	            └─► 获得授权 → 返回 (enabled=true, err=nil)
 func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err error) {
 	if !info.ReplicatedWorkInfo.Enabled {
+		//这里根据`workKind`查找对应的配置项：
+		//- `KVWork` → `KVAdmissionControlEnabled`
+		//- `SQLKVResponseWork` → `SQLKVResponseAdmissionControlEnabled`
+		//- `SQLSQLResponseWork` → `SQLSQLResponseAdmissionControlEnabled`
+		// 传统的准入控制逻辑
+		//┌─────────────────────────────┐
+		//│ info.ReplicatedWorkInfo     │
+		//│ .Enabled?                   │
+		//└────────┬───────────┬────────┘
+		//         │           │
+		//    false│           │true
+		//         ↓           │
+		//    ┌────────────┐  │
+		//    │检查集群设置 │  │
+		//    │是否启用AC? │  │
+		//    └──┬────┬────┘  │
+		//       │    │       │
+		//     是│    │否     │
+		//       │    ↓       │
+		//       │  返回      │
+		//       │ (false,    │
+		//       │  nil)      │
+		//       │            │
+		//       └────────────┴───► 继续执行
+		//                         (准入控制启用)
+
 		enabledSetting := admissionControlEnabledSettings[q.workKind]
 		if enabledSetting != nil && !enabledSetting.Get(&q.settings.SV) {
 			q.metrics.recordBypassedAdmission(info.Priority)
+			//返回准入控制未启用
+			//- 这是最早的退出点，如果准入控制未启用，直接返回(false, nil)
+			//- 调用者看到enabled=false，知道无需调用AdmittedWorkDone()
 			return false, nil
 		}
 	}
-
 	// TODO(irfansharif): When enabling replication admission control for
 	// regular writes with arbitrary concurrency (part of #95563), measure
 	// the memory overhead of enqueueing each raft command to see whether we
@@ -580,9 +728,13 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 
 	if info.RequestedCount == 0 {
 		// We treat unset RequestCounts as an implicit request of 1.
+		// 默认请求1个单位
 		info.RequestedCount = 1
 	}
 	if !q.usesTokens && info.RequestedCount != 1 {
+		//- 如果未设置（`== 0`），默认为1
+		//- 对于槽位型队列（`usesTokens=false`），必须等于1
+		//- 对于令牌型队列（`usesTokens=true`），可以 > 1
 		panic(errors.AssertionFailedf("unexpected RequestedCount: %d", info.RequestedCount))
 	}
 	q.metrics.incRequested(info.Priority)
@@ -600,6 +752,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 	}
 	if info.ReplicatedWorkInfo.Enabled {
 		if info.BypassAdmission {
+			//1. 复制写入不能绕过准入控制（BypassAdmission 必须为 false）
 			// TODO(irfansharif): "Admin" work (like splits, scatters, lease
 			// transfers, etc.), and work originating from AdmissionHeader_OTHER,
 			// don't use flow control tokens above-raft. So there's nothing to
@@ -610,27 +763,66 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 			panic("unexpected BypassAdmission bit set for below raft admission")
 		}
 		if !q.usesTokens {
+			//2. 复制写入只能在基于令牌的队列中使用（不能在基于槽位的队列中使用）
 			panic("unexpected ReplicatedWrite.Enabled on slot-based queue")
 		}
 	}
+	//只有KVWork类型的工作才允许旁路准入控制，这是因为：
+	//- 高优先级的内部KV活动（如节点存活检测）不能被阻塞
+	//- KV层内部生成的工作（如意图解析）必须立即处理以避免死锁
+	//**为什么只有KVWork可以旁路**：
+	//| 工作类型 | 是否允许旁路 | 原因 |
+	//| --- | --- | --- |
+	//| KVWork | ✓ | 节点心跳、意图解析等内部操作可能导致死锁 |
+	//| SQLKVResponseWork | × | 纯SQL层工作，不会造成死锁 |
+	//| SQLSQLResponseWork | × | 纯SQL层工作，不会造成死锁 |
 	if info.BypassAdmission && q.workKind == KVWork {
 		tenant.used += uint64(info.RequestedCount)
 		if isInTenantHeap(tenant) {
 			q.mu.tenantHeap.fix(tenant)
 		}
 		q.mu.Unlock()
-		q.granter.tookWithoutPermission(info.RequestedCount)
+		q.granter.tookWithoutPermission(info.RequestedCount) //  ← 通知granter强制占用
 		q.metrics.incAdmitted(info.Priority)
 		q.metrics.recordBypassedAdmission(info.Priority)
-		return true, nil
+		return true, nil //  ← 立即成功
 	}
 	// Work is subject to admission control.
 
 	// Tell priorityStates about this received work. We don't tell it about work
 	// that has bypassed admission control, since priorityStates is deciding the
 	// threshold for LIFO queueing based on observed admission latency.
+	// 告知 priorityStates 收到了一项任务。
+	// 我们不会告知那些“绕过准入控制”的任务，
+	// 因为 priorityStates 是基于观察到的准入延迟，来决定 LIFO 队列触发阈值的。
 	tenant.priorityStates.requestAtPriority(info.Priority)
 
+	//条件1: len(q.mu.tenantHeap) == 0  (队列为空)
+	//  AND
+	//条件2: !q.knobs.DisableWorkQueueFastPath  (未禁用快速路径)
+	//队列为空?
+	//    │
+	//    ├─ Yes → 快速路径
+	//    │         │
+	//    │         ↓
+	//    │    乐观更新 tenant.used
+	//    │         │
+	//    │         ↓
+	//    │    释放锁 q.mu.Unlock()
+	//    │         │
+	//    │         ↓
+	//    │    granter.tryGet()
+	//    │         │
+	//    │    ┌────┴────┐
+	//    │    │         │
+	//    │  成功       失败
+	//    │    │         │
+	//    │    ↓         ↓
+	//    │  返回     重新加锁
+	//    │ (true,    回退used
+	//    │  nil)     进入慢路径
+	//    │
+	//    └─ No → 直接进入慢路径
 	if len(q.mu.tenantHeap) == 0 && !q.knobs.DisableWorkQueueFastPath {
 		// Fast-path. Try to grab token/slot.
 		// Optimistically update used to avoid locking again.
@@ -644,6 +836,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 		if q.granter.tryGet(canBurst /*arbitrary*/, info.RequestedCount) {
 			q.metrics.incAdmitted(info.Priority)
 			if info.ReplicatedWorkInfo.Enabled {
+				//在快速路径中，如果复制写入获得准入，会触发特殊的日志记录和回调：
 				// TODO(irfansharif): There's a race here, and could lead to
 				// over-admission. It's possible that there are enqueued work
 				// items with lower log positions than the request that just got
@@ -689,6 +882,19 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 		// that GrantCoordinator will periodically, at a high frequency, look at
 		// the state of the requesters to see if there is any queued work that
 		// can be granted admission.
+		//**竞态场景**：
+		//
+		//```
+		//时间线：
+		//
+		//T0: 请求A 释放q.mu，调用tryGet()失败
+		//T1: granter负载降低，调用hasWaitingRequests()
+		//T2: hasWaitingRequests()返回false（队列还是空的）
+		//T3: 请求A 重新获取q.mu，准备入队
+		//T4: 请求A 入队完成
+		//
+		//结果：granter有空闲容量，但请求A在队列中等待
+		//```
 		q.mu.Lock()
 		// The tenant could have been removed. See the comment where the
 		// tenantInfo struct is declared.
@@ -709,6 +915,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 	// Check for cancellation.
 	startTime := q.timeNow()
 	if ctx.Err() != nil {
+		// 上下文已取消，直接返回错误
 		if info.ReplicatedWorkInfo.Enabled {
 			panic("not equipped to deal with cancelable contexts below raft")
 		}
@@ -725,11 +932,18 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 				q.workKind, deadlineSubstring, startTime)
 	}
 	// Push onto heap(s).
-	ordering := fifoWorkOrdering
+	ordering := fifoWorkOrdering // 默认FIFO
 	if int(info.Priority) < tenant.fifoPriorityThreshold {
-		ordering = lifoWorkOrdering
+		ordering = lifoWorkOrdering // 低优先级使用LIFO
 	}
-	work := newWaitingWork(info.Priority, ordering, info.CreateTime, info.RequestedCount, startTime, q.mu.epochLengthNanos)
+	work := newWaitingWork(
+		info.Priority,         // 优先级
+		ordering,              // FIFO/LIFO
+		info.CreateTime,       // 创建时间
+		info.RequestedCount,   // 请求数量
+		startTime,             // 入队时间
+		q.mu.epochLengthNanos, // epoch长度
+	)
 	work.replicated = info.ReplicatedWorkInfo
 
 	inTenantHeap := isInTenantHeap(tenant)
@@ -748,6 +962,7 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 
 	q.metrics.recordStartWait(info.Priority)
 	if info.ReplicatedWorkInfo.Enabled {
+		//对于复制写入，准入控制是异步的，这意味着工作被排队后立即返回，而不需要等待实际获得准入：
 		if log.V(1) {
 			q.mu.Lock()
 			queueLen := tenant.waitingWorkHeap.Len()
@@ -761,9 +976,10 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 			)
 		}
 
-		return false, nil // return without waiting (admission is asynchronous)
+		return false, nil // 立即返回，不等待
 	}
 
+	//同步准入（常规工作）
 	// Start waiting for admission.
 	var span *tracing.Span
 	ctx, span = tracing.ChildSpan(ctx, "admissionWorkQueueWait")
@@ -771,6 +987,31 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 	defer releaseWaitingWork(work)
 	select {
 	case <-ctx.Done():
+		//<-ctx.Done() 触发
+		//    ↓
+		//计算等待时间
+		//    ↓
+		//q.mu.Lock()
+		//    ↓
+		//检查 work.heapIndex
+		//    │
+		//    ├─ heapIndex == -1  (已从heap移除，授权已发生)
+		//    │     ↓
+		//    │  不回退used (避免竞态)
+		//    │     ↓
+		//    │  granter.returnGrant()  ← 归还授权
+		//    │     ↓
+		//    │  <-work.ch  ← 接收chainID
+		//    │     ↓
+		//    │  continueGrantChain()  ← 继续授权链
+		//    │
+		//    └─ heapIndex != -1  (仍在heap中)
+		//          ↓
+		//       从heap移除
+		//          ↓
+		//       从tenantHeap移除(如果需要)
+		//          ↓
+		//    返回错误
 		waitDur := q.timeNow().Sub(startTime)
 		q.mu.Lock()
 		// The work was cancelled, so waitDur is less than the wait time this work
@@ -793,13 +1034,15 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 			// returnGrant so we're not holding back future grant chains if this one
 			// chain gets terminated.
 			chainID := <-work.ch
-			q.granter.continueGrantChain(chainID)
+			q.granter.continueGrantChain(chainID) //← 继续授权链
 		} else {
+			// (仍在heap中)
 			if work.inWaitingWorkHeap {
 				tenant.waitingWorkHeap.remove(work)
 			} else {
 				tenant.openEpochsHeap.remove(work)
 			}
+			//  从tenantHeap移除(如果需要)
 			if !isInTenantHeap(tenant) {
 				q.mu.tenantHeap.remove(tenant)
 			}
@@ -820,6 +1063,17 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 			errors.Newf("context canceled while waiting in queue: %s, pri: %s, start: %v, dur: %v",
 				q.queueKind, admissionpb.WorkPriorityDict[info.Priority], startTime, waitDur)
 	case chainID, ok := <-work.ch:
+		//<-work.ch 收到 chainID
+		//    ↓
+		//检查 work.heapIndex
+		//    │
+		//    └─ 必须 == -1 (否则panic)
+		//       ↓
+		//记录指标
+		//    ↓
+		//continueGrantChain(chainID)  ← 重要！继续授权链
+		//    ↓
+		//返回 (true, nil)
 		if !ok {
 			panic(errors.AssertionFailedf("channel should not be closed"))
 		}
@@ -892,15 +1146,28 @@ func (q *WorkQueue) granted(grantChainID grantChainID) int64 {
 		q.mu.Unlock()
 		return 0
 	}
+	// 优先从 waitingWorkHeap 出队
 	tenant := q.mu.tenantHeap[0]
 	var item *waitingWork
+	//设计原则：
+	//1. waitingWorkHeap 中的工作都是"已就绪"的：
+	//   - epoch 已关闭的 LIFO 工作
+	//   - 所有 FIFO 工作
+	//2. openEpochsHeap 中的工作是"未就绪"的：
+	//   - epoch 未关闭的 LIFO 工作
+	//3. 只有在 waitingWorkHeap 为空时才从 openEpochsHeap 取工作
+	//   - 这种情况说明系统空闲
+	//   - 此时 LIFO/FIFO 的区别不重要
 	if len(tenant.waitingWorkHeap) > 0 {
 		item = heap.Pop(&tenant.waitingWorkHeap).(*waitingWork)
 	} else {
+		// waitingWorkHeap 为空，从 openEpochsHeap 出队
 		item = heap.Pop(&tenant.openEpochsHeap).(*waitingWork)
 	}
+	// 记录等待时延
 	waitDur := now.Sub(item.enqueueingTime)
 	tenant.priorityStates.updateDelayLocked(item.priority, waitDur, false /* canceled */)
+	// 更新租户使用量
 	tenant.used += uint64(item.requestedCount)
 	if isInTenantHeap(tenant) {
 		q.mu.tenantHeap.fix(tenant)
@@ -954,20 +1221,20 @@ func (q *WorkQueue) granted(grantChainID grantChainID) int64 {
 	return requestedCount
 }
 
+// 每秒执行一次 (后台 goroutine)
 func (q *WorkQueue) gcTenantsAndResetUsed() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	// With large numbers of active tenants, this iteration could hold the lock
-	// longer than desired. We could break this iteration into smaller parts if
-	// needed.
+
 	for id, info := range q.mu.tenants {
 		if info.used == 0 && !isInTenantHeap(info) {
+			// 条件1：没有使用资源
+			// 条件2：没有等待的工作
 			delete(q.mu.tenants, id)
-			releaseTenantInfo(info)
+			releaseTenantInfo(info) // 返回到对象池
 		} else {
+			// 重置 used 计数（每秒归零，避免历史数据影响公平性）
 			info.used = 0
-			// All the heap members will reset used=0, so no need to change heap
-			// ordering.
 		}
 	}
 }
@@ -1189,10 +1456,12 @@ type priorityState struct {
 	// unlikely to be the case that a certain priority sees admission with no
 	// high latency while the next lower priority never gets work dequeued
 	// because of resource saturation.
+	// 最大队列延迟（包括成功和取消的请求）
 	maxQueueDelay time.Duration
 	// Count of requests that were successfully admitted (not canceled). This is
 	// used in concert with lowestPriorityWithRequests to detect priorities
 	// where work was queued but nothing was successfully admitted.
+	//	成功准入的计数（不包括取消的）
 	admittedCount int
 }
 
@@ -1217,7 +1486,10 @@ func makePriorityStates(ps []priorityState) priorityStates {
 // requestAtPriority is called when a request is received at the given
 // priority.
 func (ps *priorityStates) requestAtPriority(priority admissionpb.WorkPriority) {
+	// 如果新请求的优先级（数字越小通常优先级越高，或视具体定义而定）
+	// 比目前记录的最低优先级还要低：
 	if int(priority) < ps.lowestPriorityWithRequests {
+		// 则更新最低优先级记录
 		ps.lowestPriorityWithRequests = int(priority)
 	}
 }
@@ -1226,6 +1498,39 @@ func (ps *priorityStates) requestAtPriority(priority admissionpb.WorkPriority) {
 // priority. This is used to compute priorityState.maxQueueDelay. Canceled
 // indicates whether the request was canceled while waiting in the queue, or
 // successfully admitted.
+// 记录每个租户下的 工作最大延迟
+// 请求完成（成功或取消）
+//
+//	│
+//	↓
+//
+// 计算 waitDur = now - enqueueTime
+//
+//	│
+//	↓
+//
+// 调用 updateDelayLocked(priority, waitDur, canceled)
+//
+//	│
+//	├──> 查找该 priority 是否已存在
+//	│    │
+//	│    ├─ 存在 → 更新统计
+//	│    │   ├─ if !canceled: admittedCount++
+//	│    │   └─ maxQueueDelay = max(current, new)
+//	│    │
+//	│    └─ 不存在 → 插入新的 priorityState
+//	│
+//	↓
+//
+// 这些统计在 epoch 关闭时被使用
+//
+//	│
+//	↓
+//
+// getFIFOPriorityThresholdAndReset()
+//
+//	│
+//	└──> 决定 FIFO/LIFO 切换阈值
 func (ps *priorityStates) updateDelayLocked(
 	priority admissionpb.WorkPriority, delay time.Duration, canceled bool,
 ) {
@@ -1312,7 +1617,7 @@ func (ps *priorityStates) getFIFOPriorityThresholdAndReset(
 type tenantInfo struct {
 	id uint64
 	// The weight assigned to the tenant. Must be > 0.
-	weight uint32
+	weight uint32 //(租户权重)
 	// used is computed over an interval and periodically reset. Ordering
 	// between tenants, for fair sharing, utilizes this value.
 	//
@@ -1344,18 +1649,26 @@ type tenantInfo struct {
 	// simply (a) do not do used--, if used is already zero, or (b) do not do
 	// used-- if the request was canceled. This does imply some inaccuracy in
 	// accounting -- it can be fixed if needed.
-	used            uint64
-	waitingWorkHeap waitingWorkHeap
-	openEpochsHeap  openEpochsHeap
-
+	// used: 已使用的资源量
+	// - 对于 slots: used = CPU 时间(纳秒)
+	// - 对于 tokens: used = token 数量
+	//
+	// 每秒重置一次,确保公平性不会被历史使用量"污染"
+	used uint64 // 已使用的slots/tokens
+	// 两个堆:一个 FIFO,一个 LIFO
+	waitingWorkHeap waitingWorkHeap // 优先级堆(最小堆,priority 越小越优先)
+	openEpochsHeap  openEpochsHeap  // Epoch 堆(LIFO,用于过载时)
+	// 优先级状态跟踪
 	priorityStates priorityStates
+	// FIFO/LIFO 切换阈值
+	// priority >= fifoPriorityThreshold → FIFO
+	// priority <  fifoPriorityThreshold → LIFO
+
 	// priority >= fifoPriorityThreshold is FIFO. This uses a larger sized type
 	// than WorkPriority since the threshold can be > MaxPri.
 	fifoPriorityThreshold int
 
-	// The heapIndex is maintained by the heap.Interface methods, and represents
-	// the heapIndex of the item in the heap.
-	heapIndex int
+	heapIndex int // 在tenantHeap中的索引
 }
 
 // tenantHeap is a heap of tenants with waiting work, ordered in increasing
@@ -1385,6 +1698,7 @@ func newTenantInfo(id uint64, weight uint32) *tenantInfo {
 	return ti
 }
 
+// 恢复默认值，返回sync.pool中
 func releaseTenantInfo(ti *tenantInfo) {
 	if isInTenantHeap(ti) {
 		panic("tenantInfo has non-empty heap")
@@ -1466,7 +1780,7 @@ type waitingWork struct {
 
 	// ch is used to communicate a grant to the waiting goroutine. The
 	// grantChainID is used by the waiting goroutine to call continueGrantChain.
-	ch chan grantChainID
+	ch chan grantChainID // 准入通知channel
 	// The heapIndex is maintained by the heap.Interface methods, and represents
 	// the heapIndex of the item in the heap. -1 when not in the heap. The same
 	// heapIndex is used by the waitingWorkHeap and the openEpochsHeap since a
@@ -1478,7 +1792,7 @@ type waitingWork struct {
 	// to false.
 	inWaitingWorkHeap bool
 	enqueueingTime    time.Time
-	replicated        ReplicatedWorkInfo
+	replicated        ReplicatedWorkInfo // 复制工作信息
 }
 
 var waitingWorkPool = sync.Pool{
@@ -1537,8 +1851,19 @@ const epochClosingDelta = time.Millisecond * 5
 // Latency threshold for switching to LIFO queuing. Once we switch to LIFO,
 // the minimum latency will be epochLenghNanos+epochClosingDeltaNanos, so it
 // makes sense not to switch until the observed latency is around the same.
+// 在相同优先级内的排序变得复杂，因为我们希望根据每个工作项的
+// workOrderingKind 混合使用 LIFO 和 FIFO。如果比较 FIFO 工作和
+// LIFO 工作，我们简单地使用 createTime，这导致"LIFO of FIFO"
+// （FIFO 工作通常比 LIFO 工作更老）。直觉是：我们不想饿死在转换
+// 到 LIFO 之前排队的老 FIFO 工作。在罕见的回退到 FIFO 的情况下，
+// 老 LIFO 工作会排在新 FIFO 工作前面，这是可接受的（不会造成重大
+// 公平性问题），因为这种转换应该很少见。
 const maxQueueDelayToSwitchToLifo = epochLength + epochClosingDelta
 
+// 示例：
+// epochLengthNanos = 100ms = 100,000,000 ns
+// t = 1,234,567,890,000,000 ns
+// epoch = 1,234,567,890,000,000 / 100,000,000 = 12,345,678
 func epochForTimeNanos(t int64, epochLengthNanos int64) int64 {
 	return t / epochLengthNanos
 }
@@ -1618,6 +1943,11 @@ func (wwh *waitingWorkHeap) Len() int { return len(*wwh) }
 //	w2: (lifo, create: t2, epoch: e)
 //	w1: (fifo, create: t1, epoch: e)
 //	w1 < w3, w3 < w2, w2 < w1, which is a cycle.
+//
+// 翻译：
+// 如果系统在过载和正常状态之间快速波动，这种接近 FIFO 的行为有风险：
+// 在 openEpochsHeap 中 FIFO 可能导致事务开始执行，但因为后续工作使用
+// LIFO 排序而无法完成。
 func (wwh *waitingWorkHeap) Less(i, j int) bool {
 	if (*wwh)[i].priority == (*wwh)[j].priority {
 		if (*wwh)[i].arrivalTimeWorkOrdering == lifoWorkOrdering ||
@@ -2286,6 +2616,9 @@ func makeStoreWorkQueue(
 
 	opts.usesAsyncAdmit = true
 	for i := range q.q {
+		//StoreWorkQueue内部包含两个WorkQueue实例：
+		//- 索引0：RegularWorkClass → “kv-regular-store-queue”
+		//- 索引1：ElasticWorkClass → “kv-elastic-store-queue”
 		var queueKind QueueKind
 		if i == int(admissionpb.RegularWorkClass) {
 			queueKind = "kv-regular-store-queue"

@@ -54,6 +54,16 @@ func WriteClusterVersionToEngines(
 //
 // binaryMinSupportedVersion is the minimum version supported by this binary. An
 // error is returned if any engine has a version lower that this.
+// 代码遵循以下步骤来确定版本：
+// 扫描所有引擎：循环检查节点上的所有硬盘存储（engines），读取它们记录的最小版本（MinVersion）。
+// 上限检查（禁止降级）：
+// 如果硬盘里的数据版本是 v23.1，但你尝试用 v22.2 的程序启动，代码会直接报错。
+// 理由：一旦数据被新版本处理过，旧版本程序可能无法解析新格式，强制运行会导致数据损坏（Unsafe）。
+// 确定最小版本：找到所有引擎中记录的最旧版本（minStoreVersion）。
+// 下限检查（禁止跨度过大）：
+// 每个程序都有一个最低支持版本（binaryMinSupportedVersion）。
+// 如果硬盘数据太老了（比如是 3 年前的版本），新程序也会拒绝启动，要求你先进行中间版本的平滑升级。
+// 初始化兜底：如果是一个全新的节点（没有任何数据），则默认使用该二进制程序支持的最小版本。
 func SynthesizeClusterVersionFromEngines(
 	ctx context.Context,
 	engines []storage.Engine,

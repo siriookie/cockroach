@@ -195,6 +195,10 @@ type granter interface {
 	// useful for certain granters.
 	//
 	// REQUIRES: count > 0. count == 1 for slots.
+	//1. **tryGet**：快速路径（fast path）
+	//    - 当没有排队工作时，直接尝试获取资源
+	//    - 避免了不必要的入队和出队开销
+	//    - 参数`burstQualification`用于区分是否允许突发（burst）
 	tryGet(getterQual burstQualification, count int64) (granted bool)
 	// returnGrant is called for:
 	// - returning slots after use.
@@ -212,6 +216,10 @@ type granter interface {
 	// done -- that should be done via granterWithStoreReplicatedWorkAdmitted.storeWriteDone.
 	//
 	// REQUIRES: count > 0. count == 1 for slots.
+	//2. **returnGrant**：资源归还
+	//    - slots使用完毕后必须归还
+	//    - tokens如果没有全部使用也可以归还
+	//    - 处理取消竞态（cancellation race）
 	returnGrant(count int64)
 	// tookWithoutPermission informs the granter that a slot or tokens were
 	// taken unilaterally, without permission. This is useful:
@@ -229,6 +237,10 @@ type granter interface {
 	// done -- that should be done via granterWithStoreReplicatedWorkAdmitted.storeWriteDone.
 	//
 	// REQUIRES: count > 0. count == 1 for slots.
+	//3. **tookWithoutPermission**：强制占用通知
+	//    - 高优先级工作可以绕过准入控制
+	//    - 用于避免死锁（如意图解析生成的KV工作）
+	//    - granter需要知道这些”黑市”资源使用
 	tookWithoutPermission(count int64)
 	// continueGrantChain is called by the requester at some point after grant
 	// was called on the requester. The expectation is that this is called by
@@ -250,6 +262,8 @@ type granter interface {
 	// It would help for a top-level comment on grantChainID or continueGrantChain
 	// to spell out what grant chains are, their purpose, and how they work with
 	// an example.
+	//- 实现自然节流（natural throttling）
+	//- 考虑了goroutine调度器的实际能力
 	continueGrantChain(grantChainID grantChainID)
 }
 
@@ -265,6 +279,12 @@ type granter interface {
 // tokens are handled.
 //
 // TODO(sumeer): remove the demuxHandle.
+// - 将锁管理集中在GrantCoordinator中
+// - 避免granter和requester之间的锁竞争
+// - 提供更细粒度的控制
+//
+// **锁顺序规则**（重要！）：
+// > granter的锁必须在requester的锁之前获取。requester在调用granter时不能持有自己的锁
 type granterWithLockedCalls interface {
 	// tryGetLocked is the real implementation of tryGet from the granter
 	// interface. demuxHandle is an opaque handle that was passed into the
@@ -426,6 +446,16 @@ type SchedulerLatencyListener = schedulerlatency.LatencyObserver
 
 type grantResult int8
 
+// 1. **grantSuccess**：授权成功
+//   - 资源充足，工作可以开始执行
+//
+// 2. **grantFailDueToSharedResource**：共享资源过载
+//   - CPU或内存等共享资源不足
+//   - 对于授权链（grant chain），这是终止信号
+//
+// 3. **grantFailLocal**：本地约束失败
+//   - 本granter的tokens/slots不足
+//   - 或者没有等待的工作
 const (
 	grantSuccess grantResult = iota
 	// grantFailDueToSharedResource is returned when the granter is unable to
@@ -499,6 +529,63 @@ type WorkKind int8
 // in the example above, does not apply to work generated from within the KV
 // layer. See https://github.com/cockroachdb/cockroach/issues/85471 for
 // details.
+// WorkKind 的列表是按照「从低层级到高层级」排列的，
+// 同时也充当了一种“硬编码”的优先级顺序：从最重要到最不重要。
+// （关于这种顺序是如何真正生效的，详见 GrantCoordinator 的实现代码。）
+//
+// KVWork、SQLKVResponseWork、SQLSQLResponseWork 都可能是 CPU 密集型的。
+// 它们的优先级顺序为：
+//
+//     KVWork > SQLKVResponseWork > SQLSQLResponseWork
+//
+// 将 KVWork 置于最高优先级，可以降低非 SQL 的 KV 层工作被饿死的概率。
+// SQLKVResponseWork 的优先级高于 SQLSQLResponseWork，
+// 因为前者包含了 DistSQL 的叶子节点处理，我们希望能尽早释放
+// RPC 树底层节点中响应所占用的内存。
+// 我们预期，如果 SQLSQLResponseWork 被延迟，
+// 最终会减少新工作的发起，这是一种“自然的背压”机制，是我们所期望的行为。
+//
+// 考虑这样一个例子：在单节点环境中，
+// 一个优先级较低、运行时间很长的 OLAP 查询，
+// 与多个优先级更高、执行时间很短的 OLTP 查询相互竞争。
+// 假设 OLAP 查询最先开始，并占用了所有的 KVWork 槽位，
+// 后续到来的 OLTP 查询只能在 KVWork 槽位上排队等待。
+// 当 OLAP 查询的 KVWork 完成后，它会继续排队等待 SQLKVResponseWork，
+// 但此时由于 OLTP 查询正在占用所有可用的 KVWork 槽位，
+// OLAP 的 SQLKVResponseWork 无法开始执行。
+// 随着 OLTP 查询的 KVWork 完成，它们各自的 SQLKVResponseWork 也会进入队列。
+// 在为 SQLKVResponseWork 发放 token 时，
+// 其对应的 WorkQueue 会优先允许更重要的 OLTP 查询进入执行，
+// 从而阻止或减缓 OLAP 查询后续工作的准入。
+//
+// 在一个理想化的世界里，如果唯一的跨 WorkKind 共享资源只有 CPU，
+// 并且我们能够完全控制 CPU 调度器，
+// 那么所有不同 WorkKind 的工作都可以放入同一个队列中进行调度，
+// 就不需要依赖这种“间接的背压机制”和硬编码的优先级顺序。
+// 但现实中我们无法控制 CPU 调度器，
+// 因此也无法抢占那些 CPU 消耗差异极大的任务。
+// 此外，内存（而且是不可抢占的内存）同样是共享资源，
+// 我们也不希望由于 CPU 调度器的抢占，
+// 导致已经部分执行的 KVWork 无法完成，
+// 因为它们可能正持有大量内存（例如扫描操作）。
+//
+// 上述的优先级设计还使我们能够获得关于 CPU 资源过载的“即时反馈”。
+// 对于前面提到的 grant chain，这种即时反馈主要通过两种方式实现：
+//   - 该链路要求被授予者对应的 goroutine 能够真正运行；
+//   - cpuOverloadIndicator（后文会介绍），
+//     特别是由 kvSlotAdjuster 提供的实现，
+//     能够提供即时反馈（之所以可行，正是因为 KVWork 具有最高优先级）。
+//
+// 这种跨 WorkKind 的严格优先级排序，可能会导致“优先级反转”问题：
+// 某些重要性较低的 KVWork，或者后启动的 KVWork，
+// 可能会先于面向用户的 SQLKVResponseWork 执行。
+// 这是因为前面示例中描述的背压机制，
+// 并不会作用于 KV 层内部生成的工作。
+// 详见：https://github.com/cockroachdb/cockroach/issues/85471
+
+// 1. 架构层次抽象：WorkKind代表的是CockroachDB系统架构中不同层次的工作类型
+// 2. 有限且固定：只有3种WorkKind，对应KV层和SQL层的不同处理阶段
+// 3. 优先级隐含排序：从KVWork到SQLSQLResponseWork，体现了从底层到高层的优先级递减
 const (
 	// KVWork represents requests submitted to the KV layer, from the same node
 	// or a different node. They may originate from the SQL layer or the KV
@@ -537,6 +624,10 @@ func (wk WorkKind) String() string {
 // "kv-regular-store-queue", "kv-elastic-store-queue".
 //
 // It is left empty for SQL types of WorkKind.
+// 1. **“kv-regular-cpu-queue”**：常规KV工作的CPU队列
+// 2. **“kv-elastic-cpu-queue”**：弹性KV工作的CPU队列
+// 3. **“kv-regular-store-queue”**：常规KV工作的Store队列
+// 4. **“kv-elastic-store-queue”**：弹性KV工作的Store队列
 type QueueKind string
 
 // SafeValue implements the redact.SafeValue interface.

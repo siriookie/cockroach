@@ -32,16 +32,16 @@ type slotGranter struct {
 	coord      *GrantCoordinator
 	workKind   WorkKind
 	requester  requester
-	usedSlots  int
-	totalSlots int
+	usedSlots  int // 已使用的槽位数
+	totalSlots int // 总槽位数
 	// skipSlotEnforcement is a dynamic value that changes based on the sampling
 	// period of cpu load. It is always true when !goschedstats.Supported (see
 	// https://github.com/cockroachdb/cockroach/issues/142262).
-	skipSlotEnforcement bool
+	skipSlotEnforcement bool //是否跳过槽位强制（CPU负载采样周期 > 1ms时为true）
 
 	usedSlotsMetric              *metric.Gauge
 	slotsExhaustedDurationMetric *metric.Counter
-	exhaustedStart               time.Time
+	exhaustedStart               time.Time //槽位耗尽的起始时间（用于统计）
 }
 
 var _ granterWithLockedCalls = &slotGranter{}
@@ -52,19 +52,26 @@ func (sg *slotGranter) tryGet(_ burstQualification, count int64) bool {
 	return sg.coord.tryGet(sg.workKind, count, 0 /*arbitrary*/)
 }
 
+// 尝试获取槽位
 // tryGetLocked implements granterWithLockedCalls.
 func (sg *slotGranter) tryGetLocked(count int64, _ int8) grantResult {
+	//槽位必须是1：slots总是以单个单位分配（与tokens不同）
 	if count != 1 {
 		panic(errors.AssertionFailedf("unexpected count: %d", count))
 	}
+	//- 正常情况：`usedSlots < totalSlots`
+	//- 特殊情况：`skipSlotEnforcement == true`（CPU监控失效时）
 	if sg.usedSlots < sg.totalSlots || sg.skipSlotEnforcement {
 		sg.usedSlots++
 		if sg.usedSlots == sg.totalSlots {
+			//精确记录资源耗尽的时刻，用于性能分析
 			sg.exhaustedStart = timeutil.Now()
 		}
 		sg.usedSlotsMetric.Update(int64(sg.usedSlots))
 		return grantSuccess
 	}
+	//- KVWork失败 → `grantFailDueToSharedResource`（因为KVWork是最高优先级，它的失败意味着CPU等共享资源不足）
+	//- 其他 → `grantFailLocal`
 	if sg.workKind == KVWork {
 		return grantFailDueToSharedResource
 	}
@@ -84,12 +91,13 @@ func (sg *slotGranter) returnGrantLocked(count int64, _ int8) {
 	if sg.usedSlots == sg.totalSlots {
 		now := timeutil.Now()
 		exhaustedMicros := now.Sub(sg.exhaustedStart).Microseconds()
-		sg.slotsExhaustedDurationMetric.Inc(exhaustedMicros)
+		sg.slotsExhaustedDurationMetric.Inc(exhaustedMicros) // 累计耗尽时长
 	}
 	sg.usedSlots--
 	if sg.usedSlots < 0 {
 		panic(errors.AssertionFailedf("used slots is negative %d", sg.usedSlots))
 	}
+	//实时更新Prometheus指标
 	sg.usedSlotsMetric.Update(int64(sg.usedSlots))
 }
 
@@ -99,6 +107,9 @@ func (sg *slotGranter) tookWithoutPermission(count int64) {
 }
 
 // tookWithoutPermissionLocked implements granterWithLockedCalls.
+// - 直接增加usedSlots，不检查是否超过totalSlots
+// - 允许usedSlots > totalSlots（过载情况）
+// - 这是高优先级工作或避免死锁所必需的
 func (sg *slotGranter) tookWithoutPermissionLocked(count int64, _ int8) {
 	if count != 1 {
 		panic(errors.AssertionFailedf("unexpected count: %d", count))
@@ -148,12 +159,15 @@ func (sg *slotGranter) setTotalSlotsLocked(totalSlots int) {
 
 func (sg *slotGranter) setTotalSlotsLockedInternal(totalSlots int) {
 	if totalSlots > sg.totalSlots {
+		// 增加槽位
 		if sg.totalSlots <= sg.usedSlots && totalSlots > sg.usedSlots {
+			// 从耗尽状态恢复
 			now := timeutil.Now()
 			exhaustedMicros := now.Sub(sg.exhaustedStart).Microseconds()
 			sg.slotsExhaustedDurationMetric.Inc(exhaustedMicros)
 		}
 	} else if totalSlots < sg.totalSlots {
+		// 减少槽位
 		if sg.totalSlots > sg.usedSlots && totalSlots <= sg.usedSlots {
 			sg.exhaustedStart = timeutil.Now()
 		}
@@ -163,21 +177,26 @@ func (sg *slotGranter) setTotalSlotsLockedInternal(totalSlots int) {
 }
 
 // tokenGranter implements granterWithLockedCalls.
+// **与slotGranter的关键区别**：
+// 1. **令牌可以批量分配**：`count`可以 > 1
+// 2. **有突发限制**：`maxBurstTokens`限制短时间内的令牌消耗
+// 3. **CPU过载检查**：每次分配都检查`cpuOverload.isOverloaded()`
 type tokenGranter struct {
 	coord                *GrantCoordinator
 	workKind             WorkKind
 	requester            requester
-	availableBurstTokens int64
-	maxBurstTokens       int64
+	availableBurstTokens int64 // 当前可用的突发令牌数
+	maxBurstTokens       int64 // 最大突发令牌数
 	skipTokenEnforcement bool
 	// Non-nil for all uses of tokenGranter (SQLKVResponseWork and
 	// SQLSQLResponseWork).
-	cpuOverload cpuOverloadIndicator
+	cpuOverload cpuOverloadIndicator // CPU过载指示器
 }
 
 var _ granterWithLockedCalls = &tokenGranter{}
 var _ granter = &tokenGranter{}
 
+// refillBurstTokens 周期性补充令牌
 func (tg *tokenGranter) refillBurstTokens(skipTokenEnforcement bool) {
 	tg.availableBurstTokens = tg.maxBurstTokens
 	tg.skipTokenEnforcement = skipTokenEnforcement
@@ -189,12 +208,24 @@ func (tg *tokenGranter) tryGet(_ burstQualification, count int64) bool {
 }
 
 // tryGetLocked implements granterWithLockedCalls.
+//  1. **CPU过载优先检查**：即使有令牌，CPU过载也会拒绝
+//  2. **令牌可以透支**：
+//     ```
+//     假设 maxBurstTokens = 100, availableBurstTokens = 10
+//     请求 count = 50
+//     结果：availableBurstTokens = -40 (允许！)
+//     ```
+//  3. **为什么允许透支**：
+//     - 请求已经在队列中等待
+//     - 拒绝会导致饿死（starvation）
+//     - 下次refill时会恢复正常
 func (tg *tokenGranter) tryGetLocked(count int64, _ int8) grantResult {
+	// CPU过载，拒绝授权
 	if tg.cpuOverload.isOverloaded() {
 		return grantFailDueToSharedResource
 	}
 	if tg.availableBurstTokens > 0 || tg.skipTokenEnforcement {
-		tg.availableBurstTokens -= count
+		tg.availableBurstTokens -= count // 可以变成负数！
 		return grantSuccess
 	}
 	return grantFailLocal
@@ -208,7 +239,7 @@ func (tg *tokenGranter) returnGrant(count int64) {
 // returnGrantLocked implements granterWithLockedCalls.
 func (tg *tokenGranter) returnGrantLocked(count int64, _ int8) {
 	tg.availableBurstTokens += count
-	if tg.availableBurstTokens > tg.maxBurstTokens {
+	if tg.availableBurstTokens > tg.maxBurstTokens { // 上限限制
 		tg.availableBurstTokens = tg.maxBurstTokens
 	}
 }
@@ -235,15 +266,21 @@ func (tg *tokenGranter) requesterHasWaitingRequests() bool {
 }
 
 // tryGrantLocked implements granterWithLockedCalls.
+// tryGrantLocked 向等待队列授权
+// 1. 先乐观地获取1个令牌
+// 2. 通知requester有可用资源
+// 3. requester返回实际需要的令牌数
+// 4. 如果需要更多，用`tookWithoutPermission`补足
 func (tg *tokenGranter) tryGrantLocked(grantChainID grantChainID) grantResult {
-	res := tg.tryGetLocked(1, 0 /*arbitrary*/)
+	res := tg.tryGetLocked(1, 0 /*arbitrary*/) //可用token先-1
 	if res == grantSuccess {
-		tokens := tg.requester.granted(grantChainID)
+		tokens := tg.requester.granted(grantChainID) // 通知requester
 		if tokens == 0 {
-			// Did not accept grant.
+			// Did not accept grant. (请求已取消)
 			tg.returnGrantLocked(1, 0 /*arbitrary*/)
 			return grantFailLocal
 		} else if tokens > 1 {
+			// 实际需要更多令牌，再-token数的可用令牌
 			tg.tookWithoutPermissionLocked(tokens-1, 0 /*arbitrary*/)
 		}
 	}
@@ -267,10 +304,15 @@ func (tg *tokenGranter) tryGrantLocked(grantChainID grantChainID) grantResult {
 // tokens, which are based on disk bandwidth as a constrained resource, and
 // apply to all the elastic incoming bytes into the LSM.
 type kvStoreTokenGranter struct {
-	knobs             *TestingKnobs
-	regularRequester  requester
-	elasticRequester  requester
-	snapshotRequester requester
+	knobs *TestingKnobs
+	//每个requester通过kvStoreTokenChildGranter与parent交互
+	//parent管理三种令牌：
+	//  1. IO Tokens (L0刷新/压缩容量)
+	//  2. Elastic IO Tokens (弹性工作专用)
+	//  3. Disk Bandwidth Tokens (磁盘带宽)
+	regularRequester  requester //(常规工作队列)
+	elasticRequester  requester //(弹性工作队列)
+	snapshotRequester requester // (快照接收队列)
 
 	mu struct {
 		syncutil.Mutex
@@ -281,10 +323,23 @@ type kvStoreTokenGranter struct {
 		// work deducts from both availableIOTokens and availableElasticIOTokens.
 		// Regular work blocks if availableIOTokens is <= 0 and elastic work
 		// blocks if availableElasticIOTokens <= 0.
+		//1. 中文翻译
+		//“发放这些令牌（Tokens）时没有速率限制。也就是说，它们全都是突发令牌（Burst Tokens）。”
+		//
+		//“‘IO’ 令牌代表进入或离开 L0 层的冲刷/压缩能力。
+		//所有的工作都会同时扣减 availableIOTokens（可用 IO 令牌）和
+		//availableElasticIOTokens（可用弹性 IO 令牌）。当 availableIOTokens 小于等于 0 时，
+		//**常规任务（Regular work）**将会阻塞；
+		//当 availableElasticIOTokens 小于等于 0 时，**弹性任务（Elastic work）**将会阻塞。
+		// "IO" tokens代表L0的刷新/压缩容量
+		// 所有工作都从availableIOTokens中扣除
+		// 常规工作：availableIOTokens[RegularWorkClass] > 0
+		// 弹性工作：availableIOTokens[ElasticWorkClass] > 0
 		availableIOTokens            [admissionpb.NumWorkClasses]int64
 		elasticIOTokensUsedByElastic int64
 		// TODO(aaditya): add support for read/IOPS tokens.
 		// Disk bandwidth tokens.
+		// 磁盘带宽令牌
 		diskTokensAvailable diskTokens
 		diskTokensError     struct {
 			// prevObserved{Writes,Reads} is the observed disk metrics in the last
@@ -298,6 +353,7 @@ type kvStoreTokenGranter struct {
 		diskTokensUsed [admissionpb.NumStoreWorkTypes]diskTokens
 		// exhaustedStart is the time when the corresponding availableIOTokens
 		// became <= 0. Ignored when the corresponding availableIOTokens is > 0.
+		// 耗尽时间追踪
 		exhaustedStart [admissionpb.NumWorkClasses]time.Time
 		// startingIOTokens is the number of tokens set by setAvailableTokens for
 		// regular work. It is used to compute the tokens used, by computing
@@ -305,6 +361,7 @@ type kvStoreTokenGranter struct {
 		startingIOTokens int64
 
 		// Estimation models.
+		// 估算模型
 		l0WriteLM, l0IngestLM, ingestLM, writeAmpLM tokensLinearModel
 	}
 
@@ -318,6 +375,18 @@ var _ granterWithIOTokens = &kvStoreTokenGranter{}
 
 // kvStoreTokenChildGranter handles a particular workClass. Its methods
 // pass-through to the parent after adding the workClass as a parameter.
+// 委托模式
+// 在设计模式中，委托模式（Delegation Pattern） 是一种基本技巧，
+// 它的核心思想是：一个对象（委托者）不亲自处理某项任务，而是将其交给另一个辅助对象（受托者）去执行。
+//
+// 简单来说，就是“这件事我不亲自做，我找专业的人帮我做”。
+
+// 3. 为什么使用委托模式？
+// 减小耦合：委托者不需要知道任务的具体实现细节，只需要知道受托者能完成任务。
+//
+// 代码复用：多个类可以共用同一个受托者。
+//
+// 灵活性：你可以在运行时动态地更换受托者（比如把程序员从 A 换成 B）。
 type kvStoreTokenChildGranter struct {
 	workType admissionpb.StoreWorkType
 	parent   *kvStoreTokenGranter
@@ -401,21 +470,49 @@ func (sg *kvStoreTokenGranter) tryGetLocked(count int64, wt admissionpb.StoreWor
 	// needed. We are generally okay with this since the model changes
 	// infrequently (every 15s), and the disk bandwidth limiter is designed to
 	// generally under admit and only pace elastic work.
+	//1. 第一段：关于“排队优先级”的潜规则【直白翻译】注： 理想情况下，如果“常规任务”正在排队，
+	//而现在来了一个“弹性任务”，我们理应直接拒绝掉这个不重要的弹性任务，
+	//先紧着重要的常规活儿干。但我们这儿有个假设：弹性任务一旦被限流，
+	//它的队列肯定不是空的。而我们现在的代码逻辑是：只有在弹性任务队列为空的情况下，
+	//才会尝试去抢占资源。所以，常规任务在排队、弹性任务却来抢资源的情况应该极少发生，
+	//不会破坏不同任务之间的性能隔离。
+	//2. 第二段：关于“写放大”造成的账单乌龙【直白翻译】注：
+	//在计算硬盘写入令牌时，我们会用一个模型（LM）来预估“写放大”——也就是你写 1GB 数据，
+	//硬盘实际可能要处理 10GB。但这里有个明显的漏洞：我们在预扣款和最终结算这两个点之间，
+	//预估模型可能会变，导致账单对不上。举个例子：刚开始，模型认为写放大是 10 倍。你请求写 50 字节，
+	//我们先扣了 $50 \times 10 + 1 = 51$ 个令牌。还没等正式写完，模型更新了，认为写放大只要 5 倍就行。
+	//结果结算时，发现你实际写了 200 字节。按新模型算，本来该扣 1001 个，但因为预扣和结算用了不同标准，
+	//最后反倒多扣了你 250 个。当然，少扣的情况也会发生。但我们觉得没关系，因为模型每 15 秒才变一次，
+	//而且这个限流器主要就是为了压榨“弹性任务”的，不求绝对精确。
+
+	// 应用写放大模型计算磁盘写令牌
 	diskWriteTokens := count
 	if wt != admissionpb.SnapshotIngestStoreWorkType {
 		// Snapshot ingests do not incur the write amplification described above, so
 		// we skip applying the model for those writes.
 		diskWriteTokens = sg.mu.writeAmpLM.applyLinearModel(count)
 	}
+	//**三种工作类型的令牌需求**：
+	//| 工作类型 | IO Tokens (Regular) | IO Tokens (Elastic) | Disk Write Tokens |
+	//| --- | --- | --- | --- |
+	//| Regular | ✓ | × | ✓ |
+	//| Elastic | ✓ | ✓ | ✓ |
+	//| Snapshot Ingest | × | × | ✓ |
+	//**设计理由**：
+	//
+	//1. **Regular工作优先级最高**：只要RegularWorkClass的IO令牌足够就能执行
 	switch wt {
+	// 常规工作只需检查IO令牌
 	case admissionpb.RegularStoreWorkType:
 		if sg.mu.availableIOTokens[admissionpb.RegularWorkClass] > 0 {
+			// 授予令牌
 			sg.subtractIOTokensLocked(count, count, false)
 			sg.mu.diskTokensAvailable.writeByteTokens -= diskWriteTokens
 			sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskWriteTokens
 			sg.mu.diskTokensUsed[wt].writeByteTokens += diskWriteTokens
 			return true
 		}
+		// 弹性工作需要检查三种令牌
 	case admissionpb.ElasticStoreWorkType:
 		if sg.mu.diskTokensAvailable.writeByteTokens > 0 &&
 			sg.mu.availableIOTokens[admissionpb.RegularWorkClass] > 0 &&
@@ -425,15 +522,18 @@ func (sg *kvStoreTokenGranter) tryGetLocked(count int64, wt admissionpb.StoreWor
 			sg.mu.diskTokensAvailable.writeByteTokens -= diskWriteTokens
 			sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskWriteTokens
 			sg.mu.diskTokensUsed[wt].writeByteTokens += diskWriteTokens
+			// 授予令牌
 			return true
 		}
 	case admissionpb.SnapshotIngestStoreWorkType:
 		// Snapshot ingests do not go into L0, so we only subject them to
 		// writeByteTokens.
+		// 快照摄入只检查磁盘写令牌（不进L0）
 		if sg.mu.diskTokensAvailable.writeByteTokens > 0 {
 			sg.mu.diskTokensAvailable.writeByteTokens -= diskWriteTokens
 			sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted += diskWriteTokens
 			sg.mu.diskTokensUsed[wt].writeByteTokens += diskWriteTokens
+			// 授予令牌
 			return true
 		}
 	}
@@ -510,16 +610,31 @@ func (sg *kvStoreTokenGranter) adjustDiskTokenError(m StoreMetrics) {
 // interval, and not across them. For reads, this is so that we don't grow
 // arbitrarily large "burst" tokens, since they are not capped to an allocation
 // period.
+// **误差产生的原因**：
+//
+// 1. **写入误差**：
+//   - 估算的写放大 ≠ 实际写放大
+//   - 后台压缩/刷新导致的额外写入
+//
+// 2. **读取误差**：
+//   - 读取在准入时不预扣令牌
+//   - 但读取会消耗磁盘带宽
+//
+// 校正策略：
+// - 每个调整周期检查实际磁盘IO
+// - 如果实际 > 已扣除，从可用令牌中补扣
+// - 防止磁盘带宽被低估
 func (sg *kvStoreTokenGranter) adjustDiskTokenErrorLocked(readBytes uint64, writeBytes uint64) {
 	intWrites := int64(writeBytes - sg.mu.diskTokensError.prevObservedWrites)
 	intReads := int64(readBytes - sg.mu.diskTokensError.prevObservedReads)
 
 	// Compensate for error due to writes.
+	// 补偿写入误差
 	writeError := intWrites - sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted
 	if writeError > 0 {
 		sg.mu.diskTokensAvailable.writeByteTokens -= writeError
 	}
-
+	// 补偿读取误差
 	// Compensate for error due to reads.
 	readError := intReads - sg.mu.diskTokensError.diskReadTokensAlreadyDeducted
 	if readError > 0 {
@@ -528,6 +643,7 @@ func (sg *kvStoreTokenGranter) adjustDiskTokenErrorLocked(readBytes uint64, writ
 
 	// We have compensated for error, if any, in this interval, so we reset the
 	// deducted count for the next compensation interval.
+	// 重置扣除计数，准备下一个周期
 	sg.mu.diskTokensError.diskWriteTokensAlreadyDeducted = 0
 	sg.mu.diskTokensError.diskReadTokensAlreadyDeducted = 0
 
@@ -607,6 +723,17 @@ func (sg *kvStoreTokenGranter) tryGrantLocked() {
 // storeGrantCoordinator. It successfully grants to at most one waiting
 // request. If there are no waiting requests, or all waiters reject the grant,
 // it returns false.
+// 优先级排序
+// **授权优先级**：
+// ```
+// 1. Regular (常规工作) - 用户前台请求
+// 2. Snapshot Ingest (快照摄入) - 节点再平衡
+// 3. Elastic (弹性工作) - 后台任务
+// ```
+// **设计理由**：
+// - Regular优先保证用户体验
+// - Snapshot优先保证集群健康（副本恢复）
+// - Elastic最后执行，可以被抢占
 func (sg *kvStoreTokenGranter) tryGrantLockedOne() bool {
 	// NB: We grant work in the following priority order: regular, snapshot
 	// ingest, elastic work. Snapshot ingests are a special type of elastic work.
@@ -642,6 +769,7 @@ func (sg *kvStoreTokenGranter) tryGrantLockedOne() bool {
 				// Was not able to get token. Do not continue with looping to grant to
 				// less important work (though it would be harmless since won't be
 				// able to get a token for that either).
+				// 无法获取令牌，不继续尝试更低优先级的工作
 				return res
 			}
 		}
@@ -758,6 +886,20 @@ func (sg *kvStoreTokenGranter) storeReplicatedWorkAdmittedLocked(
 	admittedInfo storeReplicatedWorkAdmittedInfo,
 	canGrantAnother bool,
 ) (additionalTokens int64) {
+	//**两阶段令牌扣除**：
+	//
+	//1. **准入时（Admit）**：
+	//    - 使用估算值预扣令牌
+	//    - 基于`RequestedCount`和线性模型
+	//2. **完成时（Done/Admitted）**：
+	//    - 使用实际值调整令牌
+	//    - 可能补扣（实际 > 估算）
+	//    - 也可能退还（实际 < 估算）
+	//
+	//**为什么需要两阶段**：
+	//- 准入时不知道实际写入量
+	//- 异步复制（below-raft）进一步延迟了实际值的获知
+	//- 估算模型会定期更新（每15秒）
 	// Reminder: coord.mu protects the state in the kvStoreTokenGranter.
 	wc := admissionpb.WorkClassFromStoreWorkType(wt)
 	exhaustedFunc := func() bool {
@@ -766,9 +908,12 @@ func (sg *kvStoreTokenGranter) storeReplicatedWorkAdmittedLocked(
 				sg.mu.availableIOTokens[admissionpb.ElasticWorkClass] <= 0))
 	}
 	wasExhausted := exhaustedFunc()
+	// 应用L0写入模型
 	actualL0WriteTokens := sg.mu.l0WriteLM.applyLinearModel(admittedInfo.WriteBytes)
+	// 应用L0摄入模型
 	actualL0IngestTokens := sg.mu.l0IngestLM.applyLinearModel(admittedInfo.IngestedBytes)
 	actualL0Tokens := actualL0WriteTokens + actualL0IngestTokens
+	// 计算需要额外扣除的令牌
 	additionalL0TokensNeeded := actualL0Tokens - originalTokens
 	sg.subtractIOTokensLocked(additionalL0TokensNeeded, additionalL0TokensNeeded, false)
 	if wt == admissionpb.ElasticStoreWorkType {
@@ -776,6 +921,7 @@ func (sg *kvStoreTokenGranter) storeReplicatedWorkAdmittedLocked(
 	}
 
 	// Adjust disk write tokens.
+	// 调整磁盘写令牌
 	ingestIntoLSM := sg.mu.ingestLM.applyLinearModel(admittedInfo.IngestedBytes)
 	totalBytesIntoLSM := actualL0WriteTokens + ingestIntoLSM
 	actualDiskWriteTokens := sg.mu.writeAmpLM.applyLinearModel(totalBytesIntoLSM)
@@ -783,11 +929,11 @@ func (sg *kvStoreTokenGranter) storeReplicatedWorkAdmittedLocked(
 	additionalDiskWriteTokens := actualDiskWriteTokens - originalDiskTokens
 	sg.mu.diskTokensAvailable.writeByteTokens -= additionalDiskWriteTokens
 	sg.mu.diskTokensUsed[wt].writeByteTokens += additionalDiskWriteTokens
-
+	// 如果从耗尽状态恢复，尝试授权更多请求
 	if canGrantAnother && (additionalL0TokensNeeded < 0) {
 		isExhausted := exhaustedFunc()
 		if (wasExhausted && !isExhausted) || sg.knobs.AlwaysTryGrantWhenAdmitted {
-			sg.tryGrantLocked()
+			sg.tryGrantLocked() // 尝试授权等待队列中的请求
 		}
 	}
 	// For multi-tenant fairness accounting, we choose to ignore disk bandwidth

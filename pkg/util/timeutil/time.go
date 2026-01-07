@@ -22,6 +22,10 @@ const LibPQTimePrefix = "0000-01-01"
 // SQL Datums, and there the timestamp matters. Years later, it's not clear
 // whether this was a good decision since it's forcing the nasty implementation
 // below.
+// 我们在**很久很久以前（久远到不记得什么时候）**就已经决定，
+// 在整个集群中始终返回 UTC 时间是一个好的策略。这样可以确保所有的时间戳在不同的节点上打印出来都是统一的。
+// 另一个原因是，我们担心时间戳会泄露到 SQL 的数据项（Datums）中，而在那里，时区的准确性至关重要。
+// 若干年后的今天，我们也不确定当初这个决定是否正确，因为它强迫我们采用了下面这种**非常恶心（nasty）**的底层实现。
 func Now() time.Time {
 	t := time.Now()
 	// HACK: instead of doing t = t.UTC(), we reach inside the
@@ -37,6 +41,12 @@ func Now() time.Time {
 	// 3. time.Since(t) does one less system calls when t has a monotonic reading,
 	// making it twice as fast as otherwise:
 	// https://cs.opensource.google/go/go/+/refs/tags/go1.17.2:src/time/time.go;l=878;drc=refs%2Ftags%2Fgo1.17.2
+	//黑科技（HACK）： 我们没有使用标准的 t = t.UTC()，而是直接“伸手”进结构体内部手动设置时区位置。
+	//这是因为 UTC() 函数会无缘无故地从时间对象中**剥离（strip）掉单调时钟（monotonic clock）**的读数。
+	//： 剥离掉单调时钟部分会带来严重的后果：
+	//失去优势：我们失去了单调时钟读数带来的种种好处。
+	//精度灾难（特别是 macOS）：在 macOS 上，似乎只有单调时钟能提供纳秒级的分辨率。如果把它剥离掉，我们就只能得到微秒级的分辨率。除了这本身就很糟糕（sucking）外，微秒级的精度不足以保证连续调用 Now() 不会返回相同的时间点。这会导致我们的一些测试失败，因为那些测试假设它们可以测量任何极短的时间间隔。
+	//性能损耗：当 t 包含单调读数时，执行 time.Since(t) 会少进行一次系统调用，这使得它的速度比不带读数时快了一倍。
 	x := (*timeLayout)(unsafe.Pointer(&t))
 	x.loc = nil // nil means UTC
 	return t

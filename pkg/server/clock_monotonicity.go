@@ -41,14 +41,39 @@ var (
 
 // startMonitoringForwardClockJumps starts a background task to monitor forward
 // clock jumps based on a cluster setting.
+
+// startMonitoringForwardClockJumps 函数的作用：
+// 启动一个后台任务，用于监控系统时钟的“向前跳跃”（forward clock jumps），
+// 例如由于 NTP 同步、手动调整时间、虚拟机时间漂移等原因导致的时钟突然前进很多。
+// CockroachDB 是分布式数据库，对时钟同步非常敏感（依赖 HLC 混合逻辑时钟），
+// 时钟向前跳跃如果过大，可能导致事务时间戳混乱、租约（lease）失效、数据不一致等问题。
+
 func (s *topLevelServer) startMonitoringForwardClockJumps(ctx context.Context) error {
+	// 创建一个带缓冲的 bool 通道，用于动态接收集群设置的变化
+	// （是否启用向前时钟跳跃检查）
 	forwardJumpCheckEnabled := make(chan bool, 1)
+
+	// 当服务器停止时（stopper.Stop() 被调用），关闭这个通道，确保后台监控任务能优雅退出
 	s.stopper.AddCloser(stop.CloserFn(func() { close(forwardJumpCheckEnabled) }))
 
+	// 监听集群设置 server.clock.forward_jump_check.enabled 的变化
+	// 每当该设置在集群中被修改（通过 SET CLUSTER SETTING），就会执行回调
 	forwardClockJumpCheckEnabled.SetOnChange(&s.st.SV, func(context.Context) {
+		// 把当前设置的值（true/false）发送到通道中
+		// 注意：通道有缓冲，所以不会阻塞
 		forwardJumpCheckEnabled <- forwardClockJumpCheckEnabled.Get(&s.st.SV)
 	})
 
+	// 调用物理时钟（PhysicalClock）的 StartMonitoringForwardClockJumps 方法
+	// 参数：
+	//   - ctx：上下文
+	//   - forwardJumpCheckEnabled：一个 chan bool 通道
+	//     后台监控 goroutine 会不断从这个通道读取 bool 值：
+	//       true  → 启用时钟跳跃检测
+	//       false → 暂停检测
+	//     通道关闭 → 停止监控（优雅退出）
+	//   - time.NewTicker：提供定时器工厂函数，用于周期性检查时钟
+	//   - nil：tick 回调（这里不需要额外回调）
 	if err := s.clock.StartMonitoringForwardClockJumps(
 		ctx,
 		forwardJumpCheckEnabled,
@@ -58,7 +83,9 @@ func (s *topLevelServer) startMonitoringForwardClockJumps(ctx context.Context) e
 		return errors.Wrap(err, "monitoring forward clock jumps")
 	}
 
+	// 记录信息日志，表示已成功启动时钟跳跃监控，并受集群设置控制
 	log.Ops.Info(ctx, "monitoring forward clock jumps based on server.clock.forward_jump_check.enabled")
+
 	return nil
 }
 

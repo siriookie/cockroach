@@ -175,6 +175,7 @@ func (d *diskBandwidthLimiter) SafeFormat(p redact.SafePrinter, _ rune) {
 		"readBW %s/s, provisioned %s/s)",
 		redact.SafeString(unlimitedPrefix),
 		d.state.diskBWUtil,
+		// 在日志输出中显示每种工作类型的令牌使用情况
 		ib(d.state.usedTokens[admissionpb.ElasticStoreWorkType].writeByteTokens),
 		ib(d.state.usedTokens[admissionpb.SnapshotIngestStoreWorkType].writeByteTokens),
 		ib(d.state.usedTokens[admissionpb.RegularStoreWorkType].writeByteTokens),
@@ -192,7 +193,7 @@ func (d *diskBandwidthLimiter) String() string {
 	return redact.StringWithoutMarkers(d)
 }
 
-func sumDiskTokens(tokens [admissionpb.NumStoreWorkTypes]diskTokens) diskTokens {
+func sumDiskTokens(tokens [admissionpb.NumStoreWorkTypes]diskTokens /* 用于跟踪每种工作类型的磁盘令牌使用情况 */) diskTokens {
 	var sumTokens diskTokens
 	for i := 0; i < admissionpb.NumStoreWorkTypes; i++ {
 		sumTokens.readByteTokens += tokens[i].readByteTokens

@@ -1512,11 +1512,18 @@ func (li listenerInfo) Iter() map[string]string {
 // PreStart starts the server on the specified port, starts gossip and
 // initializes the node using the engines from the server's context.
 //
+// PreStart 方法会在指定的端口上启动服务器，启动 Gossip（CockroachDB 的集群发现和信息传播协议），
+// 并使用服务器上下文中的存储引擎（engines）来初始化节点。
+
 // It does not activate the pgwire listener over the network / unix
 // socket, which is done by the AcceptClients() method. The separation
 // between the two exists so that SQL initialization can take place
 // before the first client is accepted.
 //
+// PreStart **不会**激活 pgwire 监听器（即 PostgreSQL wire protocol 的网络/Unix socket 监听），
+// 这部分工作由后续的 AcceptClients() 方法完成。
+// 将两者分开的原因是：**在接受第一个外部客户端连接之前，需要先完成 SQL 层面的初始化**（如创建系统表、初始用户等）。
+
 // PreStart is complex since it sets up the listeners and the associated
 // port muxing, but especially since it has to solve the
 // "bootstrapping problem": nodes need to connect to Gossip fairly
@@ -1527,14 +1534,32 @@ func (li listenerInfo) Iter() map[string]string {
 // underinitialized services. This is avoided with some additional
 // complexity that can be summarized as follows:
 //
+// PreStart 实现起来较为复杂，主要有以下原因：
+//   - 需要设置各种监听器（listeners）和端口复用（port muxing）
+//   - 更重要的是需要解决“自举问题”（bootstrapping problem）：
+//     节点需要尽早连接到 Gossip 网络（用于集群发现、节点间通信），
+//     但 Gossip 的连通性依赖于 KV 存储中第一个 Range 的副本（replicas）。
+//     这意味着必须尽早开启 Gossip 服务。
+//     但是，如果简单粗暴地过早开启 Gossip 服务，会导致其他大部分服务也随之暴露，
+//     而这些服务此时可能尚未完成初始化，从而暴露大量潜在不稳定的接口。
+//     为了避免这种情况，CockroachDB 引入了一些额外的复杂逻辑，概括如下：
+//
 //   - before blocking trying to connect to the Gossip network, we already open
 //     the admin UI (so that its diagnostics are available)
-//   - we also allow our Gossip and our connection health Ping service
-//   - everything else returns Unavailable errors (which are retryable)
-//   - once the node has started, unlock all RPCs.
+//     → 在阻塞式尝试连接 Gossip 网络之前，就先开放 Admin UI（管理界面），这样诊断信息（如节点状态、日志）就能提前可用。
 //
+//   - we also allow our Gossip and our connection health Ping service
+//     → 同时允许 Gossip 服务本身以及节点连接健康检查（Ping 服务）正常工作。
+//
+//   - everything else returns Unavailable errors (which are retryable)
+//     → 其他所有服务暂时返回 gRPC 的 Unavailable 错误（这种错误是可重试的），防止客户端过早使用未就绪的服务。
+//
+//   - once the node has started, unlock all RPCs.
+//     → 一旦节点完全启动成功，就解锁所有 RPC 服务，让它们正常响应。
+
 // The passed context can be used to trace the server startup. The context
 // should represent the general startup operation.
+// 传入的 context 可用于追踪服务器启动过程。该 context 应该代表整个启动操作的 tracing span。
 func (s *topLevelServer) PreStart(ctx context.Context) error {
 	ctx = s.AnnotateCtx(ctx)
 	done := startup.Begin(ctx)
@@ -1566,6 +1591,10 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 
 	// Connect the node as loopback handler for RPC requests to the
 	// local node.
+	// 这段代码的作用：
+	// 将当前节点自身的 KV 服务（s.node）注册为“本地内部服务器”（local internal server），
+	// 让节点内部发往本节点的 RPC 请求可以**绕过 gRPC 网络层**，直接通过函数调用处理（loopback 模式）。
+	// 这样可以大幅提升节点内部通信的性能，避免不必要的序列化、网络栈开销和上下文切换。
 	s.rpcContext.SetLocalInternalServer(
 		s.node,
 		s.grpc.serverInterceptorsInfo, s.rpcContext.ClientInterceptors())
@@ -1585,6 +1614,10 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	}
 
 	// Filter out self from the gossip bootstrap addresses.
+	// 这行代码的作用：
+	// 在启动节点时，从用户提供的 Gossip bootstrap 地址列表（--join 参数指定的地址）中，
+	// 过滤掉“自己”的地址（即本节点的监听地址或广告地址），
+	// 防止节点尝试“加入自己”（join itself），避免无意义的自我连接或循环。
 	filtered := s.cfg.FilterGossipBootstrapAddresses(ctx)
 
 	// Set up the init server. We have to do this relatively early because we
@@ -1626,6 +1659,15 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		// now, or if the process crashed earlier half-way through the callback,
 		// that version won't be on all engines. For that reason, we backfill
 		// once.
+		//1. 核心逻辑拆解：为什么要这么做？
+		//在分布式数据库中，一个节点可能挂载了多个磁盘（Engines）。如果节点在版本升级的过程中突然断电，可能会出现“版本分裂”：有的盘记着新版本，有的盘记着旧版本。
+		//
+		//为了解决这个问题，代码执行了两个关键步骤：
+		//
+		//A. 回写补全 (Backfill/Write-back)
+		//逻辑：不管之前发生了什么，先把从磁盘扫描到的“最大版本”重新强行写入所有挂载的引擎。
+		//
+		//目的：修复可能存在的“版本不一”情况。即使是新加入的空硬盘，也要立刻标记上当前集群的版本。
 		if err := kvstorage.WriteClusterVersionToEngines(
 			ctx, s.engines, initialDiskClusterVersion,
 		); err != nil {
@@ -1636,6 +1678,10 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		// or join an existing cluster, so we have to conservatively go with the
 		// version from disk. If there are no initialized engines, this is the
 		// binary min supported version.
+		//B. 初始化内存变量 (Initialize)
+		//逻辑：将这个确定后的物理版本加载到内存中的全局设置（Settings.SV）里。
+		//
+		//目的：从此开始，整个程序运行时的逻辑（比如是否支持某种新的 SQL 语法）将以此版本为准。
 		if err := clusterversion.Initialize(ctx, initialDiskClusterVersion.Version, &s.cfg.Settings.SV); err != nil {
 			return err
 		}
@@ -1675,47 +1721,52 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// and dispatches the server worker for the RPC.
 	// The SQL listener is returned, to start the SQL server later
 	// below when the server has initialized.
+	// 启动 RPC 和 SQL 监听器
 	pgL, loopbackPgL, grpcLoopbackDialFn, drpcLoopbackDialFn, startRPCServer, err := startListenRPCAndSQL(
 		ctx, workersCtx, s.cfg.BaseConfig,
 		s.stopper, s.grpc, s.drpc, ListenAndUpdateAddrs, true /* enableSQLListener */, s.cfg.AcceptProxyProtocolHeaders)
 	if err != nil {
 		return err
 	}
+
+	// 保存 PostgreSQL 网络监听器和本地 loopback 监听器
 	s.pgL = pgL
 	s.loopbackPgL = loopbackPgL
 
-	// Tell the RPC context how to connect in-memory.
+	// 设置 RPC 上下文的 loopback dialer，用于内存中直接连接 gRPC 和 DRPC
 	s.rpcContext.SetLoopbackDialer(grpcLoopbackDialFn)
 	s.rpcContext.SetLoopbackDRPCDialer(drpcLoopbackDialFn)
 
+	// 如果开启了测试钩子（TestingKnobs），处理测试相关的同步逻辑
 	if s.cfg.TestingKnobs.Server != nil {
 		knobs := s.cfg.TestingKnobs.Server.(*TestingKnobs)
+
+		// 如果配置了 SignalAfterGettingRPCAddress，说明测试需要等待 RPC 地址准备好
 		if knobs.SignalAfterGettingRPCAddress != nil {
 			log.Dev.Infof(ctx, "signaling caller that RPC address is ready")
-			close(knobs.SignalAfterGettingRPCAddress)
+			close(knobs.SignalAfterGettingRPCAddress) // 通知测试代码 RPC 地址已经准备好
 		}
+
+		// 如果配置了 PauseAfterGettingRPCAddress，则等待外部信号再继续初始化
 		if knobs.PauseAfterGettingRPCAddress != nil {
 			log.Dev.Infof(ctx, "waiting for signal from caller to proceed with initialization")
 			select {
 			case <-knobs.PauseAfterGettingRPCAddress:
-				// Normal case. Just continue below.
+				// 正常情况，收到信号，继续初始化
 
 			case <-ctx.Done():
-				// Test timeout or some other condition in the caller, by which
-				// we are instructed to stop.
+				// 上下文取消（可能是测试超时或其他条件），提前停止
 				return errors.CombineErrors(errors.New("server stopping prematurely from context shutdown"), ctx.Err())
 
 			case <-s.stopper.ShouldQuiesce():
-				// The server is instructed to stop before it even finished
-				// starting up.
+				// Stopper 发出停止指令，服务器在启动完成前就被要求停止
 				return errors.New("server stopping prematurely")
 			}
 			log.Dev.Infof(ctx, "caller is letting us proceed with initialization")
 		}
 	}
 
-	// Initialize grpc-gateway mux and context in order to get the /health
-	// endpoint working even before the node has fully initialized.
+	// 初始化 grpc-gateway 的 mux 和上下文，以便 /health 接口在节点完全初始化前也能工作
 	gwMux, gwCtx, conn, err := configureGRPCGateway(
 		ctx,
 		workersCtx,
@@ -1728,54 +1779,53 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		return err
 	}
 
-	// Connect the various RPC handlers to the gRPC gateway.
+	// 将各个 RPC 处理器注册到 grpc-gateway，确保它们能通过 HTTP/JSON 访问
 	for _, gw := range []grpcGatewayServer{s.admin, s.status, s.authentication, s.tsServer} {
 		if err := gw.RegisterGateway(gwCtx, gwMux, conn); err != nil {
 			return err
 		}
 	}
 
-	// Handle /health early. This is necessary for orchestration.  Note
-	// that /health is not authenticated, on purpose. This is both
-	// because it needs to be available before the cluster is up and can
-	// serve authentication requests, and also because it must work for
-	// monitoring tools which operate without authentication.
+	// 提前处理 /health 接口
+	// 这个接口用于集群编排（orchestration）和健康检查
+	// 注意 /health 接口没有认证，这样它在集群未完全启动时也能返回
+	// 另外，它还需要兼容不认证的监控工具
 	s.http.handleHealth(gwMux)
-
-	// Write listener info files early in the startup sequence. `listenerInfo` has a comment.
+	// 1. 提前写入监听器信息文件，用于记录 RPC、SQL、HTTP 的监听地址。
+	// listenerInfo 是一个封装了文件名与对应值的结构
 	listenerFiles := listenerInfo{
 		listenRPC:    s.cfg.Addr,
 		advertiseRPC: s.cfg.AdvertiseAddr,
 		listenSQL:    s.cfg.SQLAddr,
 		advertiseSQL: s.cfg.SQLAdvertiseAddr,
 		listenHTTP:   s.cfg.HTTPAdvertiseAddr,
-	}.Iter()
+	}.Iter() // Iter() 返回一个 map[string]string: 文件名 -> 值
 
-	encryptedStore := false
-	for _, storeSpec := range s.cfg.Stores.Specs {
+	encryptedStore := false                        // 标记是否存在加密存储
+	for _, storeSpec := range s.cfg.Stores.Specs { // 遍历每个存储配置
 		if storeSpec.InMemory {
-			continue
+			continue // 内存存储不写文件
 		}
 		if storeSpec.IsEncrypted() {
-			encryptedStore = true
+			encryptedStore = true // 发现加密存储
 		}
 
+		// 遍历监听器文件并写入当前存储路径
 		for name, val := range listenerFiles {
 			file := filepath.Join(storeSpec.Path, name)
 			if err := os.WriteFile(file, []byte(val), 0644); err != nil {
 				return errors.Wrapf(err, "failed to write %s", file)
 			}
 		}
-		// TODO(knz): Do we really want to write the listener files
-		// in _every_ store directory? Not just the first one?
+		// TODO: 是否需要在每个存储目录都写监听器文件？还是只写第一个目录即可
 	}
 
+	// 如果配置了 DelayedBootstrapFn，延迟执行 30 秒后再停止
 	if s.cfg.DelayedBootstrapFn != nil {
 		defer time.AfterFunc(30*time.Second, s.cfg.DelayedBootstrapFn).Stop()
 	}
 
-	// We self bootstrap for when we're configured to do so, which should only
-	// happen during tests and for `cockroach start-single-node`.
+	// 2. 自行初始化集群
 	selfBootstrap := s.cfg.AutoInitializeCluster && initServer.NeedsBootstrap()
 	if selfBootstrap {
 		if _, err := initServer.Bootstrap(ctx, &serverpb.BootstrapRequest{}); err != nil {
@@ -1783,78 +1833,71 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		}
 	}
 
-	// Set up calling s.cfg.ReadyFn at the right time. Essentially, this call
-	// determines when `./cockroach [...] --background` returns. For any
-	// initialized nodes (i.e. already part of a cluster) this is when this
-	// method returns (assuming there's no error). For nodes that need to join a
-	// cluster, we return once the initServer is ready to accept requests.
+	// 3. 设置 Ready 回调函数
+	// 用于控制 `cockroach start --background` 命令何时返回
 	var onSuccessfulReturnFn, onInitServerReady func()
 	{
 		readyFn := func(bool) {}
 		if s.cfg.ReadyFn != nil {
 			readyFn = s.cfg.ReadyFn
 		}
+
+		// 如果不需要 bootstrap 或已经自启动，则立即调用 ready
 		if !initServer.NeedsBootstrap() || selfBootstrap {
 			onSuccessfulReturnFn = func() { readyFn(false /* waitForInit */) }
 			onInitServerReady = func() {}
-		} else {
+		} else { // 需要加入已有集群
 			onSuccessfulReturnFn = func() {}
 			onInitServerReady = func() { readyFn(true /* waitForInit */) }
 		}
 	}
 
-	// This opens the main listener. When the listener is open, we can call
-	// onInitServerReady since any request initiated to the initServer at that
-	// point will reach it once ServeAndWait starts handling the queue of
-	// incoming connections.
+	// 4. 打开主监听器，开启 RPC 服务
 	startRPCServer(workersCtx)
-	onInitServerReady()
+	onInitServerReady() // 当监听器打开后，可调用 ready 回调
+
+	// 启动初始化服务器，并等待其完成初始化
 	state, initialStart, err := initServer.ServeAndWait(workersCtx, s.stopper, &s.cfg.Settings.SV)
 	if err != nil {
 		return errors.Wrap(err, "during init")
 	}
+
+	// 验证初始化状态是否合法
 	if err := state.validate(); err != nil {
 		return errors.Wrap(err, "invalid init state")
 	}
 
-	// Apply any cached initial settings (and start the gossip listener) as early
-	// as possible, to avoid spending time with stale settings.
+	// 5. 尽早应用初始缓存的系统设置，并启动 gossip 监听器
 	if err := initializeCachedSettings(
 		ctx, keys.SystemSQLCodec, s.st.MakeUpdater(), state.initialSettingsKVs,
 	); err != nil {
 		return errors.Wrap(err, "during initializing settings updater")
 	}
 
-	// TODO(irfansharif): Let's make this unconditional. We could avoid
-	// persisting + initializing the cluster version in response to being
-	// bootstrapped (within `ServeAndWait` above) and simply do it here, in the
-	// same way we're doing for when we join an existing cluster.
+	// 6. 检查集群版本是否与磁盘上的初始版本不同
 	if state.clusterVersion != initialDiskClusterVersion {
-		// We just learned about a cluster version different from the one we
-		// found on/synthesized from disk. This indicates that we're either the
-		// bootstrapping node (and are using the binary version as the cluster
-		// version), or we're joining an existing cluster that just informed us
-		// to activate the given cluster version.
-		//
-		// Either way, we'll do so by first persisting the cluster version
-		// itself, and then informing the version setting about it (an invariant
-		// we must up hold whenever setting a new active version).
+		// 如果不同，说明是新启动节点或加入已有集群，需要更新集群版本
+		// 先写入存储引擎
 		if err := kvstorage.WriteClusterVersionToEngines(
 			ctx, s.engines, state.clusterVersion,
 		); err != nil {
 			return err
 		}
 
+		// 再更新内存中 ClusterSettings 的 active 版本
 		if err := s.ClusterSettings().Version.SetActiveVersion(ctx, state.clusterVersion); err != nil {
 			return err
 		}
 	}
-
 	s.rpcContext.StorageClusterID.Set(ctx, state.clusterID)
 	s.rpcContext.NodeID.Set(ctx, state.nodeID)
 
 	// Ensure components in the DistSQLPlanner that rely on the node ID are
 	// initialized before store startup continues.
+	//
+	// 中文翻译：
+	// 确保 DistSQLPlanner 中那些依赖 node ID 的组件，
+	// 在 store（存储层）继续启动之前就已经完成初始化。
 	s.sqlServer.execCfg.DistSQLPlanner.SetGatewaySQLInstanceID(base.SQLInstanceID(state.nodeID))
 	s.sqlServer.execCfg.DistSQLPlanner.ConstructAndSetSpanResolver(ctx, state.nodeID, s.cfg.Locality)
 
@@ -1863,10 +1906,24 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// following a server restart). See the discussions in #48843 for how that
 	// could be done, and what's motivating it.
 	//
+	// 中文翻译：
+	// TODO：既然现在我们已经拿到了自己的 node ID，
+	// 那么（如果这是一次服务器重启）此处应该再做一次检查，
+	// 确保该节点没有被“下线 / 退役（decommission）”。
+	// 具体如何实现，以及背后的动机，可以参考 issue #48843 中的讨论。
+	//
 	// In summary: We'd consult our local store keys to see if they contain a
 	// kill file informing us we've been decommissioned away (the
 	// decommissioning process, that prefers to decommission live targets, will
 	// inform the target node to persist such a file).
+	//
+	// 中文翻译：
+	// 总结一下：
+	// 我们会查看本地 store 中的元数据（keys），
+	// 看是否存在一个“kill 文件”，
+	// 这个文件用于告知当前节点：你已经被 decommission 了。
+	// 在 decommission 流程中（优先对在线节点执行），
+	// 系统会要求目标节点将这个文件持久化到本地。
 	//
 	// Short of that, if we were decommissioned in absentia, we'd attempt to
 	// reach out to already connected nodes in our join list to see if they have
@@ -1877,6 +1934,20 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// decommissioned, we'll solicit the decommissioned list from the already
 	// connected node to be able to respond to inbound decomm check requests.
 	//
+	// 中文翻译：
+	// 如果没有本地 kill 文件（例如：节点当时不在线，被“缺席退役”），
+	// 那我们就会尝试联系 join 列表中已经连接上的其他节点，
+	// 询问它们是否知道“我们的 node ID 已被 decommission”。
+	//
+	// 当目标节点不可用时，执行 decommission 的节点会以“尽力而为”的方式，
+	// 向整个集群广播该节点已被退役的信息。
+	// 这类操作只会在运维人员确信该节点永远不会再回来的前提下进行。
+	//
+	// 如果我们确认自己并没有被 decommission，
+	// 那我们还会从已连接的节点那里拉取一份
+	// “已退役节点列表”，
+	// 以便将来能正确响应其他节点发来的 decommission 校验请求。
+	//
 	// As for the problem of the ever growing list of decommissioned node IDs
 	// being maintained on each node, given that we're populating+broadcasting
 	// this list in best effort fashion (like said above, we're relying on the
@@ -1886,11 +1957,29 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// IDs would likely outlive us all
 	//
 	//   536,870,912 bits/64 bits = 8,388,608 decommissioned node IDs.
+	//
+	// 中文翻译：
+	// 至于“每个节点都要维护一个不断增长的已退役 node ID 列表”这个问题：
+	// 考虑到我们是以“尽力而为”的方式来维护和广播这个列表，
+	// 并且依赖运维人员保证这些节点确实不会再回来，
+	// 那么当列表变得过大时，对其进行老化淘汰（age out）可能也是可以接受的。
+	//
+	// 即便我们最多维护 64MB 的退役 node ID 列表，
+	// 这个规模大概也足够“用到天荒地老”了：
+	// 536,870,912 bits / 64 bits = 8,388,608 个已退役节点 ID。
 
 	// TODO(tbg): split this method here. Everything above this comment is
 	// the early stage of startup -- setting up listeners and determining the
 	// initState -- and everything after it is actually starting the server,
 	// using the listeners and init state.
+	//
+	// 中文翻译：
+	// TODO：这里应该把这个方法拆分开。
+	// 这个注释之上的代码属于“启动早期阶段”：
+	//   - 设置监听器
+	//   - 确定 initState
+	// 而注释之后的代码才是真正开始启动服务器，
+	// 并使用前面准备好的监听器和初始化状态。
 
 	// Spawn a goroutine that will print a nice message when Gossip connects.
 	// Note that we already know the clusterID, but we don't know that Gossip
@@ -1898,6 +1987,47 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// cluster. Someone has to gossip the ClusterID before Gossip is connected,
 	// but this gossip only happens once the first range has a leaseholder, i.e.
 	// when a quorum of nodes has gone fully operational.
+	// 中文翻译：
+	// 启动一个 goroutine，在 Gossip 网络成功连接时打印一条友好的日志。
+	// 注意：此时我们已经知道 clusterID 了，
+	// 但我们还不知道 Gossip 是否已经真正建立连接。
+	// 一个典型场景是“整个集群同时重启”：
+	// 在 Gossip 连接建立之前，必须先有节点把 ClusterID 通过 Gossip 传播出去。
+	// 而这件事只有在第一个 range 拥有 leaseholder 之后才会发生，
+	// 也就是说，必须等到至少一个 quorum 的节点完全启动并可用。
+	//① 已知 clusterID ≠ 集群已可用
+	//本节点：
+	//已经知道 clusterID
+	//已经知道 nodeID
+	//但 Gossip 可能还没连上
+	//没有 Gossip：
+	//节点之间不知道彼此
+	//元数据无法传播
+	//集群逻辑上还没“连成一张网”
+	//② 为什么「整个集群重启」时会卡在这一步？
+	//这是注释里最重要的真实场景：
+	//restarting an entire cluster
+	//流程是这样的：
+	//所有节点同时启动
+	//没有任何节点在 Gossip 网络里
+	//Gossip 需要 ClusterID 被 gossip 出去
+	//但：
+	//只有当某个 range 有了 leaseholder
+	//leaseholder 又需要 raft quorum 可用
+	//所以：
+	//至少要有 一组节点 fully operational
+	//才能出现第一个 leaseholder
+	//才能开始 gossip ClusterID
+	//Gossip 才能真正 Connected
+	//👉 这是一个“鸡生蛋、蛋生鸡”的启动闭环
+	//③ 为什么要起一个 goroutine 专门等 Gossip？
+	//目的只有一个：
+	//告诉运维 / 日志系统：
+	//“现在这个节点，已经真正接入集群了”
+	//不是功能必须，而是：
+	//启动可观测性
+	//排错体验
+	//集群健康确认
 	_ = s.stopper.RunAsyncTask(workersCtx, "connect-gossip", func(ctx context.Context) {
 		log.Ops.Infof(ctx, "connecting to gossip network to verify cluster ID %q", state.clusterID)
 		select {

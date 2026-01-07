@@ -120,17 +120,33 @@ func storeCachedSettingsKVs(ctx context.Context, eng storage.Engine, kvs []roach
 }
 
 // loadCachedSettingsKVs loads locally stored cached settings.
+// loadCachedSettingsKVs 是 CockroachDB 节点启动或初始化时，从本地存储引擎（Pebble）中读取缓存的集群设置（cluster settings） 的函数。
+//
+// CockroachDB 的很多配置（如 server.time_until_store_dead、sql.stats.response_size 等）是集群级设置（cluster settings），可以通过 SET CLUSTER SETTING 动态修改。
+// 这些设置会被持久化到每个节点的本地存储中（在 keys.LocalStoreCachedSettingsKeyMin 到 keys.LocalStoreCachedSettingsKeyMax 这个 key 范围内）。
+// 节点启动时，需要先把这些本地缓存的设置加载到内存，这样后续 SQL 层和 KV 层就能使用最新的配置值，而不用每次都去 gossip 或系统表查。
+//
+// 简单说：让节点快速恢复上一次关机前的集群设置状态。
 func loadCachedSettingsKVs(ctx context.Context, reader storage.Reader) ([]roachpb.KeyValue, error) {
+	//准备一个切片，用于存放读取到的设置键值对。
 	var settingsKVs []roachpb.KeyValue
+	//使用 MVCCIterate 在存储引擎中范围扫描（range scan）一个特定的 key 区间：
+	//从 LocalStoreCachedSettingsKeyMin 到 LocalStoreCachedSettingsKeyMax
+	//只扫描 point keys（不扫描 range keys）
+	//迭代器类型是 KeyAndIntents（但这里实际只关心 key/value）
 	if err := reader.MVCCIterate(ctx, keys.LocalStoreCachedSettingsKeyMin,
 		keys.LocalStoreCachedSettingsKeyMax, storage.MVCCKeyAndIntentsIterKind,
 		storage.IterKeyTypePointsOnly, fs.UnknownReadCategory,
 		func(kv storage.MVCCKeyValue, _ storage.MVCCRangeKeyStack) error {
+			//每个 key 都是经过特殊编码的“cached settings key”。
+			//解码得到真正的设置 key（如 /Table/51 对应的设置名）。
 			settingKey, err := keys.DecodeStoreCachedSettingsKey(kv.Key.Key)
 			if err != nil {
 				return err
 			}
 			meta := enginepb.MVCCMetadata{}
+			//在 CockroachDB 的 MVCC 中，value 本身不直接存设置值，而是存一个 MVCCMetadata，里面有一个 RawBytes 字段才真正存设置的序列化值。
+			//这里反序列化 metadata，取出真正的设置值。
 			if err := protoutil.Unmarshal(kv.Value, &meta); err != nil {
 				return err
 			}

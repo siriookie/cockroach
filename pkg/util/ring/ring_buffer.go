@@ -69,6 +69,49 @@ func (r *Buffer[T]) GetFirst() T {
 }
 
 // GetLast returns an element at the front of the Buffer.
+//例子 1：最普通情况（不绕圈）
+//状态
+//buffer: [ A B C _ _ ]
+//index:    0 1 2 3 4
+//tail = 3   // 下一个要写的位置
+//最后一个元素是谁？
+//👉 是 C，在 index 2
+//套公式
+//(cap + tail - 1) % cap
+//= (5 + 3 - 1) % 5
+//= 7 % 5
+//= 2
+//✔️ 正好是 C
+//例子 2：发生“环绕”（关键例子）
+//状态
+//buffer: [ D E A B C ]
+//index:    0 1 2 3 4
+//tail = 2   // 下一个要写到 index 2
+//说明发生过环绕，逻辑顺序是：
+//A → B → C → D → E
+//最后一个元素是 E，在 index 1
+//套公式
+//(cap + tail - 1) % cap
+//= (5 + 2 - 1) % 5
+//= 6 % 5
+//= 1
+//✔️ 正好拿到 E
+//例子 3：最容易犯错的边界（tail == 0）
+//状态
+//buffer: [ B C D E A ]
+//index:    0 1 2 3 4
+//tail = 0   // 下一个写到 0
+
+//最后一个元素是 A，在 index 4
+//如果你天真写：
+//tail - 1 = -1 ❌ 越界
+//用这个公式：
+//(cap + tail - 1) % cap
+//= (5 + 0 - 1) % 5
+//= 4 % 5
+//= 4
+
+// ✔️ 自动绕回最后一个位置
 func (r *Buffer[T]) GetLast() T {
 	if !r.nonEmpty {
 		panic("getting last from empty ring buffer")
@@ -76,6 +119,21 @@ func (r *Buffer[T]) GetLast() T {
 	return r.buffer[(cap(r.buffer)+r.tail-1)%cap(r.buffer)]
 }
 
+// `时间轴（每 100ms 采样一次）：
+// t0    t1    t2    t3    ... t24   t25
+// │─────│─────│─────│─────│─...─│─────│
+// [H0]  [H1]  [H2]  [H3]       [H24] [H25]
+//
+// 环形缓冲区（容量 = sampleDuration / samplePeriod = 25）：
+// ┌────┬────┬────┬────┬────┬────┬────┐
+// │ H1 │ H2 │ H3 │... │H24 │H25 │    │  ← 最新样本在头部
+// └────┴────┴────┴────┴────┴────┴────┘
+//
+//	↑                           ↑
+//
+// newest                     oldest
+//
+// P99 计算：P99 = percentile(H25 - H1, 0.99)`
 func (r *Buffer[T]) resize(n int) {
 	if n < r.Len() {
 		panic("resizing to fewer elements than current length")
