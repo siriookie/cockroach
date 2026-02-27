@@ -120,13 +120,24 @@ func newUninitializedReplica(store *Store, id roachpb.FullReplicaID) (*Replica, 
 // creating the uninitialized replica, and once when initializing it).
 func newUninitializedReplicaWithoutRaftGroup(store *Store, id roachpb.FullReplicaID) *Replica {
 	uninitState := kvstorage.UninitializedReplicaState(id.RangeID)
+	//分配
+	//Replica
+	// 结构体内存。
+	//设置
+	//RangeID
+	//、replicaID（本地副本 ID）以及指向所属
+	//Store
+	// 的指针。
+	//将副本状态设为默认的 Uninitialized（未初始化） 状态。
 	r := &Replica{
 		AmbientContext: store.cfg.AmbientCtx,
 		RangeID:        id.RangeID,
 		replicaID:      id.ReplicaID,
 		creationTime:   timeutil.Now(),
 		store:          store,
-		abortSpan:      abortspan.New(id.RangeID),
+		//冲突跨度 (abortSpan)：初始化 abortSpan，用于存储已被中止（Aborted）的事务记录，防止已失效的事务重试。
+		abortSpan: abortspan.New(id.RangeID),
+		//并发管理器 (concMgr)：创建 concurrency.Manager。这是副本的“交通警察”，负责管理 Latches（内存锁） 和 Locks（事务锁/意图），确保并发请求不会互相干扰
 		concMgr: concurrency.NewManager(concurrency.Config{
 			NodeDesc:                          store.nodeDesc,
 			RangeDesc:                         uninitState.Desc,
@@ -261,6 +272,7 @@ func newUninitializedReplicaWithoutRaftGroup(store *Store, id roachpb.FullReplic
 
 	r.raftMu.msgAppScratchForFlowControl = map[roachpb.ReplicaID][]raftpb.Message{}
 	r.raftMu.replicaStateScratchForFlowControl = map[roachpb.ReplicaID]rac2.ReplicaStateInfo{}
+	//初始化新版的复制准入控制（RACV2），防止某个副本的复制压力过载压垮系统。
 	r.flowControlV2 = replica_rac2.NewProcessor(replica_rac2.ProcessorOptions{
 		NodeID:            store.NodeID(),
 		StoreID:           r.StoreID(),

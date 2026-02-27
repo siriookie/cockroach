@@ -110,11 +110,12 @@ func NewReplicaAccumulator(dims ...load.Dimension) *RRAccumulator {
 	}
 	for _, dim := range dims {
 		// Reassign dim variable to ensure correct values is captured down below in val() func.
-		dim := dim
+		// 关键：为每个维度创建独立的堆
+		dim := dim // 重新赋值以避免闭包捕获问题
 		res.dims[dim] = &rrPriorityQueue{}
 		res.dims[dim].val = func(r CandidateReplica) float64 {
 			return r.RangeUsageInfo().Load().Dim(dim)
-		}
+		} // 闭包捕获dim
 	}
 	return res
 }
@@ -122,7 +123,7 @@ func NewReplicaAccumulator(dims ...load.Dimension) *RRAccumulator {
 // Update sets the accumulator for replica tracking to be the passed in value.
 func (rr *ReplicaRankings) Update(acc *RRAccumulator) {
 	rr.mu.Lock()
-	rr.mu.dimAccumulator = acc
+	rr.mu.dimAccumulator = acc // 原子替换指针
 	rr.mu.Unlock()
 }
 
@@ -130,12 +131,12 @@ func (rr *ReplicaRankings) Update(acc *RRAccumulator) {
 func (rr *ReplicaRankings) TopLoad(dimension load.Dimension) []CandidateReplica {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
-	// If we have a new set of data, consume it. Otherwise, just return the most
-	// recently consumed data.
+
+	// 如果有新数据，先消费堆转为排序数组
 	if rr.mu.dimAccumulator != nil && rr.mu.dimAccumulator.dims[dimension].Len() > 0 {
 		rr.mu.byDim = consumeAccumulator(rr.mu.dimAccumulator.dims[dimension])
 	}
-	return rr.mu.byDim
+	return rr.mu.byDim // 返回缓存的排序结果
 }
 
 // RRAccumulator is used to update the replicas tracked by ReplicaRankings.
@@ -157,22 +158,22 @@ func (a *RRAccumulator) AddReplica(repl CandidateReplica) {
 	}
 }
 
+// pkg/kv/kvserver/replica_rankings.go:160-176
 func (a *RRAccumulator) addReplicaForDimension(repl CandidateReplica, dim load.Dimension) {
 	rr := a.dims[dim]
-	// If the heap isn't full, just push the new replica and return.
-	if rr.Len() < numTopReplicasToTrack {
 
+	// 情况1：堆未满，直接插入
+	if rr.Len() < numTopReplicasToTrack {
 		heap.Push(a.dims[dim], repl)
 		return
 	}
 
-	// Otherwise, conditionally push if the new replica is more deserving than
-	// the current tip of the heap.
+	// 情况2：堆已满，新副本需要"挤掉"堆顶才能进入
 	if rr.val(repl) > rr.val(rr.entries[0]) {
-		heap.Pop(rr)
-		heap.Push(rr, repl)
+		heap.Pop(rr)        // 移除堆顶（当前最小元素）
+		heap.Push(rr, repl) // 插入新元素
 	}
-
+	// 否则：新副本比堆顶还小，直接忽略
 }
 
 func consumeAccumulator(pq *rrPriorityQueue) []CandidateReplica {
@@ -186,7 +187,8 @@ func consumeAccumulator(pq *rrPriorityQueue) []CandidateReplica {
 
 type rrPriorityQueue struct {
 	entries []CandidateReplica
-	val     func(CandidateReplica) float64
+	//val函数的作用：每个堆需要知道”如何比较两个副本的大小”，val函数从CandidateReplica中提取对应维度的负载值
+	val func(CandidateReplica) float64
 }
 
 func (pq rrPriorityQueue) Len() int { return len(pq.entries) }

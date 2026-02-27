@@ -311,6 +311,7 @@ type ScorerOptions interface {
 	// balanceScore returns a discrete score (`balanceStatus`) based on whether
 	// the store represented by `sc` classifies as underfull, aroundTheMean, or
 	// overfull relative to all the stores in `sl`.
+	//候选 Store 相对于集群均值的负载状态(离散值:underfull/aroundTheMean/overfull)
 	balanceScore(sl storepool.StoreList, sc roachpb.StoreCapacity) balanceStatus
 	// adjustRangeCountForScoring returns the adjusted range count for scoring.
 	// Scorer options (IOOverloadOnlyScorerOptions) that do not score based on
@@ -490,7 +491,7 @@ func (bnc BaseScorerOptionsNoConvergence) removalMaximallyConvergesScore(
 // converging range counts across stores in the cluster.
 type RangeCountScorerOptions struct {
 	BaseScorerOptions
-	rangeRebalanceThreshold float64
+	rangeRebalanceThreshold float64 // 默认 0.05(5%)
 }
 
 var _ ScorerOptions = &RangeCountScorerOptions{}
@@ -533,18 +534,35 @@ func (o RangeCountScorerOptions) shouldRebalanceBasedOnThresholds(
 	return false
 }
 
+// 集群状态:
+//   - Store1: RangeCount=100
+//   - Store2: RangeCount=105
+//   - Store3: RangeCount=95
+//   - 均值 Mean = (100 + 105 + 95) / 3 = 100
+//
+// 阈值计算:
+//   - overfullThreshold = 100 + max(100*0.05, 2) = 100 + 5 = 105
+//   - underfullThreshold = 100 - max(100*0.05, 2) = 100 - 5 = 95
+//
+// balanceScore:
+//   - Store1: 95 ≤ 100 < 105 → aroundTheMean
+//   - Store2: 105 ≥ 105 → overfull
+//   - Store3: 95 ≤ 95 < 105 → underfull(边界情况,实际为 aroundTheMean)
 func (o *RangeCountScorerOptions) balanceScore(
 	sl storepool.StoreList, sc roachpb.StoreCapacity,
 ) balanceStatus {
+	// 比较该 Store 的 RangeCount 与平均值
 	maxRangeCount := overfullRangeThreshold(o, sl.CandidateRanges.Mean)
 	minRangeCount := underfullRangeThreshold(o, sl.CandidateRanges.Mean)
 	curRangeCount := float64(sc.RangeCount)
 	if curRangeCount < minRangeCount {
+		// RangeCount 远低于平均,非常好
 		return underfull
 	} else if curRangeCount >= maxRangeCount {
-		return overfull
+		return overfull // 该 Store 的 RangeCount 高于阈值,不是好的候选
+
 	}
-	return aroundTheMean
+	return aroundTheMean // RangeCount 低于平均,好
 }
 
 // rebalanceFromConvergesScore returns 1 iff rebalancing a replica away from
@@ -554,12 +572,13 @@ func (o *RangeCountScorerOptions) balanceScore(
 // (i.e. make it a less likely candidate for removal) if it doesn't further our
 // goal to converge range count towards the mean.
 func (o *RangeCountScorerOptions) rebalanceFromConvergesScore(eqClass equivalenceClass) int {
+	// 检查:从 existing Store 移除一个 Range 后,是否有助于收敛到均值
 	if !rebalanceConvergesRangeCountOnMean(
 		eqClass.candidateSL, eqClass.existing.Capacity, eqClass.existing.Capacity.RangeCount-1,
 	) {
-		return 1
+		return 1 // 不收敛,返回正分(降低移除优先级)
 	}
-	return 0
+	return 0 // 收敛,返回 0(正常优先级)
 }
 
 // rebalanceToConvergesScore returns 1 if rebalancing a replica to `sd` will
@@ -568,10 +587,11 @@ func (o *RangeCountScorerOptions) rebalanceFromConvergesScore(eqClass equivalenc
 func (o *RangeCountScorerOptions) rebalanceToConvergesScore(
 	eqClass equivalenceClass, candidate roachpb.StoreDescriptor,
 ) int {
+	// 检查:向 candidate Store 添加一个 Range 后,是否有助于收敛到均值
 	if rebalanceConvergesRangeCountOnMean(eqClass.candidateSL, candidate.Capacity, candidate.Capacity.RangeCount+1) {
-		return 1
+		return 1 // 收敛,返回正分(提高添加优先级)
 	}
-	return 0
+	return 0 // 不收敛,返回 0(正常优先级)
 }
 
 // removalConvergesScore assigns a low convergesScore to the existing store if
@@ -582,6 +602,7 @@ func (o *RangeCountScorerOptions) rebalanceToConvergesScore(
 func (o *RangeCountScorerOptions) removalMaximallyConvergesScore(
 	removalCandStoreList storepool.StoreList, existing roachpb.StoreDescriptor,
 ) int {
+	// 检查:新 RangeCount 是否比旧 RangeCount 更接近均值
 	if !rebalanceConvergesRangeCountOnMean(
 		removalCandStoreList, existing.Capacity, existing.Capacity.RangeCount-1,
 	) {
@@ -594,18 +615,22 @@ func (o *RangeCountScorerOptions) removalMaximallyConvergesScore(
 // rebalancing machinery to base its balance/convergence scores on
 // queries-per-second. This means that the resulting rebalancing decisions will
 // further the goal of converging QPS across stores in the cluster.
+// 基于 QPS/CPU 的均衡
 type LoadScorerOptions struct {
 	BaseScorerOptions
-	LoadDims []load.Dimension
+	LoadDims []load.Dimension // [QPS, CPU, ...]
 
 	// LoadThreshold and MinLoadThreshold track the threshold beyond which a
 	// store should be considered under/overfull and the minimum absolute
 	// difference required, which is used to cover corner cases where the
 	// values dealt with are relatively low.
+	// LoadThreshold: 超过均值的相对阈值(例如:0.05 表示超过均值 5%)
+	// MinLoadThreshold: 绝对阈值(防止低负载集群误判)
 	LoadThreshold, MinLoadThreshold load.Load
 
 	// MinRequiredRebalanceLoadDiff declares the minimum load difference
 	// between stores required before recommending an action to rebalance.
+	// MinRequiredRebalanceLoadDiff: 触发 rebalance 的最小负载差
 	MinRequiredRebalanceLoadDiff load.Load
 
 	// QPS-based rebalancing assumes that:
@@ -784,19 +809,19 @@ func (do DiskCapacityOptions) rebalanceToMaxCapacityCheck(store roachpb.StoreDes
 
 // candidate store for allocation. These are ordered by importance.
 type candidate struct {
-	store           roachpb.StoreDescriptor
-	valid           bool
-	fullDisk        bool
-	necessary       bool
-	voterNecessary  bool
-	diversityScore  float64
-	ioOverloaded    bool
-	ioOverloadScore float64
-	convergesScore  int
-	balanceScore    balanceStatus
-	hasNonVoter     bool
-	rangeCount      int
-	details         string
+	store           roachpb.StoreDescriptor // 候选 Store 的完整信息
+	valid           bool                    // 是否满足基本约束
+	fullDisk        bool                    // 磁盘是否接近满
+	necessary       bool                    // 是否为满足约束所必需
+	voterNecessary  bool                    // 是否为满足 voter 约束所必需(针对 NonVoter 提升场景)
+	diversityScore  float64                 // 分散性得分(0.0-1.0,越高越好)
+	ioOverloaded    bool                    // 是否 IO 过载
+	ioOverloadScore float64                 // IO 过载程度(0.0-1.0,越低越好)
+	convergesScore  int                     // 收敛性得分(是否有助于负载均衡,-1/0/1)
+	balanceScore    balanceStatus           // 负载状态(overfull=-1/aroundTheMean=0/underfull=1)
+	hasNonVoter     bool                    // 是否已有 NonVoter(用于 Voter 分配时优先选择)
+	rangeCount      int                     // Range 数量(越少越好)
+	details         string                  // 调试信息
 }
 
 func (c candidate) String() string {
@@ -860,22 +885,27 @@ func (c candidate) less(o candidate) bool {
 // diversity improvements.
 func (source candidate) isCriticalRebalance(target *candidate) bool {
 	// valid is better.
+	// 1. 约束修复: source 不满足约束,target 满足
 	if !source.valid && target.valid {
 		return true
 	}
 	// !fullDisk is better.
+	// 2. 磁盘满: source 磁盘满,target 磁盘未满
 	if source.fullDisk && !target.fullDisk {
 		return true
 	}
 	// necessary is better.
+	// 3. 必要性: source 不必要,target 必要
 	if !source.necessary && target.necessary {
 		return true
 	}
 	// voterNecessary is better.
+	// 4. Voter 必要性
 	if !source.voterNecessary && target.voterNecessary {
 		return true
 	}
 	// higher diversityScore is better.
+	// 5. 分散性改善: target 的 diversityScore 显著高于 source
 	if !scoresAlmostEqual(source.diversityScore, target.diversityScore) {
 		if target.diversityScore > source.diversityScore {
 			return true
@@ -1021,9 +1051,23 @@ func (c byScoreAndID) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
 // onlyValidAndHealthyDisk returns all the elements in a sorted (by score
 // reversed) candidate list that are valid and not nearly full or being IO
 // overloaded.
+// onlyValidAndHealthyDisk 的目标：
+// 从“按 score 倒序排序的候选列表”中，
+// 找出【所有合法 + 磁盘健康】的候选，并返回它们形成的前缀。
 func (cl candidateList) onlyValidAndHealthyDisk() candidateList {
+	// 从列表末尾向前扫描
+	// 因为：分数是倒序的，越靠后分数越低
 	for i := len(cl) - 1; i >= 0; i-- {
+		// 条件含义：
+		// valid         ：满足所有硬约束（constraint、replica type 等）
+		// !fullDisk     ：磁盘没有接近满
+		// !ioOverloaded ：磁盘 IO 未过载
 		if cl[i].valid && !cl[i].fullDisk && !cl[i].ioOverloaded {
+			// 一旦找到“最靠后的一个合法且健康的候选”，
+			// 那么 [0..i] 之间的所有候选：
+			// - 分数 >= cl[i]
+			// - 且已经在排序阶段保证了分数顺序
+			// 所以可以直接返回前缀
 			return cl[:i+1]
 		}
 	}
@@ -1032,12 +1076,20 @@ func (cl candidateList) onlyValidAndHealthyDisk() candidateList {
 
 // best returns all the elements in a sorted (by score reversed) candidate list
 // that share the highest constraint score and are valid.
+// best 的目标：
+// 在“已经按 score 从高到低排序”的候选列表中，
+// 返回【所有与第一名在“约束/评分维度上完全等价”】【且合法】的候选。
+// ——也就是说：不是选一个 best，而是选一个 best 等价类。
 func (cl candidateList) best() candidateList {
+	// 第一步：过滤非法 / 磁盘不健康的候选
+	// 返回的仍然是一个【前缀】，并且保持原有“按分数倒序”的顺序。
 	cl = cl.onlyValidAndHealthyDisk()
 	if len(cl) <= 1 {
 		return cl
 	}
 	for i := 1; i < len(cl); i++ {
+		// 下面这些字段，构成了 allocator 认为的
+		// “是否与第一名在约束意义上等价”的判定条件
 		if cl[i].necessary == cl[0].necessary &&
 			cl[i].voterNecessary == cl[0].voterNecessary &&
 			scoresAlmostEqual(cl[i].diversityScore, cl[0].diversityScore) &&
@@ -1142,6 +1194,7 @@ func (cl candidateList) selectBest(randGen allocatorRand) *candidate {
 	order := randGen.Perm(len(cl))
 	randGen.Unlock()
 	best := &cl[order[0]]
+	//the power of two 啥啥啥算法
 	for i := 1; i < allocatorRandomCount; i++ {
 		if best.less(cl[order[i]]) {
 			best = &cl[order[i]]
@@ -1153,7 +1206,7 @@ func (cl candidateList) selectBest(randGen allocatorRand) *candidate {
 // selectGood randomly chooses a good candidate store from a sorted (by score
 // reversed) candidate list using the provided random generator.
 func (cl candidateList) selectGood(randGen allocatorRand) *candidate {
-	cl = cl.good()
+	cl = cl.good() // 筛选出 good 组(valid && !fullDisk && !ioOverloaded,且 diversity 相同的一组)
 	if len(cl) == 0 {
 		return nil
 	}
@@ -1161,6 +1214,7 @@ func (cl candidateList) selectGood(randGen allocatorRand) *candidate {
 		return &cl[0]
 	}
 	randGen.Lock()
+	// 直接随机选一个
 	r := randGen.Intn(len(cl))
 	randGen.Unlock()
 	c := &cl[r]
@@ -1208,17 +1262,42 @@ func (cl candidateList) removeCandidate(c candidate) candidateList {
 // *nodes* of `existingReplicas`. Otherwise, we disregard only the *stores* of
 // `existingReplicas`. For instance, `allowMultipleReplsPerNode` is set to true
 // by callers performing lateral relocation of replicas within the same node.
+// AllocateTarget()                      ← 入口:需要新增一个副本
+//
+//	↓
+//
+// 确定 targetType(Voter/NonVoter)       ← 决定要添加的副本类型
+//
+//	↓
+//
+// 选择 constraintsChecker               ← 基于场景选择约束检查策略
+//
+//	↓
+//
+// rankedCandidateListForAllocation()    ← 【本函数】筛选 + 评分 + 排序候选 Store
+//
+//	↓
+//
+// CandidateSelector.selectOne()         ← 从排序后的候选中随机选一个
+//
+//	↓
+//
+// 执行 Raft Conf Change                 ← 实际添加副本
+// 核心职责:
+// - 输入: 所有可能的 Store、约束检查函数、现有副本信息
+// - 处理: 四阶段过滤 + 多维度评分 + 排序
+// - 输出: 按分数降序排列的候选列表(candidateList)
 func rankedCandidateListForAllocation(
 	ctx context.Context,
-	candidateStores storepool.StoreList,
-	constraintsCheck constraintsCheckFn,
-	existingReplicas []roachpb.ReplicaDescriptor,
-	nonVoterReplicas []roachpb.ReplicaDescriptor,
-	existingStoreLocalities map[roachpb.StoreID]roachpb.Locality,
-	isStoreValidForRoutineReplicaTransfer func(context.Context, roachpb.StoreID) bool,
-	allowMultipleReplsPerNode bool,
-	options ScorerOptions,
-	targetType TargetReplicaType,
+	candidateStores storepool.StoreList, // 所有潜在的候选 Store
+	constraintsCheck constraintsCheckFn, // 约束检查函数(从前一节学习的策略函数)
+	existingReplicas []roachpb.ReplicaDescriptor, // 当前 Range 已有的副本
+	nonVoterReplicas []roachpb.ReplicaDescriptor, // 当前 Range 的 NonVoter 副本
+	existingStoreLocalities map[roachpb.StoreID]roachpb.Locality, // 已有副本的 Locality 信息
+	isStoreValidForRoutineReplicaTransfer func(context.Context, roachpb.StoreID) bool, // Store 是否存活检查
+	allowMultipleReplsPerNode bool, // 是否允许同一节点多副本(测试用)
+	options ScorerOptions, // 评分选项(磁盘、IO、负载均衡等)
+	targetType TargetReplicaType, // 目标类型(Voter/NonVoter)
 ) candidateList {
 	var candidates candidateList
 	existingReplTargets := roachpb.MakeReplicaSet(existingReplicas).ReplicationTargets()
@@ -1228,41 +1307,80 @@ func rankedCandidateListForAllocation(
 	// store satisfies the constraints and does not have a full disk. It isn't
 	// fair to compare the stores which are invalid/full to the average range
 	// count of those which are valid/not-full.
+	//### 阶段一:有效性过滤(Lines 1227-1249)
+	//**目标**: 筛选出满足基本约束且磁盘/IO 不过载的 Store。
 	validCandidateStores := []roachpb.StoreDescriptor{}
 	for _, s := range candidateStores.Stores {
+		// 1. 检查磁盘是否满
 		if !options.getDiskOptions().maxCapacityCheck(s) ||
+			// 2. 检查 IO 是否过载
 			!options.getIOOverloadOptions().allocateReplicaToCheck(
 				ctx,
 				s,
 				candidateStores,
 			) {
+			//**关键设计决策**:
+			//**为什么先过滤出 validCandidateStores?**
+			//```
+			//原因:避免用无效 Store 污染统计平均值
+			//问题场景:
+			//  - 集群有 10 个 Store,其中 3 个磁盘满(99%)
+			//  - 如果不过滤,计算 balanceScore 时平均 Range Count 会被这 3 个 Store 拉低
+			//  - 导致所有 Store 的 balanceScore 都偏高,无法正确识别真正的不均衡
+			//解决方案:
+			//  - 先过滤出有效 Store,然后基于这些 Store 重新计算平均值
+			//  - validStoreList.Average() 只统计有效 Store 的平均值
+			//```
 			continue
 		}
-
+		// 3. 检查是否满足约束
 		if constraintsOK, _ := constraintsCheck(s); constraintsOK {
 			validCandidateStores = append(validCandidateStores, s)
 		}
 	}
-
+	//阶段二:构造 validStoreList
+	//**为什么要构造新的 StoreList?**
+	//`storepool.StoreList` 不仅仅存储 Store 列表,还会自动计算统计信息:
 	// Create a new store list, which will update the average for each stat to
 	// only be the average value of valid candidates.
 	validStoreList := storepool.MakeStoreList(validCandidateStores)
 
 	for _, s := range validStoreList.Stores {
 		// Disregard all the stores that already have replicas.
+		//`balanceScore` 会比较 Store 的 RangeCount 与平均值:
+		//- 如果使用原始平均值 128,s1(100)会被认为”负载偏低”,得分高
+		//- 如果使用有效平均值 105,s1(100)接近平均,得分中等
+		//**正确的基准很关键,否则会导致错误的负载均衡决策。**
 		if StoreHasReplica(s.StoreID, existingReplTargets) {
 			continue
 		}
 		// Unless the caller specifically allows us to allocate multiple replicas on
 		// the same node, we disregard nodes with existing replicas.
+		// 2. 排除已有副本的 Node(除非允许同 Node 多副本)
 		if !allowMultipleReplsPerNode && nodeHasReplica(s.Node.NodeID, existingReplTargets) {
 			continue
 		}
-
+		// 3. 再次检查约束(这次记录 necessary 标志)
 		// All invalid stores are filtered out above, before this loop, so
 		// constraintsOK should always be true.
+		//**为什么要再次调用 constraintsCheck?**
+		//```
+		//第一次调用(阶段一):
+		//  constraintsOK, _ := constraintsCheck(s)  // 只关心 constraintsOK
+		//  目的:快速过滤不满足约束的 Store
+		//第二次调用(阶段三):
+		//  constraintsOK, necessary := constraintsCheck(s)  // 关心 necessary 标志
+		//  目的:记录该 Store 是否"必要"满足约束
+		//necessary 标志的含义:
+		//  - 该 Store 满足某个约束,且该约束目前未被充分满足
+		//  - 例如:约束要求"至少 1 个副本在 us-east",当前没有副本在 us-east
+		//  - 如果该 Store 在 us-east,则 necessary=true
+		//necessary 的作用:
+		//  - 在后续排序时,necessary=true 的候选会排在前面
+		//  - 保证约束优先得到满足
+		//```
 		constraintsOK, necessary := constraintsCheck(s)
-
+		// 4. 检查 Store 是否在存活的 Node 上
 		if !isStoreValidForRoutineReplicaTransfer(ctx, s.StoreID) {
 			log.KvDistribution.VEventf(
 				ctx,
@@ -1273,9 +1391,33 @@ func rankedCandidateListForAllocation(
 			)
 			continue
 		}
-
+		// 通过所有检查,进入评分阶段
+		//阶段四:多维度评分
 		diversityScore := diversityAllocateScore(s.Locality(), existingStoreLocalities)
 		balanceScore := options.balanceScore(validStoreList, s.Capacity)
+		//### hasNonVoter 标志
+		//
+		//**目的**: 优先将 Voter 放到已有 NonVoter 的 Store 上,实现 NonVoter → Voter 的原地升级。
+		//
+		//**场景**:
+		//
+		//```
+		//当前副本:
+		//  - s1: Voter
+		//  - s2: NonVoter
+		//
+		//现在需要添加一个 Voter。
+		//
+		//候选 Store:
+		//  - s2: hasNonVoter=true  → 优先选择(可以原地升级 NonVoter → Voter)
+		//  - s3: hasNonVoter=false → 次优选择(需要新建副本)
+		//
+		//好处:
+		//  - 节省网络传输(不需要发送 Snapshot)
+		//  - 减少磁盘占用(不需要额外副本)
+		//  - 降低 Raft Log 压力
+		//```
+		//
 		var hasNonVoter bool
 		if targetType == VoterTarget {
 			if nonVoterReplTargets == nil {
@@ -1313,6 +1455,18 @@ func rankedCandidateListForAllocation(
 // host store.
 //
 // Stores that are marked as not valid, are in violation of a required criteria.
+// 输入:
+//   - existingReplsStoreList: 当前副本所在的 Store 列表
+//   - constraintsCheck: 约束检查函数
+//
+// 流程:
+//  1. 对每个现有副本计算 diversityRemovalScore(移除后的分散性)
+//  2. 筛选出 worst() 候选(分散性最低的一组)
+//  3. 在 worst 组内计算 convergesScore 和 balanceScore(针对组内比较)
+//  4. 排序并返回 candidateList(从最差到最优)
+//
+// 输出:
+//   - 排序后的 candidate 列表(使用 selectWorst 选择最适合移除的副本
 func candidateListForRemoval(
 	ctx context.Context,
 	existingReplsStoreList storepool.StoreList,
@@ -1418,13 +1572,13 @@ func candidateListForRemoval(
 // for the aforementioned existing replica -- ordered from `best()` to
 // `worst()`.
 type rebalanceOptions struct {
-	existing   candidate
-	candidates candidateList
+	existing   candidate     // 现有副本(源)
+	candidates candidateList // 可替换的候选 Store 列表(目标)
 	// advisor is lazily initialized by bestRebalanceTarget when this option is
 	// selected as best rebalance target. It is used to determine if a candidate
 	// is in conflict with mma's goals when LBRebalancingMultiMetricAndCount mode
 	// is enabled.
-	advisor *mmaprototype.MMARebalanceAdvisor
+	advisor *mmaprototype.MMARebalanceAdvisor // MMA 协调器(惰性初始化)
 }
 
 // equivalenceClass captures the set of "equivalent" replacement candidates
@@ -1441,12 +1595,12 @@ type rebalanceOptions struct {
 // the existing replica in rack 1, its equivalence class would contain its
 // neighboring store in rack 1 and all stores in racks 4...10.
 type equivalenceClass struct {
-	existing roachpb.StoreDescriptor
+	existing roachpb.StoreDescriptor // 现有 Store
 	// `candidateSl` is the `StoreList` representation of `candidates` (maintained
 	// separately to avoid converting the latter into the former for all the
 	// `scorerOptions` methods).
-	candidateSL storepool.StoreList
-	candidates  candidateList
+	candidateSL storepool.StoreList // 候选 Store 列表(StoreList 格式,带统计)
+	candidates  candidateList       // 候选 Store 列表(candidate 格式,带评分)
 }
 
 // declineReason enumerates the various results of a call into
@@ -1618,11 +1772,32 @@ func (o *LoadScorerOptions) getRebalanceTargetToMinimizeDelta(
 // groups of candidate stores and the existing replicas that they could legally
 // replace in the range. See comment above `rebalanceOptions()` for more
 // details.
+// ### `rankedCandidateListForRebalancing` - 副本重平衡选择
+//
+// ```
+// 输入:
+//   - allStores: 集群所有 Store
+//   - removalConstraintsChecker: 移除约束检查
+//   - rebalanceConstraintsChecker: 重平衡约束检查
+//   - existingVoters/NonVoters: 当前副本
+//   - options: 打分选项
+//
+// 流程:
+//  1. 对每个现有副本,找到"等价类"(equivalence class)候选
+//     - 等价类 = 至少和现有副本一样好(valid/necessary/diverse)
+//  2. 判断是否需要 rebalance(needRebalanceFrom || needRebalanceTo || shouldRebalanceCheck)
+//  3. 对每个等价类,计算候选的 balanceScore/convergesScore/ioOverloadScore
+//  4. 返回 []rebalanceOptions(每个 option 包含 existing + 可替换的候选列表)
+//
+// 输出:
+//   - 多组 rebalanceOptions,每组包含一个现有副本及其可替换候选
+//
+// ```
 func rankedCandidateListForRebalancing(
 	ctx context.Context,
-	allStores storepool.StoreList,
-	removalConstraintsChecker constraintsCheckFn,
-	rebalanceConstraintsChecker rebalanceConstraintsCheckFn,
+	allStores storepool.StoreList, // 集群所有 Store
+	removalConstraintsChecker constraintsCheckFn, // 移除约束检查
+	rebalanceConstraintsChecker rebalanceConstraintsCheckFn, // Rebalance 约束检查
 	existingVotingReplicas, existingNonVotingReplicas []roachpb.ReplicaDescriptor,
 	targetType TargetReplicaType,
 	existingStoreLocalities map[roachpb.StoreID]roachpb.Locality,
@@ -1638,19 +1813,20 @@ func rankedCandidateListForRebalancing(
 	} else {
 		existingReplicasForType = existingNonVotingReplicas
 	}
-
-	var needRebalanceFrom bool
+	// 目标: 判断每个现有副本是否"需要被替换"
+	var needRebalanceFrom bool // 是否存在"坏副本"(约束违反/磁盘满)
 	curDiversityScore := RangeDiversityScore(existingStoreLocalities)
 	for _, store := range allStores.Stores {
 		for _, repl := range existingReplicasForType {
 			if store.StoreID != repl.StoreID {
 				continue
 			}
+			// 检查约束和磁盘
 			valid, necessary := removalConstraintsChecker(store)
 			fullDisk := !options.getDiskOptions().maxCapacityCheck(store)
 
 			if !valid {
-				if !needRebalanceFrom {
+				if !needRebalanceFrom { // 标记:必须从该 Store 移除副本
 					log.KvDistribution.VEventf(ctx, 2, "s%d: should-rebalance(invalid): locality:%q",
 						store.StoreID, store.Locality())
 				}
@@ -1698,8 +1874,8 @@ func rankedCandidateListForRebalancing(
 	// store.
 
 	var equivalenceClasses []equivalenceClass
-	var needRebalanceTo bool
-
+	var needRebalanceTo bool // 是否存在"更好的候选"
+	//阶段 2: 构造等价类
 	// NB: The existing stores must be sorted during iteration in order to
 	// ensure determinism. When determinism isn't required, we still sort them
 	// as the cases where ordering is relevant are rare enough to not cause
@@ -1713,10 +1889,11 @@ func rankedCandidateListForRebalancing(
 	for _, storeID := range existingStoreList {
 		existing := existingStores[storeID]
 		var comparableCands candidateList
+		// 对于每个现有副本,找到所有"可替换"的候选
 		for _, store := range allStores.Stores {
 			// Only process replacement candidates, not existing stores.
 			if store.StoreID == existing.store.StoreID {
-				continue
+				continue // 跳过自己
 			}
 			// Ignore any stores on dead nodes or stores that contain any of the
 			// replicas within `replicasOnExemptedStores`.
@@ -1728,7 +1905,7 @@ func rankedCandidateListForRebalancing(
 					store.StoreID,
 					store.Node.NodeID,
 				)
-				continue
+				continue // 跳过 Dead 节点
 			}
 
 			var exempted, promotionCandidate bool
@@ -1778,6 +1955,7 @@ func rankedCandidateListForRebalancing(
 			// TODO(kvoli,ayushshah15): Refactor this to make it harder to
 			// inadvertently break the invariant above,
 			locality := store.Locality()
+			// 计算候选的评分
 			constraintsOK, necessary, voterNecessary := rebalanceConstraintsChecker(store, existing.store)
 			diversityScore := diversityRebalanceFromScore(
 				locality, existing.store.StoreID, existingStoreLocalities)
@@ -1789,9 +1967,11 @@ func rankedCandidateListForRebalancing(
 				fullDisk:       !options.getDiskOptions().maxCapacityCheck(store),
 				diversityScore: diversityScore,
 			}
+			// 关键: 只添加"不比 existing 更差"的候选
 			if !cand.less(existing) {
 				// If `cand` is not worse than `existing`, add it to the list.
 				comparableCands = append(comparableCands, cand)
+				// 如果 cand 比 existing 更好,标记需要 Rebalance
 				if !needRebalanceFrom && !needRebalanceTo && existing.less(cand) {
 					needRebalanceTo = true
 					log.KvDistribution.VEventf(ctx, 2,
@@ -1802,6 +1982,7 @@ func rankedCandidateListForRebalancing(
 				}
 			}
 		}
+		// 排序候选列表
 		if options.deterministicForTesting() {
 			sort.Sort(sort.Reverse(byScoreAndID(comparableCands)))
 		} else {
@@ -1811,8 +1992,8 @@ func rankedCandidateListForRebalancing(
 		// Filter down to the set of stores that are better than the rest based on
 		// diversity, disk fullness and constraints conformance. These stores are
 		// all in the same equivalence class with regards to the range in question.
+		// 提取"best"等价类(与第一名在关键维度上等价的所有候选)
 		bestCands := comparableCands.best()
-
 		bestStores := make([]roachpb.StoreDescriptor, len(bestCands))
 		for i := range bestCands {
 			bestStores[i] = bestCands[i].store
@@ -1832,6 +2013,7 @@ func rankedCandidateListForRebalancing(
 	needRebalance := needRebalanceFrom || needRebalanceTo
 	var shouldRebalanceCheck bool
 	if !needRebalance {
+		// 如果没有"明显需要 Rebalance"的信号,检查是否基于阈值应该 Rebalance
 		for _, eqClass := range equivalenceClasses {
 			if options.shouldRebalanceBasedOnThresholds(
 				ctx,
@@ -1845,12 +2027,14 @@ func rankedCandidateListForRebalancing(
 	}
 
 	if !needRebalance && !shouldRebalanceCheck {
+		// 不需要 Rebalance
 		return nil
 	}
 
 	// 4. Create sets of rebalance options, i.e. groups of candidate stores and
 	// the existing replicas that they could legally replace in the range.  We
 	// have to make a separate set of these for each group of equivalenceClasses.
+	// 对每个等价类的候选,计算 balanceScore 和 convergesScore
 	results := make([]rebalanceOptions, 0, len(equivalenceClasses))
 	for _, comparable := range equivalenceClasses {
 		existing, ok := existingStores[comparable.existing.StoreID]
@@ -1873,6 +2057,7 @@ func rankedCandidateListForRebalancing(
 		}
 
 		var candidates candidateList
+		// 只对"best"候选计算(前面已经用 best() 提取)
 		for _, cand := range comparable.candidates {
 			// We handled the possible candidates for removal above. Don't process
 			// anymore here.
@@ -1902,7 +2087,7 @@ func rankedCandidateListForRebalancing(
 		if len(candidates) == 0 {
 			continue
 		}
-
+		// 重新排序(加入 balanceScore 和 convergesScore 后)
 		if options.deterministicForTesting() {
 			sort.Sort(sort.Reverse(byScoreAndID(candidates)))
 		} else {
@@ -1933,21 +2118,27 @@ func rankedCandidateListForRebalancing(
 //
 // Contract: responsible for making sure that the returned bestIdx has the
 // corresponding MMA advisor in advisors.
+// 多源最优选择
 func bestRebalanceTarget(
-	randGen allocatorRand, options []rebalanceOptions, as *mmaintegration.AllocatorSync,
+	randGen allocatorRand,
+	options []rebalanceOptions, /* 多个等价类(每个对应一个现有副本)*/
+	as *mmaintegration.AllocatorSync, // MMA 协调器
 ) (target, existingCandidate *candidate, bestIdx int) {
 	bestIdx = -1
 	var bestTarget *candidate
 	var replaces candidate
+	// 遍历所有等价类
 	for i, option := range options {
 		if len(option.candidates) == 0 {
-			continue
+			continue // 该现有副本没有可替换的候选
 		}
+		// 从该等价类中选择最优候选
 		target = option.candidates.selectBest(randGen)
 		if target == nil {
 			continue
 		}
 		existing := option.existing
+		// 比较: 该 (target, existing) 对是否比当前的 (bestTarget, replaces) 对更好
 		if betterRebalanceTarget(target, &existing, bestTarget, &replaces) == target {
 			bestIdx = i
 			bestTarget = target
@@ -1955,10 +2146,11 @@ func bestRebalanceTarget(
 		}
 	}
 	if bestIdx == -1 {
-		return nil, nil, -1 /*bestIdx*/
+		return nil, nil, -1 /*bestIdx*/ // 没有找到合适的目标
 	}
 	// For the first time an option in options is selected, build and cache the
 	// corresponding MMA advisor in advisors[bestIdx].
+	// 惰性初始化 MMA advisor
 	if options[bestIdx].advisor == nil {
 		stores := make([]roachpb.StoreID, 0, len(options[bestIdx].candidates))
 		for _, cand := range options[bestIdx].candidates {
@@ -1970,6 +2162,7 @@ func bestRebalanceTarget(
 	// Copy the selected target out of the candidates slice before modifying
 	// the slice. Without this, the returned pointer likely will be pointing
 	// to a different candidate than intended due to movement within the slice.
+	// 从候选列表中移除已选择的候选(避免下次再选)
 	copiedTarget := *bestTarget
 	options[bestIdx].candidates = options[bestIdx].candidates.removeCandidate(copiedTarget)
 	return &copiedTarget, &options[bestIdx].existing, bestIdx
@@ -2348,7 +2541,9 @@ func containsStore(stores []roachpb.StoreID, target roachpb.StoreID) bool {
 // given range is. A higher score means the range is more diverse.
 // All below diversity-scoring methods should in theory be implemented by
 // calling into this one, but they aren't to avoid allocations.
-func RangeDiversityScore(existingStoreLocalities map[roachpb.StoreID]roachpb.Locality) float64 {
+func RangeDiversityScore(
+	existingStoreLocalities map[roachpb.StoreID]roachpb.Locality, /*一个 range 当前已经有哪些副本
+	每个副本所在 store 的 Locality*/) float64 {
 	var sumScore float64
 	var numSamples int
 	for s1, l1 := range existingStoreLocalities {
@@ -2371,6 +2566,7 @@ func RangeDiversityScore(existingStoreLocalities map[roachpb.StoreID]roachpb.Loc
 // diversityAllocateScore returns a value between 0 and 1 based on how
 // desirable it would be to add a replica to store. A higher score means the
 // store is a better fit.
+// 返回平均分
 func diversityAllocateScore(
 	storeLocality roachpb.Locality, existingStoreLocalities map[roachpb.StoreID]roachpb.Locality,
 ) float64 {
@@ -2380,15 +2576,18 @@ func diversityAllocateScore(
 	// how well the new store would fit, because for any store that we might
 	// consider adding the pairwise average diversity of the existing replicas
 	// is the same.
+	// 计算候选 Store 与每个已有副本的 Locality 差异
 	for _, locality := range existingStoreLocalities {
 		newScore := storeLocality.DiversityScore(locality)
 		sumScore += newScore
 		numSamples++
 	}
 	// If the range has no replicas, any node would be a perfect fit.
+	// 如果 Range 还没有副本,任何 Store 都是完美的
 	if numSamples == 0 {
 		return roachpb.MaxDiversityScore
 	}
+	// 返回平均差异分数
 	return sumScore / float64(numSamples)
 }
 
@@ -2405,6 +2604,8 @@ func diversityRemovalScore(
 	// because the original overall diversityScore of this range is always the
 	// same.
 	for otherStoreID, otherLocality := range existingStoreLocalities {
+		// 计算"移除此 Store 后,它与其他副本的平均 DiversityScore"
+		// 注意:分数越高表示移除后剩余副本仍保持多样性(即此 Store 不重要)
 		if otherStoreID == storeID {
 			continue
 		}
@@ -2448,27 +2649,32 @@ func diversityRebalanceScore(
 // the case where there's a particular replica we want to consider removing.
 // A higher score indicates that the provided store is a better fit for the
 // range.
+// 重平衡的分散性
 func diversityRebalanceFromScore(
-	storeLocality roachpb.Locality,
-	fromStoreID roachpb.StoreID,
+	storeLocality roachpb.Locality, // 新候选的 Locality
+	fromStoreID roachpb.StoreID, // 被替换的 Store
 	existingStoreLocalities map[roachpb.StoreID]roachpb.Locality,
 ) float64 {
 	// Compute the pairwise diversity score of all replicas that will exist
 	// after adding store and removing fromNodeID.
+	// 计算"添加 newStore,移除 fromStore 后"的总体分散性
+	// 方法:计算所有副本对的 DiversityScore 平均值
 	var sumScore float64
 	var numSamples int
 	for storeID, locality := range existingStoreLocalities {
 		if storeID == fromStoreID {
-			continue
+			continue //跳过被移除的 Store
 		}
+		// 新候选与保留的副本的分散性
 		newScore := storeLocality.DiversityScore(locality)
 		sumScore += newScore
 		numSamples++
+		// 保留的副本之间的分散性(两两配对)
 		for otherStoreID, otherLocality := range existingStoreLocalities {
 			// Only compare pairs of replicas where otherNodeID > nodeID to avoid
 			// computing the diversity score between each pair of localities twice.
 			if otherStoreID <= storeID || otherStoreID == fromStoreID {
-				continue
+				continue // 避免重复计算,跳过被移除的 Store
 			}
 			newScore := locality.DiversityScore(otherLocality)
 			sumScore += newScore
@@ -2538,12 +2744,53 @@ type IOOverloadOptions struct {
 	DiskUnhealthyScore float64
 }
 
+// 在当前 enforcement 策略下，判断一个 Store 是否因为 IO 压力而“不允许被使用”，并给出原因
+// 这些值的“真实含义”
+//
+// overloadScore
+//
+// 当前 store 的 IO 压力（如：stall、queue depth、latency）
+//
+// overloadAvg
+//
+// 集群同类 store 的平均 IO 压力
+//
+// absThreshold
+//
+// “超过这个值，不管别人怎么样，都算危险”
+//
+// meanThreshold
+//
+// “如果你比平均值高这么多，也算危险”
+//
+// diskUnhealthyScore
+//
+// 磁盘层面的问题（如：坏块、I/O error）
+//
+// enforcement
+//
+// 当前操作的“严格程度”（如：rebalance、replica add、lease transfer）
+//
+// disallowed
+//
+// 哪些操作 在 IO overload 时必须被禁止
 func ioOverloadCheck(
-	overloadScore, overloadAvg, diskUnhealthyScore, absThreshold, meanThreshold float64,
-	enforcement IOOverloadEnforcementLevel,
-	disallowed ...IOOverloadEnforcementLevel,
+	overloadScore, // 当前 Store 的 IO 压力评分
+	overloadAvg, // 集群平均 IO 压力
+	diskUnhealthyScore, // 磁盘不健康评分
+	absThreshold, // 绝对阈值
+	meanThreshold float64, // 相对平均阈值倍数
+	enforcement IOOverloadEnforcementLevel, // 当前 enforcement 级别
+	disallowed ...IOOverloadEnforcementLevel, // 哪些 enforcement 级别下禁止
 ) (ok bool, reason string) {
+	//没超过绝对阈值 → 安全
+	//超过 → 可能危险
 	absCheck := overloadScore < absThreshold
+	//即使没超过绝对阈值
+	//但如果你比“集群平均值”高太多，也认为你不健康
+	//👉 这是防止：
+	//某一个节点成为 IO 热点
+	//但整体集群还“看起来正常”
 	meanCheck := overloadScore < overloadAvg*meanThreshold
 	// We do not bother with the mean for the disk unhealthy score, because disk
 	// unhealthiness is rare, and also because this code was bolted on later
@@ -2551,14 +2798,26 @@ func ioOverloadCheck(
 	//
 	// TODO(sumeer): revisit this if this turns out to be useful, and do a
 	// cleaner version for MMA.
+	//diskUnhealthyScore ≈ 0 → 正常
+	//或者：
+	//虽然有问题
+	//但还没到绝对危险程度
+	//⚠️ 注意注释：
+	//磁盘不健康是 罕见事件，而且是后加的逻辑，所以这里故意简化
 	diskCheck := diskUnhealthyScore < epsilon || diskUnhealthyScore < absThreshold
-
+	//只要满足以下条件，就认为“IO 没有过载”：
+	//没超过绝对阈值 或
+	//没超过平均阈值
+	//并且
+	//磁盘是健康的
 	// The score needs to be no less than both the average threshold and the
 	// absolute threshold in order to be considered IO overloaded.
+	//必须同时超过「绝对阈值」和「相对平均阈值」，才会被认为是 IO overload
 	if (absCheck || meanCheck) && diskCheck {
 		return true, ""
 	}
-
+	//第二阶段：enforcement 控制（策略层）
+	//如果 被认为 IO overload，才会走到这里：
 	for _, disallowedEnforcement := range disallowed {
 		if enforcement == disallowedEnforcement {
 			return false, fmt.Sprintf(
@@ -2675,6 +2934,8 @@ func (o IOOverloadOptions) ExistingLeaseCheck(
 	return true
 }
 
+// scoresAlmostEqual 用于比较浮点分数是否“近似相等”
+// 避免因为浮点误差导致逻辑上等价的候选被错误区分
 func scoresAlmostEqual(score1, score2 float64) bool {
 	return math.Abs(score1-score2) < epsilon
 }

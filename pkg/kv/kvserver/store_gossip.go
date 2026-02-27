@@ -222,8 +222,8 @@ func (s *Store) systemGossipUpdate(sysCfg *config.SystemConfig) {
 // rebalancing.
 type cachedCapacity struct {
 	syncutil.Mutex
-	cached, lastGossiped roachpb.StoreCapacity
-	lastGossipedTime     time.Time
+	cached, lastGossiped roachpb.StoreCapacity // 当前缓存的容量,上次 gossip 的容量
+	lastGossipedTime     time.Time             // 上次 gossip 的时间
 }
 
 // StoreGossip is responsible for gossiping the store descriptor. It maintains
@@ -232,23 +232,23 @@ type cachedCapacity struct {
 type StoreGossip struct {
 	// Ident is the identity of the store this store gossip is associated with.
 	// This field is set after initialization, at store Start().
-	Ident   roachpb.StoreIdent
-	stopper *stop.Stopper
+	Ident   roachpb.StoreIdent // Store 标识（NodeID + StoreID）
+	stopper *stop.Stopper      // 用于优雅关闭
 	knobs   StoreGossipTestingKnobs
 	// cachedCapacity caches information on store capacity to prevent
 	// expensive recomputations in case leases or replicas are rapidly
 	// rebalancing.
-	cachedCapacity *cachedCapacity
+	cachedCapacity *cachedCapacity // 缓存的容量信息
 	// gossipOngoing indicates whether there is currently a triggered gossip,
 	// to avoid recursively re-triggering gossip.
-	gossipOngoing atomic.Bool
+	gossipOngoing atomic.Bool // 防止递归触发
 	// gossiper is used for adding information to gossip.
-	gossiper InfoGossiper
+	gossiper InfoGossiper // Gossip 网络接口
 	// descriptorGetter is used for getting an up to date or cached store
 	// descriptor to gossip.
-	descriptorGetter StoreDescriptorProvider
-	sv               *settings.Values
-	clock            timeutil.TimeSource
+	descriptorGetter StoreDescriptorProvider // Store 描述符提供者
+	sv               *settings.Values        // 集群配置
+	clock            timeutil.TimeSource     // 时间源
 }
 
 // StoreGossipTestingKnobs defines the testing knobs specific to StoreGossip.
@@ -371,9 +371,10 @@ func (s *StoreGossip) GossipStore(ctx context.Context, useCached bool) error {
 	// recursively triggering a gossip of the store capacity. This doesn't
 	// block direct calls to GossipStore, rather capacity triggered gossip
 	// outlined in the methods below.
+	// Step 1: 设置 gossipOngoing 标志（防止递归）
 	s.gossipOngoing.Store(true)
 	defer s.gossipOngoing.Store(false)
-
+	// Step 2: 获取 Store 描述符
 	storeDesc, err := s.descriptorGetter.Descriptor(ctx, useCached)
 	if err != nil {
 		return errors.Wrapf(err, "problem getting store descriptor for store %+v", s.Ident)
@@ -389,13 +390,17 @@ func (s *StoreGossip) GossipStore(ctx context.Context, useCached bool) error {
 	// count. Previously, this was not as much as an issue as the gossip
 	// interval was 60 seconds, such that gossiping semi-frequently on changes
 	// was required.
+	// Step 3: 更新缓存和时间戳
 	now := s.clock.Now()
 	s.cachedCapacity.Lock()
+	// 在 Gossip 成功前更新
+	// 然后才调用 AddInfoProto
 	s.cachedCapacity.lastGossiped = storeDesc.Capacity
 	s.cachedCapacity.lastGossipedTime = now
 	s.cachedCapacity.Unlock()
 
 	// Unique gossip key per store.
+	// Step 4: 构造 Gossip key
 	gossipStoreKey := gossip.MakeStoreDescKey(storeDesc.StoreID)
 	// Gossip store descriptor.
 	if fn := s.knobs.StoreGossipIntercept; fn != nil {
@@ -426,6 +431,7 @@ func (s *StoreGossip) MaybeGossipOnCapacityChange(ctx context.Context, cce Capac
 
 	// Incrementally adjust stats to keep them up to date even if the
 	// capacity is gossiped, but isn't due yet to be recomputed from scratch.
+	// Step 1: 增量更新缓存
 	s.cachedCapacity.Lock()
 	switch cce {
 	case RangeAddEvent:
@@ -438,7 +444,7 @@ func (s *StoreGossip) MaybeGossipOnCapacityChange(ctx context.Context, cce Capac
 		s.cachedCapacity.cached.LeaseCount--
 	}
 	s.cachedCapacity.Unlock()
-
+	// Step 2: 检查是否需要 gossip
 	if shouldGossip, reason := s.shouldGossipOnCapacityDelta(); shouldGossip {
 		s.asyncGossipStore(context.TODO(), reason, true /* useCached */)
 	}
@@ -472,7 +478,7 @@ func (s *StoreGossip) RecordNewIOThreshold(threshold, thresholdMax admissionpb.I
 	s.cachedCapacity.cached.IOThreshold = threshold
 	s.cachedCapacity.cached.IOThresholdMax = thresholdMax
 	s.cachedCapacity.Unlock()
-
+	// 如果 IOThresholdMax 的 Score 显著增加，触发 gossip
 	if shouldGossip, reason := s.shouldGossipOnCapacityDelta(); shouldGossip {
 		s.asyncGossipStore(context.TODO(), reason, true /* useCached */)
 	}
@@ -488,49 +494,61 @@ func (s *StoreGossip) shouldGossipOnCapacityDelta() (should bool, reason string)
 	// immediately as we will already be gossiping an up to date (cached)
 	// capacity. If we have recently gossiped the store descriptor, avoid
 	// re-gossiping too soon, to avoid overloading the receivers of store gossip.
+	// ==================== Step 1: 前置条件检查 ====================
 	if s.gossipOngoing.Load() || !s.canEagerlyGossipNow() {
 		return
 	}
-
+	// ==================== Step 2: 获取配置 ====================
 	gossipWhenCapacityDeltaExceedsFraction := GossipWhenCapacityDeltaExceedsFraction.Get(s.sv)
 	if overrideCapacityDeltaFraction := s.knobs.OverrideGossipWhenCapacityDeltaExceedsFraction; overrideCapacityDeltaFraction > 0 {
 		gossipWhenCapacityDeltaExceedsFraction = overrideCapacityDeltaFraction
 	}
 
 	gossipMinMaxIOOverloadScore := allocatorimpl.LeaseIOOverloadThreshold.Get(s.sv)
+	// ==================== Step 3: 检查各项指标 ====================
 
 	s.cachedCapacity.Lock()
+	// 3.1 检查 QPS
 	updateForQPS, deltaQPS := deltaExceedsThreshold(
 		s.cachedCapacity.lastGossiped.QueriesPerSecond, s.cachedCapacity.cached.QueriesPerSecond,
 		gossipMinAbsoluteDelta, gossipWhenLoadDeltaExceedsFraction)
+	// 3.2 检查 WPS
 	updateForWPS, deltaWPS := deltaExceedsThreshold(
 		s.cachedCapacity.lastGossiped.WritesPerSecond, s.cachedCapacity.cached.WritesPerSecond,
 		gossipMinAbsoluteDelta, gossipWhenLoadDeltaExceedsFraction)
+	// 3.3 检查 WBPS (Write Bytes Per Second)
 	updateForWBPS, deltaWBPS := deltaExceedsThreshold(
 		s.cachedCapacity.lastGossiped.WriteBytesPerSecond, s.cachedCapacity.cached.WriteBytesPerSecond,
 		gossipMinAbsoluteDelta, gossipWhenLoadDeltaExceedsFraction)
+	// 3.4 检查 CPU
 	updateForCPUS, deltaCPUS := deltaExceedsThreshold(
 		s.cachedCapacity.lastGossiped.CPUPerSecond, s.cachedCapacity.cached.CPUPerSecond,
 		gossipMinAbsoluteDelta, gossipWhenLoadDeltaExceedsFraction)
+	// 3.5 检查 Range Count
 	updateForRangeCount, deltaRangeCount := deltaExceedsThreshold(
 		float64(s.cachedCapacity.lastGossiped.RangeCount), float64(s.cachedCapacity.cached.RangeCount),
 		GossipWhenRangeCountDeltaExceeds, gossipWhenCapacityDeltaExceedsFraction)
+	// 3.6 检查 Lease Count
 	updateForLeaseCount, deltaLeaseCount := deltaExceedsThreshold(
 		float64(s.cachedCapacity.lastGossiped.LeaseCount), float64(s.cachedCapacity.cached.LeaseCount),
 		gossipWhenLeaseCountDeltaExceeds, gossipWhenCapacityDeltaExceedsFraction)
+	// 3.7 检查 IO Overload Score
 	cachedMaxIOScore, _ := s.cachedCapacity.cached.IOThresholdMax.Score()
 	lastGossipMaxIOScore, _ := s.cachedCapacity.lastGossiped.IOThresholdMax.Score()
 	updateForMaxIOOverloadScore := cachedMaxIOScore >= gossipMinMaxIOOverloadScore &&
 		cachedMaxIOScore > lastGossipMaxIOScore
+	// 3.8 检查磁盘健康状态变化
 	diskUnhealthy := s.cachedCapacity.cached.IOThreshold.DiskUnhealthy
 	updateForChangeInDiskUnhealth :=
 		s.cachedCapacity.lastGossiped.IOThreshold.DiskUnhealthy != diskUnhealthy
 	s.cachedCapacity.Unlock()
 
+	// ==================== Step 4: 测试钩子 ====================
 	if s.knobs.DisableLeaseCapacityGossip {
 		updateForLeaseCount = false
 	}
 
+	// ==================== Step 5: 构造 reason 字符串 ====================
 	if updateForQPS {
 		reason += fmt.Sprintf("queries-per-second(%.1f) ", deltaQPS)
 	}

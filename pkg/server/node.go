@@ -363,21 +363,22 @@ func (nm *nodeMetrics) updateCrossLocalityMetricsOnBatchResponse(
 // IDs for bootstrapping the node itself or initializing new stores as
 // they're added on subsequent instantiations.
 type Node struct {
-	stopper      *stop.Stopper
-	clusterID    *base.ClusterIDContainer // UUID for Cockroach cluster
-	Descriptor   roachpb.NodeDescriptor   // Node ID, network/physical topology
-	storeCfg     kvserver.StoreConfig     // Config to use and pass to stores
+	stopper      *stop.Stopper // 生命周期管理
+	clusterID    *base.ClusterIDContainer // UUID for Cockroach cluster,集群 UUID
+	Descriptor   roachpb.NodeDescriptor   // Node ID, network/physical topology,节点元数据（ID、地址、属性）
+	storeCfg     kvserver.StoreConfig     // Config to use and pass to stores,Store 配置（共享给所有 Store）
 	execCfg      *sql.ExecutorConfig      // For event logging
-	stores       *kvserver.Stores         // Access to node-local stores
+	stores       *kvserver.Stores         // Access to node-local stores,节点上的所有 Store（通常 1 个）
 	metrics      *nodeMetrics
 	recorder     *status.MetricsRecorder
-	startedAt    int64
-	lastUp       int64
-	initialStart bool // true if this is the first time this node has started
+	// 状态字段
+	startedAt    int64                    // HLC 墙钟时间戳
+	lastUp       int64                    // 上次启动时间（从 Store 持久化读取）
+	initialStart bool                     // 是否首次启动（vs 重启）
 	txnMetrics   kvcoord.TxnMetrics
 
-	// Used to signal when additional stores, if any, have been initialized.
-	additionalStoreInitCh chan struct{}
+	// 异步初始化通道
+	additionalStoreInitCh chan struct{}   // 新 Store 初始化完成信号
 
 	perReplicaServer kvserver.Server
 
@@ -642,6 +643,18 @@ func (n *Node) AnnotateCtxWithSpan(
 // that SQL connections are accepted at addr. Neither is ever assumed
 // to carry HTTP, only if httpAddr is non-null will this node accept
 // proxied traffic from other nodes.
+//1.1 背景与要解决的问题
+//在 CockroachDB 的启动序列中，Server.PreStart() 已经完成了所有组件的构造（construction）工作：
+//- 存储引擎（Pebble）已被打开但未激活
+//- KV 层组件（DistSender、RangeDescriptorCache）已被创建但未连接到网络
+//- 准入控制（Admission Control）、SQL 执行器已被初始化但未处理请求
+//此时系统面临的核心问题是：如何将一个”构造完成但处于冷启动状态”的节点激活成为集群中的活跃成员？
+//具体包括：
+//1. 服务发现：如何让集群中的其他节点知道本节点的存在？
+//2. 状态同步：如何获取集群的全局元数据（如 Range 分布、节点拓扑）？
+//3. 数据激活：如何加载磁盘上的 Replica 并启动 Raft 共识？
+//4. 网络注册：如何开始接收和处理分布式 RPC 请求？
+//Node.start() 正是解决这些问题的激活层，它将已构造的组件从”静态配置”转变为”动态运行”。
 func (n *Node) start(
 	ctx, workersCtx context.Context,
 	addr, sqlAddr, httpAddr net.Addr,
@@ -653,19 +666,19 @@ func (n *Node) start(
 	localityAddress []roachpb.LocalityAddress,
 ) error {
 	n.initialStart = initialStart
-	n.startedAt = n.storeCfg.Clock.Now().WallTime
+	n.startedAt = n.storeCfg.Clock.Now().WallTime  // 记录启动时间（HLC）
 	n.Descriptor = roachpb.NodeDescriptor{
-		NodeID:          state.nodeID,
-		Address:         util.MakeUnresolvedAddr(addr.Network(), addr.String()),
-		SQLAddress:      util.MakeUnresolvedAddr(sqlAddr.Network(), sqlAddr.String()),
-		Attrs:           attrs,
-		Locality:        locality,
+		NodeID:          state.nodeID,// 从 initState 获取
+		Address:         util.MakeUnresolvedAddr(addr.Network(), addr.String()), // RPC 地址
+		SQLAddress:      util.MakeUnresolvedAddr(sqlAddr.Network(), sqlAddr.String()), // SQL 地址
+		Attrs:           attrs,// 节点属性（如 SSD）
+		Locality:        locality,// 节点属性（如 SSD）
 		LocalityAddress: localityAddress,
 		ClusterName:     clusterName,
 		ServerVersion:   n.storeCfg.Settings.Version.LatestVersion(),
 		BuildTag:        build.GetInfo().Tag,
 		StartedAt:       n.startedAt,
-		HTTPAddress:     util.MakeUnresolvedAddr(httpAddr.Network(), httpAddr.String()),
+		HTTPAddress:     util.MakeUnresolvedAddr(httpAddr.Network(), httpAddr.String()),// HTTP 管理界面地址
 	}
 
 	// Track changes to the version setting to inform the tenant connector.
@@ -674,6 +687,15 @@ func (n *Node) start(
 	n.notifyClusterVersionChange(ctx, n.storeCfg.Settings.Version.ActiveVersion(ctx))
 
 	// Gossip the node descriptor to make this node addressable by node ID.
+	//**关键点**：
+	//- 此时 Gossip **尚未连接**到其他节点（`startGossiping()` 在后面）
+	//- 但可以先将节点描述符写入本地 Gossip 存储
+	//- 一旦 Gossip 连接建立，会自动将此信息传播出去
+	//
+	//**Why this order？**
+	//- Store 启动后会立即尝试与其他节点通信（如 Raft heartbeat）
+	//- 如果目标节点在 Gossip 中找不到本节点的 `NodeDescriptor`，RPC 会失败
+	//- 因此必须先注册，再启动 Store
 	n.storeCfg.Gossip.NodeID.Set(ctx, n.Descriptor.NodeID)
 	if err := n.storeCfg.Gossip.SetNodeDescriptor(&n.Descriptor); err != nil {
 		return errors.Wrapf(err, "couldn't gossip descriptor for node %d", n.Descriptor.NodeID)
@@ -683,11 +705,13 @@ func (n *Node) start(
 	// channel to collect errors when starting stores in separate goroutines.
 	// The channel is a buffered channel with the same size as the number of
 	// stores so worker go routines will never wait on the channel.
+	//### 并发启动已初始化的 Store（L682-L725）
+	//这是 `Node.start()` 中**最重的操作**，涉及加载磁盘上的所有 Replica。
 	var sem *quotapool.IntPool
 	if !startStoresAsync {
 		sem = quotapool.NewIntPool("store start concurrency", 1)
 	}
-	engineErrC := make(chan error, len(state.initializedEngines))
+	engineErrC := make(chan error, len(state.initializedEngines))// 缓冲通道，避免 goroutine 阻塞
 	for i := range state.initializedEngines {
 		engine := state.initializedEngines[i]
 		err := n.stopper.RunAsyncTaskEx(ctx,
@@ -711,6 +735,7 @@ func (n *Node) start(
 
 	// Collect errors from the go routines and return the first error received.
 	// This also waits for all stores to finish starting.
+	// 等待所有 Store 启动完成（或第一个错误）
 	for range state.initializedEngines {
 		select {
 		case <-n.stopper.ShouldQuiesce():
@@ -720,11 +745,13 @@ func (n *Node) start(
 		case err := <-engineErrC:
 			if err != nil {
 				return err
-			}
+			}// Fail-fast：任何 Store 失败都会导致节点启动失败
 		}
 	}
 
 	// Verify all initialized stores agree on cluster and node IDs.
+	//- 防止误将其他集群的磁盘挂载到当前节点
+	//- 防止多个节点共享同一磁盘（会导致数据损坏）
 	if err := n.validateStores(ctx); err != nil {
 		return err
 	}
@@ -733,6 +760,9 @@ func (n *Node) start(
 	// Compute the time this node was last up; this is done by reading the
 	// "last up time" from every store and choosing the most recent timestamp.
 	var mostRecentTimestamp hlc.Timestamp
+	//恢复节点的上次启动时间（L733-L748）
+	//- 计算节点的停机时长（用于诊断）
+	//- 影响 Replica 的 lease 恢复策略（长时间停机后可能放弃旧 lease）
 	if err := n.stores.VisitStores(func(s *kvserver.Store) error {
 		timestamp, err := s.ReadLastUpTimestamp(ctx)
 		if err != nil {
@@ -753,7 +783,7 @@ func (n *Node) start(
 	if err := n.storeCfg.Gossip.SetStorage(n.stores); err != nil {
 		return errors.Wrap(err, "failed to initialize the gossip interface")
 	}
-
+	//异步初始化新添加的 Store
 	// Initialize remaining stores/engines, if any.
 	if len(state.uninitializedEngines) > 0 {
 		// We need to initialize any remaining stores asynchronously.
@@ -772,6 +802,22 @@ func (n *Node) start(
 		//
 		// [1]: It's important to note that store IDs are allocated via a
 		// sequence ID generator stored in a system key.
+		//注释中明确说明了原因（L759-L774）：
+		//> 考虑存储 Store ID 分配器的 Range。当我们重启持有该 Range quorum 的节点集合时，
+		//特别是当我们使用辅助 Store 重启时，这些 Store 在初始化期间需要 Store ID。
+		//但如果我们将节点启动（特别是打开 RPC gateway）阻塞在所有 Store 完全初始化上，
+		//我们将在尝试分配 Store ID 时陷入死锁。
+		//>
+		//
+		//**死锁场景**：
+		//1. 节点 A、B、C 持有 Store ID 分配器的 Range
+		//2. 全部重启，且都有新 Store 需要分配 ID
+		//3. 如果都等待新 Store 初始化才启动 RPC → 无法处理分配请求 → 死锁
+		//
+		//**解决方案**：
+		//- 已有数据的 Store 同步启动（能够立即处理请求）
+		//- 新 Store 异步初始化（不阻塞节点启动）
+		//- 调用者通过 `waitForAdditionalStoreInit()` 等待完整初始化（如需要）
 		n.additionalStoreInitCh = make(chan struct{})
 		if err := n.stopper.RunAsyncTask(workersCtx, "initialize-additional-stores", func(ctx context.Context) {
 			if err := n.initializeAdditionalStores(ctx, state.uninitializedEngines); err != nil {
@@ -783,9 +829,10 @@ func (n *Node) start(
 			return err
 		}
 	}
-
+	// 1. 启动定期指标计算
 	n.startComputePeriodicMetrics(n.stopper, base.DefaultMetricsSampleInterval)
 	// Stores have been created, so can start providing tenant weights.
+	// 2. 将节点注册为 Admission Control 的租户权重提供者
 	n.storeCfg.KVAdmissionController.SetTenantWeightProvider(n, n.stopper)
 
 	// Be careful about moving this line above where we start stores; store
@@ -794,10 +841,11 @@ func (n *Node) start(
 	// with a given cluster version, but not if the server starts with a lower
 	// one and gets bumped immediately, which would be possible if gossip got
 	// started earlier).
+	// 3. 启动 Gossip 网络（开始连接其他节点）
 	n.startGossiping(workersCtx, n.stopper)
 
 	var terminateCollector func() = nil
-
+	// 4. 启动 Key Visualizer 的统计收集器（如果启用）
 	if keyvissettings.Enabled.Get(&n.storeCfg.Settings.SV) {
 		terminateCollector = n.enableSpanStatsCollector(ctx)
 	}
@@ -812,7 +860,7 @@ func (n *Node) start(
 	})
 
 	log.Dev.Infof(ctx, "started with attributes %v", attrs.Attrs)
-
+	// 5. 启动 Liveness Range 的定期 Compaction
 	n.startPeriodicLivenessCompaction(n.stopper, livenessRangeCompactInterval)
 	return nil
 }
@@ -1120,19 +1168,26 @@ func (n *Node) startComputePeriodicMetrics(stopper *stop.Stopper, interval time.
 	})
 }
 
-// startPeriodicLivenessCompaction starts a loop where it periodically compacts
-// the liveness range.
+// startPeriodicLivenessCompaction 启动一个后台循环，定期对存储 Liveness 数据的 Range 进行“手动压缩（Compaction）”。
+//
+// 为什么需要这个函数？
+// 1. 高频写入压力：集群中的每个节点每隔几秒就会发送一次心跳。这意味着 Liveness Range 处于极高频率的
+//    MVCC 写入状态，会产生海量的旧版本数据和删除标记（Tombstones）。
+// 2. 防止扫描延迟：虽然 CockroachDB 有自动 GC，但在这种极端高频场景下，旧版本堆积可能导致该 Range 的
+//    读操作（如集群启动时的扫描）变得异常缓慢。
+// 3. 强制瘦身：通过显式调用底层存储引擎的 CompactRange，可以物理地清除这些陈旧数据，保持 Liveness Range 的紧凑和高性能。
 func (n *Node) startPeriodicLivenessCompaction(
 	stopper *stop.Stopper, livenessRangeCompactInterval *settings.DurationSetting,
 ) {
 	ctx := n.AnnotateCtx(context.Background())
 
-	// getCompactionInterval() returns the interval at which the liveness range is
-	// set to be compacted. If the interval is set to 0, the period is set to the
-	// max possible duration because a value of 0 cause the ticker to panic.
+	// getCompactionInterval 是一个闭包，用于从集群设置中获取当前的压缩周期。
+	// 它处理了 Ticker 的一个特殊约束：时长必须大于 0。
 	getCompactionInterval := func() time.Duration {
 		interval := livenessRangeCompactInterval.Get(&n.storeCfg.Settings.SV)
 		if interval == 0 {
+			// 在 CockroachDB 设置中，0 通常表示禁用。
+			// 为了防止 NewTicker(0) 导致 Panic，我们将其映射为一个极大的时长。
 			interval = math.MaxInt64
 		}
 		return interval
@@ -1144,11 +1199,10 @@ func (n *Node) startPeriodicLivenessCompaction(
 
 		intervalChangeChan := make(chan time.Duration)
 
-		// Update the compaction interval when the setting changes.
+		// 当设置发生变化时更新压缩间隔。
 		livenessRangeCompactInterval.SetOnChange(&n.storeCfg.Settings.SV, func(ctx context.Context) {
-			// intervalChangeChan is used to signal the compaction loop that the
-			// interval has changed. Avoid blocking the main goroutine that is
-			// responsible for handling all settings updates.
+			// intervalChangeChan 用于通知压缩循环间隔已更改。
+			// 避免阻塞负责处理所有设置更新的主协程。
 			select {
 			case intervalChangeChan <- getCompactionInterval():
 			default:
@@ -1159,7 +1213,7 @@ func (n *Node) startPeriodicLivenessCompaction(
 		for {
 			select {
 			case <-ticker.C:
-				// Find the liveness replica in order to compact it.
+				// 寻找并压缩 Liveness 副本。
 				_ = n.stores.VisitStores(func(store *kvserver.Store) error {
 					store.VisitReplicas(func(repl *kvserver.Replica) bool {
 						span := repl.Desc().KeySpan().AsRawSpanWithNoLocals()
@@ -1167,11 +1221,13 @@ func (n *Node) startPeriodicLivenessCompaction(
 							return true
 						}
 
-						// CompactRange() expects the start and end keys to be encoded.
+						// CompactRange() 要求起始和结束键是经过编码的。
 						startEngineKey := storage.EngineKey{Key: span.Key}.Encode()
 						endEngineKey := storage.EngineKey{Key: span.EndKey}.Encode()
 
 						timeBeforeCompaction := timeutil.Now()
+						// 对属于 Liveness 范围的数据执行手动压缩。
+						// 这会物理移除 LSM 树中由于高频心跳产生的过期版本和标记。
 						if err := store.StateEngine().CompactRange(
 							context.Background(), startEngineKey, endEngineKey,
 						); err != nil {
@@ -1193,7 +1249,6 @@ func (n *Node) startPeriodicLivenessCompaction(
 	}); err != nil {
 		log.Dev.Errorf(ctx, "failed to start the async liveness compaction task")
 	}
-
 }
 
 // updateNodeRangeCount updates the internal counter of the total ranges across

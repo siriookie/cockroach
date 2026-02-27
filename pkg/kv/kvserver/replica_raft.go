@@ -879,6 +879,8 @@ func (r *Replica) handleRaftReady(
 //
 // The returned string is nonzero whenever an error is returned to give a
 // non-sensitive cue as to what happened.
+// 发送 Raft 消息时过滤 MsgApp
+// 触发时机：处理 Raft Ready（pkg/kv/kvserver/replica_raft.go:1018）
 func (r *Replica) handleRaftReadyRaftMuLocked(
 	ctx context.Context, inSnap IncomingSnapshot,
 ) (stats handleRaftReadyStats, _ error) {
@@ -962,7 +964,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		return unquiesceAndWakeLeader, nil
 	})
 	r.mu.applyingEntries = !ready.Committed.Empty()
-	pausedFollowers := r.mu.pausedFollowers
+	pausedFollowers := r.mu.pausedFollowers // 读取暂停列表
 	if shouldResetLastReplicaAdded {
 		// Since we already hold the Replica.mu lock, reset the lastReplicaAdded
 		// here if we need to.
@@ -1015,6 +1017,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	}
 
 	r.traceMessageSends(ready.Messages, "sending messages")
+	// 发送消息时过滤
 	r.sendRaftMessages(ctx, ready.Messages, pausedFollowers)
 
 	// Load the committed entries to be applied after releasing Replica.mu, to
@@ -1373,8 +1376,10 @@ func maybeFatalOnRaftReadyErr(ctx context.Context, err error) (removed bool) {
 
 // tick the Raft group, returning true if the raft group exists and should
 // be queued for Ready processing; false otherwise.
+// ### Replica 读取快照并更新 pausedFollowers
+// **触发时机**：每个 Replica 的 tick 处理（[pkg/kv/kvserver/replica_raft.go:1413](pkg/kv/kvserver/replica_raft.go#L1413)）
 func (r *Replica) tick(
-	ctx context.Context, livenessMap livenesspb.IsLiveMap, ioThresholdMap *ioThresholdMap,
+	ctx context.Context, livenessMap livenesspb.IsLiveMap, ioThresholdMap *ioThresholdMap, // 从 Store 传入的快照
 ) (exists bool, err error) {
 	r.raftMu.Lock()
 	defer r.raftMu.Unlock()
@@ -1409,9 +1414,9 @@ func (r *Replica) tick(
 		}
 		r.mu.internalRaftGroup.ReportUnreachable(raftpb.PeerID(remoteReplica))
 	}
-
+	// 更新 pausedFollowers（基于 ioThresholdMap）
 	r.updatePausedFollowersLocked(ctx, ioThresholdMap)
-
+	// ... 后续 quiesce、lease 检查等 ...
 	storeClockTimestamp := r.store.Clock().NowAsClockTimestamp()
 
 	// Update lastTickTimestamp so that we don't have to redo the work multiple
@@ -1814,6 +1819,7 @@ func (r *Replica) sendRaftMessages(
 	for _, message := range messages {
 		_, drop := blocked[roachpb.ReplicaID(message.To)]
 		if drop {
+			// 丢弃 MsgApp 消息，不发送到网络
 			r.store.Metrics().RaftPausedFollowerDroppedMsgs.Inc(1)
 		}
 		switch message.Type {

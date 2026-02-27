@@ -26,25 +26,34 @@ var KVSlotAdjusterOverloadThreshold = settings.RegisterIntSetting(
 // kvSlotAdjuster is an implementer of CPULoadListener and
 // cpuOverloadIndicator.
 type kvSlotAdjuster struct {
-	settings *cluster.Settings
-	// This is the slotGranter used for KVWork.
-	granter     *slotGranter
-	minCPUSlots int
-	maxCPUSlots int
+	settings *cluster.Settings // 集群配置
+	granter  *slotGranter      // 关联的 slotGranter（KVWork）
 
-	totalSlotsMetric                 *metric.Gauge
-	cpuLoadShortPeriodDurationMetric *metric.Counter
-	cpuLoadLongPeriodDurationMetric  *metric.Counter
-	slotAdjusterIncrementsMetric     *metric.Counter
-	slotAdjusterDecrementsMetric     *metric.Counter
+	// ========== 边界约束 ==========
+	minCPUSlots int // 最小 slots（默认 1）
+	maxCPUSlots int // 最大 slots（默认 100,000）
+
+	// ========== Metrics（可观测性）==========
+	totalSlotsMetric                 *metric.Gauge   // 当前 totalSlots
+	cpuLoadShortPeriodDurationMetric *metric.Counter // 短周期采样时长统计
+	cpuLoadLongPeriodDurationMetric  *metric.Counter // 长周期采样时长统计
+	slotAdjusterIncrementsMetric     *metric.Counter // slot 增加次数
+	slotAdjusterDecrementsMetric     *metric.Counter // slot 减少次数
 }
 
+// 接口实现： 如果没实现的话在编译阶段就会报错
 var _ cpuOverloadIndicator = &kvSlotAdjuster{}
 var _ CPULoadListener = &kvSlotAdjuster{}
 
-func (kvsa *kvSlotAdjuster) CPULoad(runnable int, procs int, samplePeriod time.Duration) {
+// 接收 CPU 负载信号
+func (kvsa *kvSlotAdjuster) CPULoad(
+	runnable int, // 可运行 goroutine 数量
+	procs int, // GOMAXPROCS
+	samplePeriod time.Duration, // 采样周期
+) {
+	//每个cpu可以运行的goroutine数量，默认是32
 	threshold := int(KVSlotAdjusterOverloadThreshold.Get(&kvsa.settings.SV))
-
+	//默认的cpu采样周期，1ms，大于这个值认为cpu已经因为延迟导致采样周期变长
 	periodDurationMicros := samplePeriod.Microseconds()
 	if samplePeriod > time.Millisecond {
 		kvsa.cpuLoadLongPeriodDurationMetric.Inc(periodDurationMicros)
@@ -56,20 +65,22 @@ func (kvsa *kvSlotAdjuster) CPULoad(runnable int, procs int, samplePeriod time.D
 	// could be devised.
 	usedSlots := kvsa.granter.usedSlots
 	tryDecreaseSlots := func(total int, adjustMetric bool) int {
-		// Overload.
-		// If using some slots, and the used slots is less than the total slots,
-		// and total slots hasn't bottomed out at the min, decrease the total
-		// slots. If currently using more than the total slots, it suggests that
-		// the previous slot reduction has not taken effect yet, so we hold off on
-		// further decreasing.
-		// TODO(sumeer): despite the additive decrease and high multiplier value,
-		// the metric showed some drops from 40 slots to 1 slot on a kv50 overload
-		// workload. It was not accompanied by a drop in runnable count per proc,
-		// so it is suggests that the drop in slots should not be causing cpu
-		// under-utilization, but one cannot be sure. Experiment with a smoothed
-		// signal or other ways to prevent a fast drop.
-		if usedSlots > 0 && total > kvsa.minCPUSlots && usedSlots <= total {
-			total--
+		// 条件 1: usedSlots > 0
+		// 原因: 如果没有 slot 在用，说明没有负载，不需要减少
+		if usedSlots > 0 &&
+
+			// 条件 2: total > kvsa.minCPUSlots
+			// 原因: 保证至少有 minCPUSlots（默认 1）个 slot
+			total > kvsa.minCPUSlots &&
+
+			// 条件 3: usedSlots ≤ total (关键！)
+			// 原因: 如果 usedSlots > total，说明之前的减少还未生效
+			//      （有请求 bypass 或正在处理中）
+			//      此时继续减少会导致过度反应
+			usedSlots <= total {
+
+			total-- // 减少 1 个 slot
+
 			if adjustMetric {
 				kvsa.slotAdjusterDecrementsMetric.Inc(1)
 			}
@@ -77,25 +88,29 @@ func (kvsa *kvSlotAdjuster) CPULoad(runnable int, procs int, samplePeriod time.D
 		return total
 	}
 	tryIncreaseSlots := func(total int, adjustMetric bool) int {
-		// Underload.
-		// Used all its slots and can increase further, so additive increase. We
-		// also handle the case where the used slots are a bit less than total
-		// slots, since callers for soft slots don't block.
-		if usedSlots >= total && total < kvsa.maxCPUSlots {
-			// NB: If the workload is IO bound, the slot count here will keep
-			// incrementing until these slots are no longer the bottleneck for
-			// admission. So it is not unreasonable to see this slot count go into
-			// the 1000s. If the workload switches to being CPU bound, we can
-			// decrease by 1000 slots every second (because the CPULoad ticks are at
-			// 1ms intervals, and we do additive decrease).
-			total++
+		// 条件 1: usedSlots >= total (slots 被用满或接近用满)
+		// 原因: 只有需求饱和时才增加供给
+		if usedSlots >= total &&
+
+			// 条件 2: total < kvsa.maxCPUSlots
+			// 原因: 不超过上限（默认 100,000）
+			total < kvsa.maxCPUSlots {
+
+			total++ // 增加 1 个 slot
+
 			if adjustMetric {
 				kvsa.slotAdjusterIncrementsMetric.Inc(1)
 			}
 		}
 		return total
 	}
-
+	//- IO-bound 负载：slots 会持续增长到数千
+	//- 因为 goroutine 大量阻塞在 IO，usedSlots 总是满的
+	//- 但 runnable goroutines 很少（大部分在等待 IO）
+	//- kvSlotAdjuster 会持续增加 slots
+	//- CPU-bound 负载：可以每秒减少 1000 个 slots
+	//- 1ms 间隔 × 1000 次/秒 = 1000 slots/秒
+	//- 快速响应负载切换
 	if runnable >= threshold*procs {
 		// Overloaded.
 		kvsa.granter.setTotalSlotsLocked(
@@ -109,6 +124,8 @@ func (kvsa *kvSlotAdjuster) CPULoad(runnable int, procs int, samplePeriod time.D
 	kvsa.totalSlotsMetric.Update(int64(kvsa.granter.totalSlots))
 }
 
+// 检查 CPU 是否过载
 func (kvsa *kvSlotAdjuster) isOverloaded() bool {
+	//已使用的槽位大于所有的槽位，并且没有因为负载过重强制跳过准入校验
 	return kvsa.granter.usedSlots >= kvsa.granter.totalSlots && !kvsa.granter.skipSlotEnforcement
 }

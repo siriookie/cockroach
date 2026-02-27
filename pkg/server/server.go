@@ -557,6 +557,9 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 			decomNodeMap.onNodeDecommissioned(id)
 		},
 		Engines: engines,
+		//这就像是一个“签到中心”，每当节点心跳成功时，
+		//它会跑到自己名下的**每一个仓库（Store）**里盖个章，
+		//上面刻着：“本仓库在 [当前时间] 仍然处于健康服务的状态”。
 		OnSelfHeartbeat: func(ctx context.Context) {
 			now := clock.Now()
 			if err := stores.VisitStores(func(s *kvserver.Store) error {
@@ -758,7 +761,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 	})
 	kvMemoryMonitor := mon.NewMonitorInheritWithLimit(
 		mon.MakeName("kv-mem"), 0 /* limit */, sqlMonitorAndMetrics.rootSQLMemoryMonitor,
-		true, /* longLiving */
+		true,                     /* longLiving */
 	)
 	kvMemoryMonitor.StartNoReserved(ctx, sqlMonitorAndMetrics.rootSQLMemoryMonitor)
 	rangeFeedBudgetFactory := serverrangefeed.NewBudgetFactory(
@@ -2039,6 +2042,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	})
 
 	// Start measuring the Go scheduler latency.
+	// 监视p99延迟来对准入控制进行校准
 	if err := schedulerlatency.StartSampler(
 		workersCtx, s.st, s.stopper, s.sysRegistry, base.DefaultMetricsSampleInterval,
 		// Wire up admission control's scheduler latency listener.
@@ -2048,6 +2052,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	}
 
 	// Check that the HLC clock is only moving forward.
+	//保证hlc上界一直在往前走，如果出现较大的差距那就panic
 	hlcUpperBoundExists, err := s.checkHLCUpperBoundExistsAndEnsureMonotonicity(ctx, initialStart)
 	if err != nil {
 		return err
@@ -2068,6 +2073,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	advAddrU := util.NewUnresolvedAddr("tcp", s.cfg.AdvertiseAddr)
 
 	// We're going to need to start gossip before we spin up Node below.
+	//启动gossip，开始连接 加入集群
 	s.gossip.Start(advAddrU, filtered, s.rpcContext)
 	log.Event(ctx, "started gossip")
 
@@ -2081,8 +2087,12 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// Registers an event log writer for the system tenant. This will enable the
 	// ability to persist structured events to the system tenant's
 	//system.eventlog table.
+	//`eventlog.Register`函数是CockroachDB事件日志系统的初始化入口，主要解决以下问题：
+	//1. **集中式事件管理**：为系统中的重要事件提供统一的存储和查询接口
+	//2. **持久化机制**：将结构化事件持久化存储到`system.eventlog`表中
+	//3. **测试控制**：提供测试钩子控制写入行为（同步/异步）
 	eventlog.Register(ctx, s.cfg.TestingKnobs.EventLog, s.node.execCfg.InternalDB, s.stopper, s.cfg.AmbientCtx, s.ClusterSettings())
-
+	//node 启动
 	if err := s.node.start(
 		ctx, workersCtx,
 		advAddrU,
@@ -2099,6 +2109,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	}
 
 	log.Event(ctx, "started node")
+	//周期性的更新HLC的上界
 	if err := s.startPersistingHLCUpperBound(ctx, hlcUpperBoundExists); err != nil {
 		return err
 	}

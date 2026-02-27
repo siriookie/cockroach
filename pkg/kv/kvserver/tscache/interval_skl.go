@@ -61,29 +61,32 @@ const (
 // That is, the range from apple (inclusive) to orange (exclusive) has a read
 // timestamp of 200. The range from orange (inclusive) to raspberry (inclusive)
 // has a read timestamp of 100. All other keys have a read timestamp of 0.
-type nodeOptions int
+// - hasKey：设置节点的 keyVal
+// - hasGap：设置节点的 gapVal
+// - hasKey|hasGap：同时设置两者（用于 range 起点）
+type nodeOptions int // hasKey, hasGap 的组合
 
 const (
 	// initialized indicates that the node has been created and fully
 	// initialized. Key and gap values are final, and can now be used.
-	initialized = 1 << iota
+	initialized = 1 << iota // 节点已初始化（值可用）
 
 	// cantInit indicates that the node should never be allowed to initialize.
 	// This is set on nodes which were unable to ratchet their values at some
 	// point because of a full arena. In this case, the node's values should
 	// never become final and any goroutines trying to initialize it it will be
 	// forced to create it again in a new page when they notice this flag.
-	cantInit
+	cantInit // 节点永不可初始化（Arena 满导致）
 
 	// hasKey indicates that the node has an associated key value. If this is
 	// not set, then the key timestamp is assumed to be zero and the key is
 	// assumed to not have a corresponding txnID.
-	hasKey
+	hasKey // 节点有 key timestamp
 
 	// hasGap indicates that the node has an associated gap value. If this is
 	// not set, then the gap timestamp is assumed to be zero and the gap is
 	// assumed to not have a corresponding txnID.
-	hasGap
+	hasGap // 节点有 gap timestamp
 )
 
 const (
@@ -142,15 +145,16 @@ type intervalSkl struct {
 	// lock is acquired by the Add and Lookup operations. The write lock is
 	// acquired only when the pages are rotated. Since that is very rare, the
 	// vast majority of operations can proceed without blocking.
-	rotMutex syncutil.RWMutex
+	rotMutex syncutil.RWMutex // 页面轮转的读写锁
 
 	// The following fields are used to enforce a minimum retention window on
 	// all timestamp intervals. intervalSkl promises to retain all timestamp
 	// intervals until they are at least this old before allowing the floor
 	// timestamp to ratchet and subsume them. If clock is nil then no minimum
 	// retention policy will be employed.
+	// 最小保留策略
 	clock  *hlc.Clock
-	minRet time.Duration
+	minRet time.Duration // 最小保留时间 默认10s
 
 	// The size of the last allocated page in the data structure, in bytes. When
 	// a page fills, a new page will be allocate, the pages will be rotated, and
@@ -161,8 +165,8 @@ type intervalSkl struct {
 	// The entire data structure is typically bound to a maximum a size of
 	// maximumSklPageSize*minPages. However, this limit can be violated if the
 	// intervalSkl needs to grow larger to enforce a minimum retention policy.
-	pageSize      uint32
-	pageSizeFixed bool // testing only
+	pageSize      uint32 // 当前页面大小（动态增长）
+	pageSizeFixed bool   // 是否固定页面大小（测试用）
 
 	// The linked list maintains fixed-size skiplist pages, ordered by creation
 	// time such that the first page is the one most recently created. When the
@@ -172,17 +176,17 @@ type intervalSkl struct {
 	// the list. However, earlier pages are accessed whenever necessary during
 	// lookups. Pages are evicted when they become too old, subject to a minimum
 	// retention policy described above.
-	pages    list.List[*sklPage]
-	minPages int
+	pages    list.List[*sklPage] // 页面链表（最新在前）
+	minPages int                 // 最少保留页面数
 
 	// In order to ensure that timestamps never decrease, intervalSkl maintains
 	// a floor timestamp, which is the minimum timestamp that can be returned by
 	// the lookup operations. When the earliest page is discarded, its current
 	// maximum timestamp becomes the new floor timestamp for the overall
 	// intervalSkl.
-	floorTS hlc.Timestamp
+	floorTS hlc.Timestamp // Floor Timestamp（单调递增下界）
 
-	metrics sklMetrics
+	metrics sklMetrics // 监控指标
 }
 
 // newIntervalSkl creates a new interval skiplist with the given minimum
@@ -226,6 +230,17 @@ func (s *intervalSkl) Add(ctx context.Context, key []byte, val cacheValue) {
 // the range is split into sub-ranges that are each marked with the maximum read
 // timestamp for that sub-range. Once AddRange completes, future lookups at any
 // point in the range are guaranteed to return an equal or greater timestamp.
+// 语义是：
+//
+// 「标记：这个区间 [from, to) 在 ts 时刻被读过」
+//
+// 并且要保证：
+//
+// 如果之前这个区间有更大的 ts → 拆分
+//
+// 最终：
+//
+// 对任意 key ∈ [from, to)，Lookup(key) ≥ ts
 func (s *intervalSkl) AddRange(
 	ctx context.Context, from, to []byte, opt rangeOptions, val cacheValue,
 ) {
@@ -246,6 +261,7 @@ func (s *intervalSkl) AddRange(
 
 		switch {
 		case cmp > 0:
+			//3.1 from > to → 直接 panic（严重 bug）
 			// Starting key is after ending key. This shouldn't happen. Determine
 			// the index where the keys diverged and panic.
 			d := 0
@@ -596,9 +612,9 @@ func (s *intervalSkl) FloorTS() hlc.Timestamp {
 // filled up, it returns arenaskl.ErrArenaFull. At that point, a new fixed page
 // must be allocated and used instead.
 type sklPage struct {
-	list        *arenaskl.Skiplist
-	maxWallTime atomic.Int64
-	isFull      atomic.Int32
+	list        *arenaskl.Skiplist // Arena-based 跳表
+	maxWallTime atomic.Int64       // 页面最大墙钟时间（用于查询优化）
+	isFull      atomic.Int32       // 页面是否已满（1=满）
 }
 
 func newSklPage(arena *arenaskl.Arena) *sklPage {
@@ -785,7 +801,11 @@ func (p *sklPage) visitRange(from, to []byte, opt rangeOptions, visit sklPageVis
 // created the node. If the flag is not set and a different goroutine created
 // the node, the method won't try to help.
 func (p *sklPage) addNode(
-	it *arenaskl.Iterator, key []byte, val cacheValue, opt nodeOptions, mustInit bool,
+	it *arenaskl.Iterator, /*跳表迭代器（复用以减少分配*/
+	key []byte, //要插入的 key
+	val cacheValue, //cacheValue（包含 ts 和 txnID）
+	opt nodeOptions,
+	mustInit bool, //是否强制初始化节点
 ) error {
 	// Array with constant size will remain on the stack.
 	var arr [encodedValSize * 2]byte
@@ -800,6 +820,8 @@ func (p *sklPage) addNode(
 	}
 
 	if !it.SeekForPrev(key) {
+		// key 不存在，需要插入新节点
+		// Step 2.1: 扫描 prevGapVal
 		// The key was not found. Scan for the previous gap value.
 		prevGapVal := p.incomingGapVal(it, key)
 
@@ -814,11 +836,14 @@ func (p *sklPage) addNode(
 			// no need to add another node, since its timestamp would be the
 			// same as the gap timestamp and its txnID would be the same as the
 			// gap txnID.
+			// Step 2.2: 检查是否需要插入
+			// 如果 prevGapVal 已经 >= val，无需插入节点
 			if _, update := ratchetValue(prevGapVal, val); !update {
-				return nil
+				return nil // Fast path: 无需插入
 			}
 
 			// Ratchet max timestamp before adding the node.
+			// Step 2.3: Ratchet max timestamp（乐观更新） CAS
 			p.ratchetMaxTimestamp(val.ts)
 
 			// Ensure that a new node is created. It needs to stay in the
@@ -827,8 +852,12 @@ func (p *sklPage) addNode(
 			// the search for the gap value, this node acts as a sentinel
 			// for other ongoing operations - when they see this node they're
 			// forced to stop and ratchet its value before they can continue.
+			// Step 2.4: 编码 value set
+			// meta 中包含 hasKey 和/或 hasGap 标志
 			b, meta := encodeValueSet(arr[:0], keyVal, gapVal)
+			// Step 2.5: 插入节点（CAS 操作）
 			err = it.Add(key, b, meta)
+			// 注意：节点初始状态是 initialized=0（未初始化）
 		}
 
 		switch {
@@ -836,9 +865,12 @@ func (p *sklPage) addNode(
 			p.isFull.Store(1)
 			return err
 		case errors.Is(err, arenaskl.ErrRecordExists):
+			// 另一线程已插入，fallback 到 ratchet
+			// 继续执行下面的代码
 			// Another thread raced and added the node, so just ratchet its
 			// values instead (down below).
 		case err == nil:
+			// 插入成功，现在需要初始化它
 			// Add was successful, so finish initialization by scanning for gap
 			// value and using it to ratchet the new nodes' values.
 			return p.ensureInitialized(it, key)
@@ -846,10 +878,12 @@ func (p *sklPage) addNode(
 			panic(fmt.Sprintf("unexpected error: %v", err))
 		}
 	}
-
+	// 此时节点已存在（无论是我们插入的还是别人插入的）
+	// 需要 ratchet 其值
 	// If mustInit is set to true then we're promising that the node will be
 	// initialized by the time this method returns. Ensure this by helping out
 	// the goroutine that created the node.
+	// 如果 mustInit=true，确保节点已初始化
 	if (it.Meta()&initialized) == 0 && mustInit {
 		if err := p.ensureInitialized(it, key); err != nil {
 			return err
@@ -860,9 +894,10 @@ func (p *sklPage) addNode(
 	// initialized bit. If mustInit is set then we already made sure the node
 	// was initialized. If mustInit is not set then we don't require it to be
 	// initialized.
+	// Ratchet 节点的值（但不设置 initialized 标志）
 	if opt == 0 {
 		// Don't need to set either key or gap value, so done.
-		return nil
+		return nil // 没有要设置的值
 	}
 	return p.ratchetValueSet(it, always, keyVal, gapVal, false /* setInit */)
 }
@@ -930,13 +965,16 @@ func (p *sklPage) addNode(
 // been called.
 func (p *sklPage) ensureInitialized(it *arenaskl.Iterator, key []byte) error {
 	// Determine the incoming gap value.
+	// Step 1: 扫描 incoming gap value
 	prevGapVal := p.incomingGapVal(it, key)
 
 	// Make sure we're on the right key again.
 	if util.RaceEnabled && !bytes.Equal(it.Key(), key) {
 		panic("no node found")
 	}
-
+	// Step 2: 用 prevGapVal 初始化节点
+	// onlyIfUninitialized: 只有 initialized=0 时才更新
+	// setInit=true: 设置 initialized 标志
 	// If the node isn't initialized, initialize it.
 	return p.ratchetValueSet(it, onlyIfUninitialized, prevGapVal, prevGapVal, true /* setInit */)
 }
@@ -1026,12 +1064,8 @@ func (p *sklPage) getMaxTimestamp() hlc.Timestamp {
 type ratchetPolicy bool
 
 const (
-	// always is a policy to ratchet a node regardless of whether it is already
-	// initialized or not.
-	always ratchetPolicy = false
-	// onlyIfUninitialized is a policy to only ratchet a node if it has not been
-	// initialized yet.
-	onlyIfUninitialized ratchetPolicy = true
+	always              ratchetPolicy = false // 总是 ratchet
+	onlyIfUninitialized ratchetPolicy = true  // 只 ratchet 未初始化节点
 )
 
 // ratchetValueSet will update the current node's key and gap values to the
@@ -1042,8 +1076,12 @@ const (
 // The method will return ErrArenaFull if the arena was too full to ratchet the
 // node's value set. In that case, the node will be marked with the "cantInit"
 // flag because its values should never be trusted in isolation.
+// 原子更新节点值
 func (p *sklPage) ratchetValueSet(
-	it *arenaskl.Iterator, policy ratchetPolicy, keyVal, gapVal cacheValue, setInit bool,
+	it *arenaskl.Iterator,
+	policy ratchetPolicy, // always 或 onlyIfUninitialized
+	keyVal, gapVal cacheValue,
+	setInit bool, // 是否设置 initialized 标志
 ) error {
 	// Array with constant size will remain on the stack.
 	var arr [encodedValSize * 2]byte
@@ -1052,20 +1090,22 @@ func (p *sklPage) ratchetValueSet(
 		util.RacePreempt()
 
 		meta := it.Meta()
+		// Step 1: 检查策略
 		inited := (meta & initialized) != 0
 		if inited && policy == onlyIfUninitialized {
 			// If the node is already initialized and the policy is
 			// onlyIfUninitialized, return. If this isn't the first ratcheting
 			// attempt then we must have raced with node initialization before.
-			return nil
+			return nil // 节点已初始化，跳过
 		}
 		if (meta & cantInit) != 0 {
 			// If the meta has the cantInit flag set to true, we fail with an
 			// ErrArenaFull error to force the current goroutine to retry on a
 			// new page.
-			return arenaskl.ErrArenaFull
+			// 节点被标记为 cantInit（Arena 满导致）
+			return arenaskl.ErrArenaFull // 强制调用者在新页面重试
 		}
-
+		// Step 2: 计算新 meta
 		newMeta := meta
 		updateInit := setInit && !inited
 		if updateInit {
@@ -1079,6 +1119,7 @@ func (p *sklPage) ratchetValueSet(
 		updateVals := keyValUpdate || gapValUpdate
 
 		if updateVals {
+			// Step 4: 更新 max timestamp
 			// If we're updating the values (and maybe the init flag) then we
 			// need to call it.Set. This can return an ErrArenaFull, which we
 			// must handle with care.
@@ -1087,23 +1128,23 @@ func (p *sklPage) ratchetValueSet(
 			maxTs := keyVal.ts
 			maxTs.Forward(gapVal.ts)
 			p.ratchetMaxTimestamp(maxTs)
-
+			// Step 5: 编码新 value set
 			// Remove the hasKey and hasGap flags from the meta. These will be
 			// replaced below.
-			newMeta &^= (hasKey | hasGap)
+			newMeta &^= (hasKey | hasGap) // 清除旧标志
 
 			// Update the values, possibly preserving the init bit.
 			b, valMeta := encodeValueSet(arr[:0], keyVal, gapVal)
 			newMeta |= valMeta
-
+			// Step 6: CAS 更新
 			err := it.Set(b, newMeta)
 			switch {
 			case err == nil:
 				// Success.
-				return nil
+				return nil // 成功
 			case errors.Is(err, arenaskl.ErrRecordUpdated):
 				// Record was updated by another thread, so restart ratchet attempt.
-				continue
+				continue // 重试 CAS
 			case errors.Is(err, arenaskl.ErrArenaFull):
 				// The arena was full which means that we were unable to ratchet
 				// the value of this node. Mark the page as full and make sure
@@ -1112,9 +1153,11 @@ func (p *sklPage) ratchetValueSet(
 				// was initialized after this, its value set would be relied
 				// upon to stand on its own even though it would be missing the
 				// ratcheting we tried to perform here.
+				// Arena 满，标记节点为 cantInit
 				p.isFull.Store(1)
 
 				if !inited && (meta&cantInit) == 0 {
+					// 设置 cantInit 标志（这个操作不会失败）
 					err := it.SetMeta(meta | cantInit)
 					switch {
 					case errors.Is(err, arenaskl.ErrRecordUpdated):
@@ -1130,6 +1173,7 @@ func (p *sklPage) ratchetValueSet(
 				panic(fmt.Sprintf("unexpected error: %v", err))
 			}
 		} else if updateInit {
+			// 只更新 initialized 标志（不需要分配新 Arena 空间）
 			// If we're only updating the init flag and not the values, we can
 			// use it.SetMeta instead of it.Set, which avoids allocating new
 			// chunks in the arena.
@@ -1140,14 +1184,14 @@ func (p *sklPage) ratchetValueSet(
 				return nil
 			case errors.Is(err, arenaskl.ErrRecordUpdated):
 				// Record was updated by another thread, so restart ratchet attempt.
-				continue
+				continue // 重试
 			case errors.Is(err, arenaskl.ErrArenaFull):
 				panic(fmt.Sprintf("SetMeta with larger meta should not return %v", err))
 			default:
 				panic(fmt.Sprintf("unexpected error: %v", err))
 			}
 		} else {
-			return nil
+			return nil // 无需更新
 		}
 	}
 }
@@ -1174,9 +1218,12 @@ func (p *sklPage) ratchetValueSet(
 // decrease on future lookups, which is the critical invariant.
 func (p *sklPage) incomingGapVal(it *arenaskl.Iterator, key []byte) cacheValue {
 	// Iterate backwards to the nearest initialized node.
+	// Step 1: 向后扫描到最近的 initialized 节点
 	prevInitNode(it)
+	// 现在 it 位于 <= key 的最近 initialized 节点
 
 	// Iterate forwards to key, remembering the last gap value.
+	// Step 2: 向前扫描到 key，沿途 ratchet 未初始化节点
 	return p.scanTo(it, key, 0, cacheValue{}, nil)
 }
 
@@ -1200,7 +1247,11 @@ func (p *sklPage) incomingGapVal(it *arenaskl.Iterator, key []byte) cacheValue {
 // When finished, the iterator will be positioned the same as if it.Seek(to) had
 // been called.
 func (p *sklPage) scanTo(
-	it *arenaskl.Iterator, to []byte, opt rangeOptions, initGapVal cacheValue, visit sklPageVisitor,
+	it *arenaskl.Iterator,
+	to []byte,
+	opt rangeOptions,
+	initGapVal cacheValue, // 初始 gap value
+	visit sklPageVisitor, // 可选的访问者函数
 ) (prevGapVal cacheValue) {
 	prevGapVal = initGapVal
 	first := true
@@ -1225,10 +1276,12 @@ func (p *sklPage) scanTo(
 
 		// Ratchet uninitialized nodes. We pass onlyIfUninitialized, so if
 		// the node is already initialized then this is a no-op.
+		// Ratchet 未初始化节点（防止竞态）
 		ratchetErr := p.ratchetValueSet(it, onlyIfUninitialized,
 			prevGapVal, prevGapVal, false /* setInit */)
 
 		// Decode the current node's value set.
+		// 解码节点的 value set
 		keyVal, gapVal := decodeValueSet(it.Value(), it.Meta())
 		if ratchetErr != nil {
 			if errors.Is(ratchetErr, arenaskl.ErrArenaFull) {
@@ -1245,6 +1298,7 @@ func (p *sklPage) scanTo(
 		if !(first && (opt&excludeFrom) != 0) && visit != nil {
 			// As long as this isn't the first key and opt says to exclude the
 			// first key, we call the visitor.
+			// 调用访问者（如果提供）
 			visit(key, keyVal, hasKey)
 		}
 
@@ -1255,11 +1309,12 @@ func (p *sklPage) scanTo(
 
 		// Call the visitor with the current gapVal.
 		if visit != nil {
+			// 调用访问者（如果提供）
 			visit(key, gapVal, hasGap)
 		}
 
 		// Haven't yet reached the scan's end key, so keep iterating.
-		prevGapVal = gapVal
+		prevGapVal = gapVal // 更新 gap value
 		first = false
 		it.Next()
 	}
@@ -1280,11 +1335,11 @@ func prevInitNode(it *arenaskl.Iterator) {
 
 		if (it.Meta() & initialized) != 0 {
 			// Found an initialized node.
-			break
+			break // 找到 initialized 节点
 		}
 
 		// Haven't yet reached an initialized node, so keep iterating.
-		it.Prev()
+		it.Prev() // 继续向后
 	}
 }
 

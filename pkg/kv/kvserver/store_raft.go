@@ -1038,18 +1038,23 @@ func (s *Store) raftTickLoop(ctx context.Context) {
 	}
 }
 
+// 在 Store.raftTickLoop() 中，每个 tick 周期执行：
 func (s *Store) updateIOThresholdMap() {
+	// 1. 从 StorePool 读取集群中所有 Store 的 IOThreshold
 	ioThresholdMap := map[roachpb.StoreID]*admissionpb.IOThreshold{}
 	for _, sd := range s.cfg.StorePool.GetStores() {
-		ioThreshold := sd.Capacity.IOThreshold // need a copy
+		ioThreshold := sd.Capacity.IOThreshold // 复制一份（避免竞态）
 		ioThresholdMap[sd.StoreID] = &ioThreshold
 	}
+	// 2. 读取集群设置的暂停阈值
 	threshold := pauseReplicationIOThreshold.Get(&s.cfg.Settings.SV)
 	if threshold <= 0 {
-		threshold = math.MaxFloat64
+		threshold = math.MaxFloat64 // 禁用暂停机制
 	}
+	// 3. 原子替换旧快照
 	old, cur := s.ioThresholds.Replace(ioThresholdMap, threshold)
 	// Log whenever the set of overloaded stores changes.
+	// 4. 如果"可暂停的 Store 集合"发生变化，记录日志
 	shouldLog := log.V(1) || old.seq != cur.seq
 	if shouldLog {
 		log.KvExec.Infof(

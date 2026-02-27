@@ -79,6 +79,13 @@ type Cache interface {
 }
 
 // New returns a new timestamp cache with the supplied hybrid-logical clock.
+// 核心分支存在的原因：
+// - 默认路径（SkipList）：生产环境使用，性能优先
+// - 优势：Lock-free读，Arena分配减少GC压力，内存效率高
+// - 劣势：实现复杂，调试困难
+// - 备选路径（Tree）：测试环境或特殊场景使用
+// - 优势：逻辑简单，行为确定性强，易于调试
+// - 劣势：全局RWMutex，内存占用高（64MB固定）
 func New(clock *hlc.Clock) Cache {
 	if envutil.EnvOrDefaultBool("COCKROACH_USE_TREE_TSCACHE", false) {
 		return newTreeImpl(clock)
@@ -89,8 +96,8 @@ func New(clock *hlc.Clock) Cache {
 // cacheValue combines a timestamp with an optional txnID. It is shared between
 // multiple Cache implementations.
 type cacheValue struct {
-	ts    hlc.Timestamp
-	txnID uuid.UUID
+	ts    hlc.Timestamp // 混合逻辑时钟时间戳
+	txnID uuid.UUID     // 事务ID（可选，用于冲突解析）
 }
 
 // noTxnID is used when a cacheValue has no corresponding TxnID.

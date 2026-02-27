@@ -29,6 +29,7 @@ type Fabric interface {
 	// S_local will never be unaware of support it is providing.
 	//
 	// If S_local is unaware of the remote store S_remote, false will be returned.
+	// SupportFor 返回本 Store 对指定 Store 的支持状态
 	SupportFor(id slpb.StoreIdent) (slpb.Epoch, bool)
 
 	// SupportFrom returns the epoch of the current uninterrupted period of Store
@@ -51,6 +52,7 @@ type Fabric interface {
 	//
 	// If S_local is unaware of the remote store S_remote, it will initiate a
 	// heartbeat loop to S_remote in order to request support.
+	// SupportFrom 返回本 Store 从指定 Store 获得的支持状态
 	SupportFrom(id slpb.StoreIdent) (slpb.Epoch, hlc.Timestamp)
 
 	// SupportFromEnabled determines if Store Liveness requests support from

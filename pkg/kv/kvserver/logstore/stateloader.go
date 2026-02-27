@@ -61,8 +61,12 @@ type EntryID = kvserverpb.RaftTruncatedState
 func (sl StateLoader) LoadLastEntryID(
 	ctx context.Context, reader storage.Reader, ts kvserverpb.RaftTruncatedState,
 ) (EntryID, error) {
+	//prefix := sl.RaftLogPrefix()：它首先计算出当前 Range 的 Raft Log 在存储引擎中的 Key 前缀。所有的 Raft Log 条目都存储在这个前缀下。
+	//例如：/Local/RangeID/<id>/RaftLog/。
 	prefix := sl.RaftLogPrefix()
 	// NB: raft log has no intents.
+	//它向底层存储（Pebble）申请一个迭代器。
+	//LowerBound: prefix：这告诉迭代器，我们只关心这个前缀之后的数据，优化查询性能。
 	iter, err := reader.NewMVCCIterator(
 		ctx, storage.MVCCKeyIterKind, storage.IterOptions{
 			LowerBound: prefix, ReadCategory: fs.ReplicationReadCategory})
@@ -72,6 +76,9 @@ func (sl StateLoader) LoadLastEntryID(
 	defer iter.Close()
 
 	var last EntryID
+	//它构造了一个指向该前缀下 理论上最大可能 Key（RaftLogKeyFromPrefix(prefix, math.MaxUint64)）的 Key。
+	//然后它让迭代器去寻找 小于 (Less Than) 这个最大 Key 的第一条记录。
+	//因为数据库中的 Key 是有序的，查找“小于无穷大的最大值”实际上就是在找该前缀下的 最后一条记录。
 	iter.SeekLT(storage.MakeMVCCMetadataKey(keys.RaftLogKeyFromPrefix(prefix, math.MaxUint64)))
 	if ok, _ := iter.Valid(); ok {
 		key := iter.UnsafeKey().Key
@@ -94,7 +101,11 @@ func (sl StateLoader) LoadLastEntryID(
 		}
 		last.Term = kvpb.RaftTerm(entry.Term)
 	}
-
+	//如果没找到任何记录（last.Index == 0）：这意味着日志是空的。
+	//原因可能是：这还是个新 Range，或者所有的日志都已经被截断（Truncated）并转为快照了。
+	//此时，它会直接返回传入的
+	//ts
+	// (TruncatedState)。因为如果日志为空，那么逻辑上的“最后一条日志”其实就是截断点的信息（快照中的 Index 和 Term）。
 	if last.Index == 0 {
 		// The log is empty, which means we are either starting from scratch
 		// or the entire log has been truncated away.
@@ -104,6 +115,18 @@ func (sl StateLoader) LoadLastEntryID(
 }
 
 // LoadRaftTruncatedState loads the truncated state.
+// 构造 Key：
+// 调用 sl.RaftTruncatedStateKey() 生成该 Range 对应的截断状态 Key。
+// 这个 Key 是 Range 专有的本地 Key（Range Local Key）。
+// 读取数据 (MVCCGetProto)：
+// 调用 storage.MVCCGetProto 从传入的 reader（通常是 Pebble 引擎的 Reader）中读取数据。
+// 忽略时间戳：传入了 hlc.Timestamp{}（空时间戳），这在读取 Range Local 数据时通常意味着直接读取最新值（因为这些元数据通常不使用 MVCC多版本并发控制，或者是 Blind Put 更新的）。
+// 反序列化：将读取到的 Value 反序列化为 kvserverpb.RaftTruncatedState 结构体。
+// 返回结果：
+// 如果是新副本或者从未发生过截断，这通常会返回零值（Index=0, Term=0）。
+// 如果发生过截断，返回的结构体包含：
+// Index: 被截断丢弃的最后一条日志的 Index。
+// Term: 被截断日志中最后一条日志的 Term。
 func (sl StateLoader) LoadRaftTruncatedState(
 	ctx context.Context, reader storage.Reader,
 ) (kvserverpb.RaftTruncatedState, error) {

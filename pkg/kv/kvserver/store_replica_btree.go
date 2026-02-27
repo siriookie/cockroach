@@ -17,6 +17,8 @@ import (
 
 // IterationOrder specifies the order in which replicas will be iterated through
 // by VisitKeyRange.
+// 3. 迭代顺序枚举
+// 职责：指定范围遍历的方向
 type IterationOrder int
 
 // Ordering options for VisitKeyRange.
@@ -29,9 +31,11 @@ const (
 // fields indicating whether this is a *Replica or a *ReplicaPlaceholder.
 // Exactly one of these two fields is set. The zero replicaOrPlaceholder represents no
 // value.
+// 2. 联合类型（值对象）
+// 职责：统一表示B树中的元素，支持两种Range状态
 type replicaOrPlaceholder struct {
-	repl *Replica
-	ph   *ReplicaPlaceholder
+	repl *Replica            // 完整的Replica（二选一）
+	ph   *ReplicaPlaceholder // 占位符（二选一）
 }
 
 func (it replicaOrPlaceholder) Desc() *roachpb.RangeDescriptor {
@@ -70,6 +74,9 @@ func (it replicaOrPlaceholder) key() roachpb.RKey {
 // a Store's replicasByKey btree. Please use only the "exported" (upper-case)
 // methods; everything else should be considered internal and only for use
 // from within storeReplicaBTree.
+// 1. 主索引结构（长期存在）
+// 生命周期：随Store创建而创建，随Store销毁而销毁
+// 职责：维护StartKey → Replica/Placeholder的有序映射
 type storeReplicaBTree btreemap.BTreeMap[roachpb.RKey, replicaOrPlaceholder]
 
 func newStoreReplicaBTree() *storeReplicaBTree {

@@ -262,6 +262,7 @@ type AllocatorStorePool interface {
 	// ClusterNodeCount returns the number of nodes that are possible allocation
 	// targets.
 	// See comment on StorePool.ClusterNodeCount().
+	//集群中所有已加入 gossip 的节点（Node）的数量
 	ClusterNodeCount() int
 
 	// IsDeterministic returns true iff the pool is configured to be deterministic.
@@ -969,7 +970,7 @@ func (sp *StorePool) getStoreDetailsCount() int {
 
 // Stat provides a running sample size and running stats.
 type Stat struct {
-	n, Mean float64
+	n /*Store 数量*/, Mean /* 平均 Range Count*/ float64
 }
 
 // Update adds the specified value to the Stat, augmenting the running stats.
@@ -982,11 +983,11 @@ func (s *Stat) update(x float64) {
 // stats for those stores.
 type StoreList struct {
 	Stores []roachpb.StoreDescriptor
-
+	// 自动计算的统计信息
 	// CandidateRanges tracks range count stats for Stores that are eligible to
 	// be rebalance targets (their used capacity percentage must be lower than
 	// maxFractionUsedThreshold).
-	CandidateRanges Stat
+	CandidateRanges Stat // Range Count 统计
 
 	// CandidateLeases tracks range lease stats for Stores that are eligible to
 	// be rebalance targets.
@@ -1208,7 +1209,8 @@ func (sp *StorePool) getStoreListFromIDs(
 	now := sp.clock.Now()
 	timeUntilNodeDead := liveness.TimeUntilNodeDead.Get(&sp.st.SV)
 	timeAfterNodeSuspect := liveness.TimeAfterNodeSuspect.Get(&sp.st.SV)
-
+	//StorePool 里可能 没有某些 store
+	//不在 StorePool 中 → 直接跳过
 	for _, storeID := range storeIDs {
 		detail, ok := sp.Details.StoreDetails.Load(storeID)
 		if !ok {
@@ -1217,6 +1219,17 @@ func (sp *StorePool) getStoreListFromIDs(
 		}
 		switch s := detail.status(now, timeUntilNodeDead, nl, timeAfterNodeSuspect); s {
 		case storeStatusThrottled:
+			//含义：
+			//Store：
+			//节点活着
+			//但由于某些原因被 throttled
+			//snapshot 太多
+			//IO 压力过大
+			//rebalance 限制
+			//是否加入候选列表，取决于 filter
+			//👉 调度器可以选择：
+			//“宁缺毋滥”（过滤）
+			//或“退而求其次”（允许）
 			aliveStoreCount++
 			detail.RLock()
 			throttled = append(throttled, detail.throttledBecause)
@@ -1225,13 +1238,27 @@ func (sp *StorePool) getStoreListFromIDs(
 			}
 			detail.RUnlock()
 		case storeStatusAvailable:
+			//含义：
+			//Store：
+			//节点存活
+			//没有被限流
+			//没有 drain
+			//可以自由用于 replica / lease / rebalance
 			aliveStoreCount++
 			detail.RLock()
 			storeDescriptors = append(storeDescriptors, *detail.Desc)
 			detail.RUnlock()
 		case storeStatusDraining:
+			//含义：
+			//Store 正在被运维下线
+			//绝对不能作为新副本/lease 目标
+			//但会记录原因，方便 debug
 			throttled = append(throttled, fmt.Sprintf("s%d: draining", storeID))
 		case storeStatusSuspect:
+			//含义：
+			//Node Liveness 有异常迹象
+			//还没完全 dead
+			//默认不优先使用，但不完全禁用
 			aliveStoreCount++
 			throttled = append(throttled, fmt.Sprintf("s%d: suspect", storeID))
 			if filter != StoreFilterThrottled && filter != StoreFilterSuspect {
@@ -1240,6 +1267,12 @@ func (sp *StorePool) getStoreListFromIDs(
 				detail.RUnlock()
 			}
 		case storeStatusDead, storeStatusUnknown, storeStatusDecommissioning:
+			//含义：
+			//这些 Store：
+			//完全不可用
+			//不算 alive
+			//不进入候选
+			//彻底排除
 			// Do nothing; this store cannot be used.
 		default:
 			panic(fmt.Sprintf("unknown store status: %d", s))

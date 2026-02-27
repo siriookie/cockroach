@@ -22,10 +22,10 @@ import (
 type requesterState struct {
 	// meta stores the RequesterMeta, including the max timestamp and max epoch at
 	// which this store has requested support.
-	meta slpb.RequesterMeta
+	meta slpb.RequesterMeta // 元数据
 	// supportFrom stores a pointer to requestedSupport for each remote store
 	// from which this store has received support.
-	supportFrom map[slpb.StoreIdent]*requestedSupport
+	supportFrom map[slpb.StoreIdent]*requestedSupport // 我从哪些 Store 获得支持
 }
 
 // requestedSupport is a wrapper around SupportState that also indicates whether
@@ -83,7 +83,7 @@ const (
 // progress is not allowed.
 type requesterStateHandler struct {
 	// requesterState is the source of truth for requested support.
-	requesterState requesterState
+	requesterState requesterState // COW 模式
 	// mu controls access to requesterState. The access pattern to requesterState
 	// is single writer, multi reader. Concurrent reads come from API calls to
 	// SupportFrom; these require RLocking mu. Updates to requesterState are done

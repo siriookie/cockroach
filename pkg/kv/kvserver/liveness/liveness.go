@@ -609,10 +609,24 @@ func (nl *NodeLiveness) setMembershipStatusInternal(
 // the NewNodeLiveness function. Currently the liveness is required prior to
 // Start getting called in replica_range_lease. For non-epoch leases this should
 // be possible.
+// Start 函数启动一个后台常驻协程来执行周期性的心跳。
+//
+// 核心作用：
+// 1. 宣告存活：定时刷新分布式 KV 中的过期时间，向集群证明节点在线。
+// 2. 纪元管理 (Epoch)：在节点启动时增加 Epoch，用来废除该节点之前可能残留的租约记录。
+// 3. 故障安全性：如果心跳因为磁盘卡死或网络彻底中断而停止，该节点的存活状态会由于没有被及时续期而过期，
+//    从而允许集群安全地将数据租约（Lease）重定位到其他健康节点。
+//
+// 例子：
+// - 节点启动 (Epoch=10)：
+//   - 第一次打卡：调用 (Epoch: 10 -> 11, Expiration: 12:00:09)。成功后，该节点正式“上线”。
+//   - 后续打卡：每 4.5s 执行一次。调用 (Epoch: 11, Expiration: 12:00:13.5)。只增加 Expiration，保证 Epoch 稳定。
+// - 如果节点网络断了 15s：
+//   - 其 Expiration (12:00:13.5) 会到期。集群判定该节点死亡，允许其他节点通过增加 Epoch (11 -> 12) 来接管该节点的 Range 租约。
 func (nl *NodeLiveness) Start(ctx context.Context) {
 	log.VEventf(ctx, 1, "starting node liveness instance")
 	if nl.started.Load() {
-		// This is meant to prevent tests from calling start twice.
+		// 避免重复启动。
 		log.KvExec.Fatal(ctx, "liveness already started")
 	}
 
@@ -620,7 +634,7 @@ func (nl *NodeLiveness) Start(ctx context.Context) {
 	retryOpts.Closer = nl.stopper.ShouldQuiesce()
 
 	nl.started.Store(true)
-
+	// 启动后台异步任务执行心跳循环。
 	_ = nl.stopper.RunAsyncTaskEx(ctx, stop.TaskOpts{TaskName: "liveness-hb", SpanOpt: stop.SterileRootSpan}, func(context.Context) {
 		ambient := nl.ambientCtx
 		ambient.AddLogTag("liveness-hb", nil)
@@ -629,25 +643,31 @@ func (nl *NodeLiveness) Start(ctx context.Context) {
 		ctx, sp := ambient.AnnotateCtxWithSpan(ctx, "liveness heartbeat loop")
 		defer sp.Finish()
 
+		// 标志第一次心跳是否需要增加 epoch。节点刚启动时必须通过增加 epoch
+		// 来确保让任何先前运行的实例所持有的旧租约失效并作废。
 		incrementEpoch := true
+
+		// 计算心跳尝试的频率。通常设为 (阈值 - 续期耗时上限)。
 		heartbeatInterval := nl.livenessThreshold - nl.renewalDuration
+		// 1. 启动周期性定时器。
 		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-nl.heartbeatToken:
+			case <-nl.heartbeatToken: // 仅用于单元测试控制。
 			case <-nl.stopper.ShouldQuiesce():
-				return
+				return // 节点优雅退出。
 			}
-			// Give the context a timeout approximately as long as the time we
-			// have left before our liveness entry expires.
+			// 2. 限制单次心跳操作的耗时，防止请求卡在网络层无法返回。
 			if err := timeutil.RunWithTimeout(ctx, "node liveness heartbeat", nl.renewalDuration,
 				func(ctx context.Context) error {
 					nl.cache.checkForStaleEntries(gossip.StoreTTL)
-					// Retry heartbeat in the event the conditional put fails.
+					// 3. 心跳写入循环。
 					for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
+						// 3.a 优先从本地缓存获取自己的心跳状态。
 						oldLiveness, ok := nl.Self()
 						if !ok {
+							// 如果缓存为空（初始时刻），则执行网络 IO 从全局 KV 中读取一次记录。
 							nodeID := nl.cache.selfID()
 							liveness, err := nl.getLivenessRecordFromKV(ctx, nodeID)
 							if err != nil {
@@ -659,24 +679,30 @@ func (nl *NodeLiveness) Start(ctx context.Context) {
 							}
 							oldLiveness = liveness.Liveness
 						}
+						// 3.b 执行真正的条件更新。底层会验证 epoch。
 						if err := nl.heartbeatInternal(ctx, oldLiveness, incrementEpoch); err != nil {
+							// 如果因为 epoch 已被其他更年轻的节点非法推进了，则本节点需要重新同步状态。
 							if errors.Is(err, ErrEpochIncremented) {
 								log.KvExec.Infof(ctx, "%s; retrying", err)
 								continue
 							}
 							return err
 						}
-						incrementEpoch = false // don't increment epoch after first heartbeat
+						// 成功后，将增量 epoch 设置为 false，后续心跳只续期存活时间。
+						incrementEpoch = false
 						break
 					}
 					return nil
 				}); err != nil {
+				// 记录心跳失败日志。如果持续失败，该节点将被宣告死亡，丢失所有租约。
 				log.KvExec.Warningf(ctx, heartbeatFailureLogFormat, err)
 			} else if nl.onSelfHeartbeat != nil {
+				// 4. 心跳成功后的扩展回调（如本地磁盘打卡）。
 				nl.onSelfHeartbeat(ctx)
 			}
 
 			nl.heartbeatToken <- struct{}{}
+			// 5. 等待下一个节拍。
 			select {
 			case <-ticker.C:
 			case <-nl.stopper.ShouldQuiesce():
@@ -748,6 +774,31 @@ func (nl *NodeLiveness) notifyIsAliveCallbacks(fns []IsLiveCallback) {
 	}
 }
 
+// 总结来说，
+//
+// heartbeatInternal
+// 是整个心跳机制将数据实际落地到数据库的核心步骤，也是节点向全集群其它节点“宣示存活”最后的一道门。其主要的执行步骤如下：
+//
+// 取号和防重复（惊群效应防御）：心跳可能因为网络、CPU抖动而大量重试触发。系统先通过 selfSem 这个单通道的锁机制让各种高并发触发的心跳串行化。并在入队列前后计算时间戳差异，如果发现有人跑在前面替自己续上约了，就直接提前成功返回，不再重复向数据库发包。
+// 强制提升纪元 (Epoch Increment) 规则：日常续命是不改 Epoch 的（只延长过期时间）。如果外界告诉该节点“别人觉得你死了”（或者该节点刚重启发现它自己过期了），此节点就会开启“死而复生”模式，强行累加老周期的
+//
+// Epoch
+// 从而进入新时代，这一举动能强制让之前旧纪元发起的所以读写老租约瞬间作废，防止脑裂（Split Brain）脏写问题。
+// 计算出全新的过期时间
+//
+// Expiration
+// ：它结合当前墙上时钟+给定的生命阈值常量，计算出一个未来的截止期限。
+// 发起强一致更新（Conditional PutCAS 更新）：代码通过调用 nl.updateLiveness 将新旧两个状态传给底层的 KV 分布式引擎。它是一次附带前提条件的写入：“如果现在底层存的状态还是我这里保存的这个 oldLiveness 状态，就请把它更新成我现在的这个新状态；如果底层的数据不是我传的这坨 old 了，就抛错！”。
+// 处理失败或成功的结果：
+// 失败：如果是普通失败，但是检查底库发现在底层存活记录还是生效中，我们就当做心跳没发出去但也无能大碍（因为底层的过期时间依然在未来），转为成功返回；如果是
+//
+// Epoch
+// 被硬串改了证明有别的大事发生，抛出严重错误 ErrEpochIncremented 让上游启动重走重新读取接管最新状态的流程。
+// 成功：将新获得的 KV 回包更新到本地缓存里（调用我们前文提到的
+//
+// maybeUpdate
+// ）。至此不仅外界所有节点认知到了你的最新存活时间，你自己本地也认可了这个时间，整个心跳流程完美闭环。
+// heartbeatInternal 内部心跳的核心实现：它通过 CAS（Conditional Put）方式将节点的新过期时间更新到底层 KV
 func (nl *NodeLiveness) heartbeatInternal(
 	ctx context.Context, oldLiveness livenesspb.Liveness, incrementEpoch bool,
 ) (err error) {
@@ -755,47 +806,36 @@ func (nl *NodeLiveness) heartbeatInternal(
 	defer sp.Finish()
 	defer func(start time.Time) {
 		dur := timeutil.Since(start)
+		// 记录每次心跳的延迟，用于监控报警
 		nl.metrics.HeartbeatLatency.RecordValue(dur.Nanoseconds())
 		if dur > time.Second {
 			log.KvExec.Warningf(ctx, "slow heartbeat took %s; err=%v", dur, err)
 		}
 	}(timeutil.Now())
 
-	// Collect a clock reading from before we begin queuing on the heartbeat
-	// semaphore. This method (attempts to, see [*]) guarantees that, if
-	// successful, the liveness record's expiration will be at least the
-	// liveness threshold above the time that the method was called.
-	// Collecting this clock reading before queuing allows us to enforce
-	// this while avoiding redundant liveness heartbeats during thundering
-	// herds without needing to explicitly coalesce heartbeats.
-	//
-	// [*]: see TODO below about how errNodeAlreadyLive handling does not
-	//      enforce this guarantee.
+	// 1. 在入队等待锁之前，先抓取一次时钟，以此估算一个“期望的最短存活时间”。
+	// 这样可以避免如果锁排队时间过长，刚发出去的心跳一瞬间就过期了。
 	beforeQueueTS := nl.clock.Now()
 	minExpiration := beforeQueueTS.Add(nl.livenessThreshold.Nanoseconds(), 0).ToLegacyTimestamp()
 
-	// Before queueing, record the heartbeat as in-flight.
+	// 标记有心跳正在运行中
 	nl.metrics.HeartbeatsInFlight.Inc(1)
 	defer nl.metrics.HeartbeatsInFlight.Dec(1)
 
-	// Allow only one heartbeat at a time.
+	// 2. 限制本节点的心跳只能串行发生（同一时间内只能有一个在飞）
 	sem := nl.selfSem
 	select {
-	case sem <- struct{}{}:
+	case sem <- struct{}{}: // 获取令牌
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 	defer func() {
-		<-sem
+		<-sem // 释放令牌
 	}()
 
-	// If we are not intending to increment the node's liveness epoch, detect
-	// whether this heartbeat is needed anymore. It is possible that we queued
-	// for long enough on the semaphore such that other heartbeat attempts ahead
-	// of us already incremented the expiration past what we wanted. Note that
-	// if we allowed the heartbeat to proceed in this case, we know that it
-	// would hit a ConditionFailedError and return a errNodeAlreadyLive down
-	// below.
+	// 3. 冗余心跳拦截（惊群效应防御）
+	// 如果这只是一个普通的续期(不改变纪元)，而且在排队等锁的这段时间里，
+	// 其他更早发起的心跳已经成功把过期时间更新地足够远了，那这次心跳其实就没有必要再去调用底层系统了，直接视为成功即可。
 	if !incrementEpoch {
 		curLiveness, ok := nl.Self()
 		if ok && minExpiration.Less(curLiveness.Expiration) {
@@ -807,22 +847,20 @@ func (nl *NodeLiveness) heartbeatInternal(
 		return errors.AssertionFailedf("invalid old liveness record; found to be empty")
 	}
 
-	// Let's compute what our new liveness record should be. Start off with our
-	// existing view of things.
+	// 4. 构建新的心跳包
 	newLiveness := oldLiveness
 	if incrementEpoch {
+		// 如果在外界发现本节点已经被宣判死亡，或者节点刚启动接管，
+		// 这时候心跳的性质变了，必须强行把纪元(Epoch)加1，这会使得其他所有基于老纪元的租约立刻失效。
 		newLiveness.Epoch++
-		newLiveness.Draining = false // clear draining field
+		newLiveness.Draining = false // 增加纪元时重置 Draining 状态
 	}
 
-	// Grab a new clock reading to compute the new expiration time,
-	// since we may have queued on the semaphore for a while.
+	// 再次抓取当前时钟（因为上面等排队可能过了很久），得出实际的未来新过期时间（如 : 当前+9s）
 	afterQueueTS := nl.clock.Now()
 	newLiveness.Expiration = afterQueueTS.Add(nl.livenessThreshold.Nanoseconds(), 0).ToLegacyTimestamp()
-	// This guards against the system clock moving backwards. As long
-	// as the cockroach process is running, checks inside hlc.Clock
-	// will ensure that the clock never moves backwards, but these
-	// checks don't work across process restarts.
+
+	// 5. 校验：不能允许时间的倒流。如果机器时钟调错了，会导致拒绝心跳。
 	if newLiveness.Expiration.Less(oldLiveness.Expiration) {
 		return errors.Errorf("proposed liveness update expires earlier than previous record")
 	}
@@ -831,38 +869,36 @@ func (nl *NodeLiveness) heartbeatInternal(
 		oldLiveness: oldLiveness,
 		newLiveness: newLiveness,
 	}
+	// 6. 核心动作：向底层的 CockroachDB 数据范围发起 Conditional Put
+	// 这是保证所有节点对“谁活着”具备强一致认知的关键屏障
 	written, err := nl.updateLiveness(ctx, update, func(actual Record) error {
-		// Update liveness to actual value on mismatch.
+		// 回调函数只有在更新失败时触发（即实际在底层的记录和预期的 oldLiveness 不一致）
+
+		// 不管怎样，既然到底层查出了新数据，顺便就用这个新数据更新一下本地的缓存字典
 		nl.cache.maybeUpdate(ctx, actual)
 
-		// If the actual liveness is different than expected, but is
-		// considered live, treat the heartbeat as a success. This can
-		// happen when the periodic heartbeater races with a concurrent
-		// lease acquisition.
-		//
-		// TODO(bdarnell): If things are very slow, the new liveness may
-		// have already expired and we'd incorrectly return
-		// ErrEpochIncremented. Is this check even necessary? The common
-		// path through this method doesn't check whether the liveness
-		// expired while in flight, so maybe we don't have to care about
-		// that and only need to distinguish between same and different
-		// epochs in our return value.
+		// 特殊情况：如果当前节点心跳失败，但底层记录显示这节点依然“活着”（虽然记录的数值和预期的有偏差），
+		// 而且我们不是在做强制的纪元增加，那其实我们想要维持节点存活的目的已经达到了，姑且假装心跳成功了。
 		if actual.IsLive(nl.clock.Now()) && !incrementEpoch {
 			return errNodeAlreadyLive
 		}
-		// Otherwise, return error.
+		// 否则，这说明底层被人硬改了（纪元增加了）。这是一个严重的错误，会让上层进入死循环重试逻辑。
 		return ErrEpochIncremented
 	})
+
+	// 7. 处理各种结果并记录指标
 	if err != nil {
 		if errors.Is(err, errNodeAlreadyLive) {
+			// 因前面提到的“虽然失败但还是活着的”情况被包容，转为成功
 			nl.metrics.HeartbeatSuccesses.Inc(1)
 			return nil
 		}
 		nl.metrics.HeartbeatFailures.Inc()
-		return err
+		return err // 真正失败的错误抛出去（大概率是 ErrEpochIncremented）
 	}
 
 	log.VEventf(ctx, 1, "heartbeat %+v", written.Expiration)
+	// 发送成功，更新本地缓存为这笔最新的记录，同时可能触发节点状态由死转生的回调
 	nl.cache.maybeUpdate(ctx, written)
 	nl.metrics.HeartbeatSuccesses.Inc(1)
 	return nil
@@ -1042,23 +1078,17 @@ func (nl *NodeLiveness) RegisterCallback(cb IsLiveCallback) {
 	nl.notifyIsAliveCallbacks([]IsLiveCallback{cb})
 }
 
-// updateLiveness does a conditional put on the node liveness record for the
-// node specified by nodeID. In the event that the conditional put fails, the
-// handleCondFailed callback is invoked with the actual node liveness record;
-// the error returned by the callback replaces the ConditionFailedError as the
-// retval, and an empty Record is returned.
+// updateLiveness 是对底层 KV 存储执行“条件更新（Conditional Put）”的入口函数。
+// 它的职责是：在正式更新心跳前校验磁盘健康状态，并处理更新过程中可能出现的瞬态错误（如网络波动或不确定的结果）。
 //
-// The conditional put is done as a 1PC transaction with a ModifiedSpanTrigger
-// which indicates the node liveness record that the range leader should gossip
-// on commit.
-//
-// updateLiveness terminates certain errors that are expected to occur
-// sporadically, such as ambiguous results.
-//
-// If the CPut is successful (i.e. no error is returned and handleCondFailed is
-// not called), the value that has been written is returned as a Record.
-// This includes the encoded bytes, and it can be used to update the local
-// cache.
+// 逻辑流程：
+//  1. 校验磁盘健康 (verifyDiskHealth)：在续期心跳前，先尝试对所有存储引擎执行一次同步写操作。
+//     如果磁盘 IO 卡死或报错，则本函数直接返回错误导致心跳续期失败。这是一种自我保护机制：
+//     如果机器磁盘坏了，节点应该主动“自杀”（丢失存活状态和租约），让集群其它健康节点接管。
+//  2. 容错重试 (Retry Loop)：使用 retry 策略包裹更新逻辑。
+//  3. 执行单次尝试 (updateLivenessAttempt)：调用底层方法真正向 KV 系统发起包含 1PC 事务的 Conditional Put 请求。
+//  4. 结果分发：如果遇到这类可以重试的错误（errRetryLiveness），则继续下一轮循环；
+//     如果 CPut 因为记录不匹配失败，会触发 handleCondFailed 回调（通常由 heartbeatInternal 传入）。
 func (nl *NodeLiveness) updateLiveness(
 	ctx context.Context, update LivenessUpdate, handleCondFailed func(actual Record) error,
 ) (Record, error) {
@@ -1084,56 +1114,86 @@ func (nl *NodeLiveness) updateLiveness(
 	return Record{}, errors.New("retry loop ended without error - likely shutting down")
 }
 
-// verifyDiskHealth does a sync write to all disks before updating liveness, so
-// that a faulty or stalled disk will cause us to fail liveness and lose our
-// leases. All disks are written concurrently.
-// We do this asynchronously in order to respect the caller's context, and
-// coalesce concurrent writes onto an in-flight one. This is particularly
-// relevant for a stalled disk during a lease acquisition heartbeat, where we
-// need to return a timely NLHE to the caller such that it will try a different
-// replica and nudge it into acquiring the lease. This can leak a goroutine in
-// the case of a stalled disk.
+// verifyDiskHealth 的作用：这是 CockroachDB 的一种“自杀式”磁盘健康检查机制。
+// 在节点进行心跳续期（Liveness Heartbeat）之前，它会强制要求对本地所有的存储盘执行一次同步写（Sync Write）操作。
+//
+// 核心逻辑：
+//  1. 为什么要做这个？
+//     在分布式系统中，如果一个机器的磁盘 IO 彻底卡死（Stalled），但 CPU 和网络还是通的，
+//     如果没有这个检查，心跳依然能发出去（因为心跳只是一次网络请求），这会导致该节点占着租约（Lease）却无法读写磁盘。
+//     通过这个函数，如果磁盘卡死超过了心跳阈值，续期就会失败。
+//  2. 实现方式：
+//     - 它遍历所有的引擎（nl.engines），对每一个引擎调用 diskStorage.WriteSyncNoop。
+//     - 使用 singleflight 机制 (nl.engineSyncs.DoChan)：这意味着如果同时有多个地方想做磁盘检查（比如心跳跑得快），
+//     它们会合并成一次真实的磁盘同步写，避免给正在报警的磁盘雪上加霜。
+//     - 异步与超时处理：它会尊重传入的 ctx（包含心跳超时时间）。如果磁盘超过几秒没响应，WaitForResult(ctx) 就会报错。
+//  3. 后果：
+//     如果这个函数报错返回，updateliveness 就会失败，节点很快会因为无法续期而丢失 Liveness，
+//     从而触发全集群范围内的租约迁移，让健康的节点接管这台挂掉的机器。
 func (nl *NodeLiveness) verifyDiskHealth(ctx context.Context) error {
+	// resultCs 存储每个存储引擎同步写的异步结果（Future）
 	resultCs := make([]singleflight.Future, len(nl.engines))
 	for i, eng := range nl.engines {
+		// 使用 singleflight 串行化/合并并发的磁盘写校验请求
 		resultCs[i], _ = nl.engineSyncs.DoChan(ctx,
-			strconv.Itoa(i),
+			strconv.Itoa(i), // 每个引擎 ID 独立一个 singleflight group
 			singleflight.DoOpts{
 				Stop:               nl.stopper,
 				InheritCancelation: false,
 			},
 			func(ctx context.Context) (interface{}, error) {
+				// 执行一次实际的同步写测试（不带数据的同步操作，类似于 fsync 一个文件）
 				return nil, diskStorage.WriteSyncNoop(eng)
 			})
 	}
+	// 等待所有磁盘的校验结果返回
 	for _, resultC := range resultCs {
 		r := resultC.WaitForResult(ctx)
 		if r.Err != nil {
+			// 只要有一个磁盘出问题，就认为当前节点磁盘健康状态异常
 			return errors.Wrapf(r.Err, "disk write failed while updating node liveness")
 		}
 	}
 	return nil
 }
 
+// updateLivenessAttempt 是 updateLiveness 的具体执行单次尝试的函数。
+// 它的主要职责是确保在发起底层的事务性写入前，我们拥有正确的“旧状态”数据，
+// 并作为中间层触发逻辑冲突的回调。
+//
+// 逻辑说明：
+//  1. 检查 oldRaw（旧状态的原始二进制数据）：
+//     Conditional Put 需要知道数据库里“原本应该长什么样”。如果调用者没提供，
+//     它会尝试从本地 cache 中读取当前缓存的记录。
+//  2. 缓存一致性预检：
+//     如果本地 cache 里的记录（l.Liveness）已经和调用者预期的“旧记录”（update.oldLiveness）不一样了，
+//     说明在发起网络请求前，我们就已经知道这次 CPut 肯定会失败。
+//     这时候直接在本地调用 handleCondFailed(l) 回调处理冲突，而不必再浪费一次网络 IO。
+//  3. 执行真实写入：
+//     调用 nl.storage.Update，将请求真正发送到 KV 存储层（liveness 范围所在的 Leaseholder 节点）。
 func (nl *NodeLiveness) updateLivenessAttempt(
 	ctx context.Context, update LivenessUpdate, handleCondFailed func(actual Record) error,
 ) (Record, error) {
-	// If the caller is not manually providing the previous value in
-	// update.oldRaw. we need to read it from our cache.
+	// 如果调用者没有手动提供 update.oldRaw 中的先前值，我们需要从缓存中读取它。
 	if update.oldRaw == nil {
 		l, ok := nl.cache.getLiveness(update.newLiveness.NodeID)
 		if !ok {
-			// TODO(baptist): We only expect callers to supply us with node IDs
-			// they learnt through existing liveness records, which implies we
-			// should never find ourselves here. We should be able to return
-			// ErrMissingRecord instead.
+			// 如果缓存里完全没找到这个节点的记录，说明状态有问题。
 			return Record{}, ErrRecordCacheMiss
 		}
+		// 如果缓存的记录与调用者期望用来做对比的旧记录不一致，
+		// 说明 CPut 必定失败，直接调用 handleCondFailed 并返回。
 		if l.Liveness != update.oldLiveness {
 			return Record{}, handleCondFailed(l)
 		}
+		// 填充原始二进制数据，用于底层的字节级别对比。
 		update.oldRaw = l.raw
 	}
+	// 调用存储接口，发起真实的分布式写入。
+	//由于 Liveness 记录存储在系统的预留 Range（通常是第一个 Range）里，
+	//这个 Range 是有多个副本的（默认 3 个或 5 个）。
+	//因此，这笔心跳写入必须通过 Raft 协议 复制到该 Range 的多数派成员上并持久化到它们的物理存储（Pebble）中，
+	//才算心跳成功。
 	return nl.storage.Update(ctx, update, handleCondFailed)
 }
 

@@ -112,12 +112,23 @@ func Status(ctx context.Context, nl NodeLiveness, i StatusInput) kvserverpb.Leas
 		RequestTime:               i.RequestTs,
 		MinValidObservedTimestamp: i.MinValidObservedTs,
 	}
+	//st := repl.CurrentLeaseStatus(ctx)
+	//  ↓
+	//st.IsValid(): 检查 lease 是否有效 (未过期)
+	//  ↓
+	//st.OwnedBy(repl.StoreID()): 检查 lease 是否属于本 Store
+	//
+	//如果不满足:
+	//  - 返回 benignerror (不会触发 metric.failures)
+	//  - Replica 不入队
 	switch lease.Type() {
+	// 检查 lease 是否过期
 	case roachpb.LeaseExpiration:
 		// lease.Expiration is the only field we need to evaluate the lease.
 	case roachpb.LeaseEpoch:
 		// For epoch-based leases, retrieve the node liveness record associated with
 		// the lease.
+		// 检查 liveness epoch
 		l, ok := nl.GetLiveness(lease.Replica.NodeID)
 		status.Liveness = l.Liveness
 		if !ok || status.Liveness.Epoch < lease.Epoch {

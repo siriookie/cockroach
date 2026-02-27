@@ -521,6 +521,10 @@ func (rs ReplicaSet) String() string {
 
 // ProbeToCloseTimerScheduler is an interface for scheduling the closing of a
 // replica send stream.
+// 1. 必须持有 raftMu：调用者必须持有 Replica 的 raftMu 锁
+// 2. 异步执行：方法立即返回，实际关闭在未来发生
+// 3. 至少一次语义：事件可能重复触发（无害，Raft 层会检查）
+// 4. 无取消机制：一旦调度，无法取消（设计简化）
 type ProbeToCloseTimerScheduler interface {
 	// ScheduleSendStreamCloseRaftMuLocked schedules a callback with a raft event
 	// after the given delay. This function may be used to handle send stream

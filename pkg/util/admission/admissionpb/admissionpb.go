@@ -180,11 +180,11 @@ type WorkClass int8
 const (
 	// RegularWorkClass is for work corresponding to workloads that are
 	// throughput and latency sensitive.
-	RegularWorkClass WorkClass = iota
+	RegularWorkClass WorkClass = iota // 常规工作
 	// ElasticWorkClass is for work corresponding to workloads that can handle
 	// reduced throughput, possibly by taking longer to finish a workload. It is
 	// not latency sensitive.
-	ElasticWorkClass
+	ElasticWorkClass // 弹性工作
 	// NumWorkClasses is the number of work classes.
 	NumWorkClasses
 )

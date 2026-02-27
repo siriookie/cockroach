@@ -55,7 +55,39 @@ type StoreGrantCoordinators struct {
 
 	settings               *cluster.Settings
 	makeStoreRequesterFunc makeStoreRequesterFunc
-
+	//原因：
+	//
+	//1. IO 资源隔离：
+	//   ├─► 每个 Store 对应一个磁盘
+	//   ├─► 磁盘之间的 IO 容量独立
+	//   └─► 需要独立的 IO token 管理
+	//
+	//2. L0 容量独立：
+	//   ├─► 每个 Store 有独立的 Pebble 实例
+	//   ├─► L0 子层数独立
+	//   └─► 需要独立的 L0 token 管理
+	//
+	//3. 磁盘健康状态独立：
+	//   ├─► 一个 Store 的磁盘可能过载
+	//   ├─► 其他 Store 的磁盘正常
+	//   └─► 需要独立的准入决策
+	//
+	//示例：双 Store 节点
+	//
+	//Store 1：
+	//├─► L0 子层数 = 15（接近上限）
+	//├─► 磁盘带宽 = 80%（接近饱和）
+	//└─► IO tokens = 0（停止准入）
+	//
+	//Store 2：
+	//├─► L0 子层数 = 3（正常）
+	//├─► 磁盘带宽 = 30%（正常）
+	//└─► IO tokens = 10000（正常准入）
+	//
+	//结果：
+	//- Store 1 的写入请求被阻塞 ✓
+	//- Store 2 的写入请求正常处理 ✓
+	//- 避免 Store 2 被 Store 1 拖累 ✓
 	gcMap syncutil.Map[roachpb.StoreID, storeGrantCoordinator]
 	// numStores is used to track the number of stores which have been added
 	// to the gcMap. This is used because the IntMap doesn't expose a size
@@ -198,7 +230,9 @@ func (sgc *StoreGrantCoordinators) initGrantCoordinator(
 	storeID roachpb.StoreID, metricsRegistry *metric.Registry,
 ) *storeGrantCoordinator {
 	// Initialize metrics.
+	// ===== 步骤 1: 创建 metrics =====
 	sgcMetrics := makeStoreGrantCoordinatorMetrics(metricsRegistry)
+	// 为 regular 和 elastic 各创建一套 WorkQueue metrics
 	regularStoreWorkQueueMetrics :=
 		makeWorkQueueMetrics(fmt.Sprintf("%s-stores", KVWork), metricsRegistry,
 			admissionpb.NormalPri, admissionpb.LockingNormalPri)
@@ -209,7 +243,7 @@ func (sgc *StoreGrantCoordinators) initGrantCoordinator(
 		regularStoreWorkQueueMetrics, elasticStoreWorkQueueMetrics,
 	}
 	snapshotQMetrics := makeSnapshotQueueMetrics(metricsRegistry)
-
+	// ===== 步骤 2: 创建 kvStoreTokenGranter =====
 	kvg := &kvStoreTokenGranter{
 		knobs:                           sgc.knobs,
 		ioTokensExhaustedDurationMetric: sgcMetrics.KVIOTokensExhaustedDuration,
@@ -220,6 +254,8 @@ func (sgc *StoreGrantCoordinators) initGrantCoordinator(
 	// Setting tokens to unlimited is defensive. We expect that
 	// pebbleMetricsTick and allocateIOTokensTick will get called during
 	// initialization, which will also set these to unlimited.
+	// 初始化为 unlimited（防御性编程）
+	// 真正的值会在 pebbleMetricsTick 和 allocateIOTokensTick 中设置
 	kvg.mu.startingIOTokens = unlimitedTokens / unloadedDuration.ticksInAdjustmentInterval()
 	kvg.mu.availableIOTokens[admissionpb.RegularWorkClass] = unlimitedTokens / unloadedDuration.ticksInAdjustmentInterval()
 	kvg.mu.availableIOTokens[admissionpb.ElasticWorkClass] = kvg.mu.availableIOTokens[admissionpb.RegularWorkClass]
@@ -227,20 +263,21 @@ func (sgc *StoreGrantCoordinators) initGrantCoordinator(
 
 	opts := makeWorkQueueOptions(KVWork)
 	// This is IO work, so override the usesTokens value.
-	opts.usesTokens = true
+	opts.usesTokens = true // 关键：使用 token 而不是 slot,在io环节就不用slot了，只用token
+	// ===== 步骤 3: 创建 child granters（委托模式）=====
 	storeGranters := [admissionpb.NumWorkClasses]granterWithStoreReplicatedWorkAdmitted{
 		&kvStoreTokenChildGranter{
 			workType: admissionpb.RegularStoreWorkType,
-			parent:   kvg,
+			parent:   kvg, // 委托给 parent
 		},
 		&kvStoreTokenChildGranter{
 			workType: admissionpb.ElasticStoreWorkType,
-			parent:   kvg,
+			parent:   kvg, // 委托给 parent
 		},
 	}
 	snapshotGranter := &kvStoreTokenChildGranter{
 		workType: admissionpb.SnapshotIngestStoreWorkType,
-		parent:   kvg,
+		parent:   kvg, // 委托给 parent
 	}
 
 	storeReq := sgc.makeStoreRequesterFunc(
@@ -253,13 +290,18 @@ func (sgc *StoreGrantCoordinators) initGrantCoordinator(
 		sgc.knobs,
 		sgc.onLogEntryAdmitted,
 		sgcMetrics.KVIOTokensBypassed,
-		&kvg.mu.Mutex,
+		/*- `StoreWorkQueue` 和 `kvStoreTokenGranter` 共享同一个 mutex
+		- 原因：token 的扣除和归还需要原子性
+		- 锁顺序：`kvg.mu` 在 `WorkQueue.mu` 之前*/
+		&kvg.mu.Mutex, // 共享锁！
 	)
 	requesters := storeReq.getRequesters()
 	kvg.regularRequester = requesters[admissionpb.RegularWorkClass]
 	kvg.elasticRequester = requesters[admissionpb.ElasticWorkClass]
+	// ===== 步骤 5: 创建 SnapshotQueue =====
 	snapshotReq := makeSnapshotQueue(snapshotGranter, snapshotQMetrics)
 	kvg.snapshotRequester = snapshotReq
+	// ===== 步骤 6: 创建 ioLoadListener =====
 	ioll := &ioLoadListener{
 		storeID:               storeID,
 		settings:              sgc.settings,
@@ -270,6 +312,7 @@ func (sgc *StoreGrantCoordinators) initGrantCoordinator(
 		l0CompactedBytes:      sgcMetrics.L0CompactedBytes,
 		l0TokensProduced:      sgcMetrics.L0TokensProduced,
 	}
+	// ===== 步骤 7: 组装 coordinator =====
 	coord := &storeGrantCoordinator{
 		granter:        kvg,
 		storeReq:       storeReq,
@@ -357,11 +400,12 @@ func makeStoreGrantCoordinatorMetrics(registry *metric.Registry) StoreGrantCoord
 // child granters), requesters (WorkQueues for regular and elastic work, and
 // SnapshotQueue for incoming snapshots), and the ioLoadListener that listens
 // to load signals and adjusts the various token buckets.
+
 type storeGrantCoordinator struct {
-	granter        *kvStoreTokenGranter
-	storeReq       storeRequester
-	snapshotReq    requesterClose
-	ioLoadListener *ioLoadListener
+	granter        *kvStoreTokenGranter // IO token 管理
+	storeReq       storeRequester       // StoreWorkQueue
+	snapshotReq    requesterClose       // SnapshotQueue
+	ioLoadListener *ioLoadListener      // IO 负载监听
 }
 
 func (coord *storeGrantCoordinator) close() {

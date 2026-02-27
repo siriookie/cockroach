@@ -1589,15 +1589,30 @@ func ScanLocks(
 	return locks, nil
 }
 
-// WriteSyncNoop carries out a synchronous no-op write to the engine.
+// WriteSyncNoop 的作用：对底层存储引擎执行一次“同步空操作”写入。
+// 
+// 核心逻辑与用途：
+// 1. 为什么叫 No-op（空操作）？
+//    因为它调用了 batch.LogData(nil)，这在 RocksDB/Pebble 等引擎中只会向 WAL（预写日志）
+//    写入一条元数据标记（Custom Log Data），而不会修改任何实际的用户数据。
+// 2. 为什么要执行同步写（Sync）？
+//    最后的 batch.Commit(true /* sync */) 会强制要求操作系统将这笔日志物理刷入磁盘（fsync/fdatasync）。
+// 3. 在 Liveness 检查中的作用：
+//    它是 verifyDiskHealth 的核心工具。如果磁盘硬件故障、IO 调度器卡死或文件系统变成了只读，
+//    这个“看似无用”的同步写操作就会因为超时或直接报错而失败。
+//    简而言之，它是一根用来测试磁盘“是否有反应”的探针。
 func WriteSyncNoop(eng Engine) error {
+	// 创建一个新的写入批处理
 	batch := eng.NewBatch()
 	defer batch.Close()
 
+	// 写入一条空的日志元数据（LogData 不会产生实际的键值对变更）
 	if err := batch.LogData(nil); err != nil {
 		return err
 	}
 
+	// 提交该批处理，并显式要求同步刷盘（sync=true）
+	// 如果由于磁盘损坏无法完成 fsync，这里会阻塞或报错。
 	if err := batch.Commit(true /* sync */); err != nil {
 		return err
 	}

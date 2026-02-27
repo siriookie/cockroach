@@ -97,6 +97,8 @@ func (df *SystemConfigDeltaFilter) ForModified(
 
 // batchAndConsume waits on a channel to allow batching more events. It keeps
 // while consuming events as they come to avoid blocking the channel producer.
+// - 消费 channel 中的所有待处理信号
+// - 等待 infosBatchDelay（10ms）以批量处理
 func batchAndConsume(ch <-chan struct{}, batchDuration time.Duration) {
 	var batchTimer timeutil.Timer
 	defer batchTimer.Stop()

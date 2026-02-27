@@ -239,9 +239,12 @@ type ioLoadListener struct {
 	l0TokensProduced *metric.Counter
 }
 
+// ### L0 负载的感知机制
+// **信号源**：Pebble metrics（每 15s 采样）
 type ioLoadListenerState struct {
 	// Cumulative.
 	cumL0AddedBytes uint64
+	// ===== L0 状态（Gauge）=====
 	// Gauge.
 	curL0Bytes int64
 	// Cumulative.
@@ -590,12 +593,14 @@ func (io *ioLoadListener) pebbleMetricsTick(ctx context.Context, metrics StoreMe
 
 // For both byte and disk bandwidth tokens, allocateTokensTick gives out
 // remainingTokens/remainingTicks tokens in the current tick.
+// 将 15 秒的 token 分摊到每个 tick（1ms 或 250ms）
 func (io *ioLoadListener) allocateTokensTick(remainingTicks int64) {
 	allocateFunc := func(total int64, allocated int64, remainingTicks int64) (toAllocate int64) {
 		remainingTokens := total - allocated
 		// remainingTokens can be equal to unlimitedTokens(MaxInt64) if allocated ==
 		// 0. In such cases remainingTokens + remainingTicks - 1 will overflow.
 		if remainingTokens >= unlimitedTokens-(remainingTicks-1) {
+			// 处理 unlimitedTokens 的溢出
 			toAllocate = remainingTokens / remainingTicks
 		} else {
 			// Round up so that we don't accumulate tokens to give in a burst on
@@ -607,10 +612,36 @@ func (io *ioLoadListener) allocateTokensTick(remainingTicks int64) {
 			// tokens in 150000/11 == 13637 remainingTicks. So, we'll have over a
 			// second where we grant no tokens. Larger values of totalNumBytesTokens
 			// will ease this problem.
+			// ===== 向上取整 =====
+			// 目的：避免最后一个 tick 突然释放大量 tokens
+			//场景：totalTokens = 150,001, ticks = 15,000 (1ms 间隔)
+			//
+			//方案 A：向下取整（错误）
+			//├─ tokensPerTick = 150,001 / 15,000 = 10
+			//├─ 前 15,000 ticks: 10 * 15,000 = 150,000
+			//├─ 最后一个 tick: 150,001 - 150,000 = 1
+			//└─ 问题：分配不均 ❌
+			//
+			//方案 B：向上取整（正确）
+			//├─ tokensPerTick = (150,001 + 14,999) / 15,000 = 11
+			//├─ 前 13,636 ticks: 11 * 13,636 = 150,001
+			//├─ 后续 ticks: 0
+			//└─ 效果：更均匀 ✓
+			//
+			//数学原理：
+			//ceil(a/b) = (a + b - 1) / b  （整数除法）
+			//
+			//实际影响：
+			//├─ totalTokens = 150,000,000 (150 MB)
+			//├─ ticks = 15,000
+			//├─ tokensPerTick = 10,000
+			//└─ 分配完成时间：150,000,000 / 10,000 = 15,000 ticks
+			//    ≈ 15s（完美分配）
 			toAllocate = (remainingTokens + remainingTicks - 1) / remainingTicks
 			if toAllocate < 0 {
 				panic(errors.AssertionFailedf("toAllocate is negative %d", toAllocate))
 			}
+			// 防御性检查
 			if toAllocate+allocated > total {
 				toAllocate = total - allocated
 			}
@@ -676,7 +707,7 @@ func (io *ioLoadListener) allocateTokensTick(remainingTicks int64) {
 	diskWriteTokenMaxCapacity := allocateFunc(
 		io.diskWriteTokens, 0, unloadedDuration.ticksInAdjustmentInterval(),
 	)
-
+	// ===== 传递给 granter =====
 	tokensUsed, tokensUsedByElasticWork := io.kvGranter.setAvailableTokens(
 		toAllocateByteTokens,
 		toAllocateElasticByteTokens,

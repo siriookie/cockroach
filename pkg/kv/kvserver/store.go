@@ -871,42 +871,47 @@ increasing over time (see Replica.setTombstoneKey).
 NOTE: to the best of our knowledge, we don't rely on this invariant.
 */
 type Store struct {
-	Ident                *roachpb.StoreIdent // pointer to catch access before Start() is called
-	cfg                  StoreConfig
-	internalEngines      kvstorage.Engines
-	db                   *kv.DB
-	tsCache              tscache.Cache           // Most recent timestamps for keys / key ranges
-	allocator            allocatorimpl.Allocator // Makes allocation decisions
-	replRankings         *ReplicaRankings
+	// ========== 身份与配置 ==========
+	Ident           *roachpb.StoreIdent // StoreID、NodeID（Start 时填充）
+	cfg             StoreConfig         // 全局配置
+	internalEngines kvstorage.Engines   // Pebble 引擎（Log + State）
+	db              *kv.DB              // 分布式 KV 客户端
+	// ========== 缓存与优化 ==========
+	tsCache tscache.Cache // Most recent timestamps for keys / key ranges, // Timestamp Cache（避免并发写冲突）
+	// ========== 分配与再平衡 ==========
+	allocator            allocatorimpl.Allocator // Replica 放置决策
+	replRankings         *ReplicaRankings        // 按负载排序的 Replica
 	replRankingsByTenant *ReplicaRankingMap
-	storeRebalancer      *StoreRebalancer
-	mmaStoreRebalancer   *mmaStoreRebalancer
-	rangeIDAlloc         *idalloc.Allocator // Range ID allocator
-	leaseQueue           *leaseQueue        // Lease queue
-	mvccGCQueue          *mvccGCQueue       // MVCC GC queue
-	mergeQueue           *mergeQueue        // Range merging queue
-	splitQueue           *splitQueue        // Range splitting queue
-	replicateQueue       *replicateQueue    // Replication queue
-	replicaGCQueue       *replicaGCQueue    // Replica GC queue
-	raftLogQueue         *raftLogQueue      // Raft log truncation queue
+	storeRebalancer      *StoreRebalancer    // 主动再平衡
+	mmaStoreRebalancer   *mmaStoreRebalancer // MMA 再平衡
+	rangeIDAlloc         *idalloc.Allocator  // Range ID allocator
+	leaseQueue           *leaseQueue         // Lease 转移
+	mvccGCQueue          *mvccGCQueue        // MVCC 垃圾回收
+	mergeQueue           *mergeQueue         // Range 合并
+	splitQueue           *splitQueue         // Range 分裂
+	replicateQueue       *replicateQueue     // Replica 复制
+	replicaGCQueue       *replicaGCQueue     // Replica 垃圾回收
+	raftLogQueue         *raftLogQueue       // Raft log 截断
 	// Carries out truncations proposed by the raft log queue, and "replicated"
 	// via raft, when they are safe. Created in Store.Start.
-	raftTruncator        *raftLogTruncator
-	raftSnapshotQueue    *raftSnapshotQueue          // Raft repair queue
-	tsMaintenanceQueue   *timeSeriesMaintenanceQueue // Time series maintenance queue
-	scanner              *replicaScanner             // Replica scanner
-	consistencyQueue     *consistencyQueue           // Replica consistency check queue
-	consistencyLimiter   *quotapool.RateLimiter      // Rate limits consistency checks
-	metrics              *StoreMetrics
-	intentResolver       *intentresolver.IntentResolver
-	recoveryMgr          txnrecovery.Manager
-	storeLiveness        storeliveness.Fabric
-	syncWaiters          []*logstore.SyncWaiterLoop
-	raftEntryCache       *raftentry.Cache
+	raftTruncator      *raftLogTruncator
+	raftSnapshotQueue  *raftSnapshotQueue          // Raft snapshot 修复
+	tsMaintenanceQueue *timeSeriesMaintenanceQueue // Time series maintenance queue
+	// ========== 后台队列 ==========
+	scanner            *replicaScanner        // 扫描所有 Replica
+	consistencyQueue   *consistencyQueue      // 一致性检查
+	consistencyLimiter *quotapool.RateLimiter // Rate limits consistency checks
+	metrics            *StoreMetrics
+	intentResolver     *intentresolver.IntentResolver
+	recoveryMgr        txnrecovery.Manager
+	storeLiveness      storeliveness.Fabric
+	syncWaiters        []*logstore.SyncWaiterLoop // fsync 等待器
+	raftEntryCache     *raftentry.Cache           // Raft log 缓存
+	// ========== 流量控制 ==========
 	limiters             batcheval.Limiters
 	txnWaitMetrics       *txnwait.Metrics
 	raftMetrics          *raft.Metrics
-	sstSnapshotStorage   snaprecv.SSTSnapshotStorage
+	sstSnapshotStorage   snaprecv.SSTSnapshotStorage // Snapshot 临时存储
 	protectedtsReader    spanconfig.ProtectedTSReader
 	ctSender             *sidetransport.Sender
 	policyRefresher      *policyrefresher.PolicyRefresher
@@ -921,18 +926,23 @@ type Store struct {
 
 	// metricsMu protects the collection and update of engine metrics.
 	metricsMu syncutil.Mutex
-
+	// ========== Raft 消息合并 ==========
 	coalescedMu struct {
 		syncutil.Mutex
+		//结果是：
+		//heartbeats = {
+		//  Store B: [HB(range1), HB(range2), ... HB(range1000)]
+		//}
+		//👉 一个 Store 一个 entry
 		heartbeats         map[roachpb.StoreIdent][]kvserverpb.RaftHeartbeat
 		heartbeatResponses map[roachpb.StoreIdent][]kvserverpb.RaftHeartbeat
 	}
 	// 1 if the store was started, 0 if it wasn't. To be accessed using atomic
 	// ops.
-	started int32
+	started int32 // 原子标志：0=未启动, 1=已启动
 	stopper *stop.Stopper
 	// The time when the store was Start()ed, in nanos.
-	startedAt    int64
+	startedAt    int64 // 启动时间（HLC）
 	nodeDesc     *roachpb.NodeDescriptor
 	initComplete sync.WaitGroup // Signaled by async init tasks
 
@@ -948,7 +958,7 @@ type Store struct {
 	// TODO(bdarnell,tschottdorf): Would look better inside of `mu`, which at
 	// the time of its creation was riddled with deadlock (but that situation
 	// has likely improved).
-	draining atomic.Bool
+	draining atomic.Bool // 是否正在排空（graceful shutdown）
 
 	// concurrentRaftTraces is the number of concurrent raft trace requests that
 	// are currently registered. This limit is used to prevent extensive raft
@@ -1047,7 +1057,7 @@ type Store struct {
 	// out from under us. In particular, handleRaftReady accesses the replicaID
 	// more than once, and we rely on Replica.raftMu to ensure that this is not
 	// modified by a concurrent HandleRaftRequest. (#4476)
-
+	// ========== Replica 管理 ==========
 	mu struct {
 		syncutil.RWMutex
 		// Map of replicas by Range ID (map[roachpb.RangeID]*Replica).
@@ -1059,7 +1069,7 @@ type Store struct {
 		//
 		// INVARIANT: Any ReplicaPlaceholder in this map is also in replicaPlaceholders.
 		// INVARIANT: Any Replica with Replica.IsInitialized()==true is also in replicasByRangeID.
-		replicasByKey *storeReplicaBTree
+		replicasByKey *storeReplicaBTree // Key → Replica 映射
 		// creatingReplicas stores IDs of all ranges for which there is an ongoing
 		// attempt to create a replica.
 		creatingReplicas map[roachpb.RangeID]struct{}
@@ -1098,7 +1108,7 @@ type Store struct {
 	// Store.mu.replicas.
 	raftRecvQueues raftReceiveQueues
 
-	scheduler *raftScheduler
+	scheduler *raftScheduler // Raft 事件调度器（核心）
 
 	// livenessMap is a map from nodeID to a bool indicating
 	// liveness. It is updated periodically in raftTickLoop()
@@ -1107,19 +1117,20 @@ type Store struct {
 	// ioThresholds is analogous to livenessMap, but stores the *IOThresholds for
 	// the stores in the cluster . It is gossip-backed but is not updated
 	// reactively, i.e. will refresh on each tick loop iteration only.
-	ioThresholds *ioThresholds
+	// ========== IO 负载跟踪 ==========
+	ioThresholds *ioThresholds // LSM 层级阈值（用于准入控制）
 
 	ioThreshold struct {
 		syncutil.Mutex
 		t                 *admissionpb.IOThreshold // never nil
-		maxL0NumSubLevels *slidingwindow.Swag
+		maxL0NumSubLevels *slidingwindow.Swag      // 5 分钟滑动窗口
 		maxL0NumFiles     *slidingwindow.Swag
 		maxL0Size         *slidingwindow.Swag
 	}
 
 	// lastIOOverloadLeaseShed tracks the last time the store attempted to shed
 	// all range leases it held due to becoming IO overloaded.
-	lastIOOverloadLeaseShed atomic.Value
+	lastIOOverloadLeaseShed atomic.Value // 上次转移时间(atomic.Value)
 
 	counts struct {
 		// Number of placeholders removed due to error. Not a good fit for meaningful
@@ -1165,24 +1176,25 @@ type StoreConfig struct {
 	base.RaftConfig
 
 	DefaultSpanConfig roachpb.SpanConfig
-	Settings          *cluster.Settings
-	Clock             *hlc.Clock
-	Gossip            *gossip.Gossip
-	DB                *kv.DB
-	NodeLiveness      *liveness.NodeLiveness
-	StoreLiveness     *storeliveness.NodeContainer
-	StorePool         *storepool.StorePool
+	// ========== 全局资源 ==========
+	Settings      *cluster.Settings            // 集群配置（动态可调）
+	Clock         *hlc.Clock                   // 混合逻辑时钟
+	Gossip        *gossip.Gossip               // 节点间通信
+	DB            *kv.DB                       // 分布式 KV 客户端
+	NodeLiveness  *liveness.NodeLiveness       // 节点存活检测
+	StoreLiveness *storeliveness.NodeContainer // 集群中所有 Store 的状态
+	StorePool     *storepool.StorePool
 	// One MMAllocator per node which guides mma store rebalancer to make
 	// allocation changes when
 	// LBRebalancingMultiMetricOnly/LBRebalancingMultiMetricAndCount is enabled.
 	MMAllocator          mmaprototype.Allocator
 	AllocatorSync        *mmaintegration.AllocatorSync
-	Transport            *RaftTransport
-	NodeDialer           *nodedialer.Dialer
+	Transport            *RaftTransport     // Raft 消息传输
+	NodeDialer           *nodedialer.Dialer // 节点间 RPC
 	RPCContext           *rpc.Context
 	RangeDescriptorCache *rangecache.RangeCache
 
-	ClosedTimestampSender   *sidetransport.Sender
+	ClosedTimestampSender   *sidetransport.Sender // 侧信道传输
 	ClosedTimestampReceiver sidetransportReceiver
 
 	// PolicyRefresher periodically refreshes the closed timestamp policies for
@@ -1218,39 +1230,40 @@ type StoreConfig struct {
 	CoalescedHeartbeatsInterval time.Duration
 
 	// ScanInterval is the default value for the scan interval
-	ScanInterval time.Duration
+	// ========== 扫描配置 ==========
+	ScanInterval time.Duration // Replica 扫描间隔（默认 10 分钟）
 
 	// ScanMinIdleTime is the minimum time the scanner will be idle between ranges.
 	// If enabled (> 0), the scanner may complete in more than ScanInterval for
 	// stores with many ranges.
-	ScanMinIdleTime time.Duration
+	ScanMinIdleTime time.Duration // 扫描最小空闲时间
 
 	// ScanMaxIdleTime is the maximum time the scanner will be idle between ranges.
 	// If enabled (> 0), the scanner may complete in less than ScanInterval for small
 	// stores.
-	ScanMaxIdleTime time.Duration
+	ScanMaxIdleTime time.Duration // 扫描最大空闲时间
 
 	// If LogRangeAndNodeEvents is true, major changes to ranges will be logged into
 	// the range event log (system.rangelog table) and node join and restart
 	// events will be logged into the event log (system.eventlog table).
 	// Note that node Decommissioning events are always logged.
 	LogRangeAndNodeEvents bool
-
+	// ========== Raft 配置 ==========
 	// RaftSchedulerConcurrency specifies the number of Raft scheduler workers
 	// for this store. Values < 1 imply 1.
-	RaftSchedulerConcurrency int
+	RaftSchedulerConcurrency int // Raft 调度器工作线程数（默认 8*CPU）
 
 	// RaftSchedulerConcurrentPriority specifies the number of Raft scheduler
 	// workers for this store's dedicated priority shard. Values < 1 imply 1.
-	RaftSchedulerConcurrencyPriority int
+	RaftSchedulerConcurrencyPriority int // 优先级调度器线程数
 
 	// RaftSchedulerShardSize specifies the maximum number of Raft scheduler
 	// workers per mutex shard. Values < 1 imply 1.
-	RaftSchedulerShardSize int
+	RaftSchedulerShardSize int // 每个 shard 的最大 worker 数
 
 	// RaftEntryCacheSize is the size in bytes of the Raft log entry cache
 	// shared by all Raft groups managed by the store.
-	RaftEntryCacheSize uint64
+	RaftEntryCacheSize uint64 // Raft log 缓存大小
 
 	// IntentResolverTaskLimit is the maximum number of asynchronous tasks that
 	// may be started by the intent resolver. -1 indicates no asynchronous tasks
@@ -1466,12 +1479,13 @@ func (sc *StoreConfig) Tracer() *tracing.Tracer {
 
 // NewStore returns a new instance of a store.
 func NewStore(
-	ctx context.Context, cfg StoreConfig, eng storage.Engine, nodeDesc *roachpb.NodeDescriptor,
+	ctx context.Context, cfg StoreConfig /*提供全局配置（Clock、Gossip、DB、Settings 等）*/, eng storage.Engine /*Pebble 存储引擎实例*/, nodeDesc *roachpb.NodeDescriptor, /*节点元数据（NodeID、地址、属性）*/
 ) *Store {
 	if !cfg.Valid() {
 		log.KvExec.Fatalf(ctx, "invalid store configuration: %+v", &cfg)
 	}
 	iot := ioThresholds{}
+	// 初始化为空阈值，threshold=1.0
 	iot.Replace(nil, 1.0) // init as empty
 	s := &Store{
 		internalEngines:                   kvstorage.MakeEngines(eng),
@@ -1487,6 +1501,7 @@ func NewStore(
 	}
 	s.ioThreshold.t = &admissionpb.IOThreshold{}
 	// Track the maxScore over the last 5 minutes, in one minute windows.
+	// 3. 创建滑动窗口跟踪器（5 分钟窗口，1 分钟粒度）
 	now := cfg.Clock.Now().GoTime()
 	s.ioThreshold.maxL0NumSubLevels = slidingwindow.NewMaxSwag(now, time.Minute, 5)
 	s.ioThreshold.maxL0NumFiles = slidingwindow.NewMaxSwag(now, time.Minute, 5)
@@ -1499,13 +1514,15 @@ func NewStore(
 		// store pool in those cases.
 		allocatorStorePool = cfg.StorePool
 		storePoolIsDeterministic = allocatorStorePool.IsDeterministic()
+		// 4. 注册 IO 过载回调（当检测到 IO 过载时触发）
 		allocatorStorePool.SetOnCapacityChange(s.makeIOOverloadCapacityChangeFn())
-
+		// 5. 创建负载均衡目标管理器
 		s.rebalanceObjManager = newRebalanceObjectiveManager(
 			ctx,
 			s.cfg.AmbientCtx,
 			s.cfg.Settings,
 			func(ctx context.Context, obj LBRebalancingObjective) {
+				// 当再平衡目标变化时，更新所有 Replica 的分裂策略
 				s.VisitReplicas(func(r *Replica) (wantMore bool) {
 					r.loadBasedSplitter.SetSplitObjective(
 						s.Clock().PhysicalTime(),
@@ -1518,15 +1535,17 @@ func NewStore(
 			allocatorStorePool, /* capacityChangeNotifier */
 		)
 	}
+	// 6. 创建 Allocator（Replica 放置决策引擎）
 	if cfg.RPCContext != nil {
 		s.allocator = allocatorimpl.MakeAllocator(
 			cfg.Settings,
 			cfg.AllocatorSync,
 			storePoolIsDeterministic,
-			cfg.RPCContext.RemoteClocks.Latency,
+			cfg.RPCContext.RemoteClocks.Latency, // 用于评估节点间延迟
 			cfg.TestingKnobs.AllocatorKnobs,
 		)
 	} else {
+		// 测试路径：没有 RPC，无法获取延迟
 		s.allocator = allocatorimpl.MakeAllocator(
 			cfg.Settings,
 			cfg.AllocatorSync,
@@ -1540,10 +1559,10 @@ func NewStore(
 		s.metrics.registry.AddMetricStruct(s.allocator.Metrics.LoadBasedLeaseTransferMetrics)
 		s.metrics.registry.AddMetricStruct(s.allocator.Metrics.LoadBasedReplicaRebalanceMetrics)
 	}
-
+	// 7. 创建 Replica 排名（用于优先处理高负载 Range）
 	s.replRankings = NewReplicaRankings()
 	s.replRankingsByTenant = NewReplicaRankingsMap()
-
+	// 8. 创建 Raft 接收队列监控器
 	s.raftRecvQueues.mon = mon.NewUnlimitedMonitor(ctx, mon.Options{
 		Name:     mon.MakeName("raft-receive-queue"),
 		CurCount: s.metrics.RaftRcvdQueuedBytes,
@@ -1560,7 +1579,7 @@ func NewStore(
 		// (in RACv2 code) would result in unnecessary code complexity.
 		s.raftRecvQueues.SetEnforceMaxLen(wc != rac2.AllWorkWaitsForEval)
 	})
-
+	//同时满足 cfg.LogRangeAndNodeEvents（编译时）和 logRangeAndNodeEventsEnabled（运行时）才写表
 	s.cfg.RangeLogWriter = newWrappedRangeLogWriter(
 		s.metrics.getCounterForRangeLogEventType,
 		func() bool {
@@ -1569,24 +1588,29 @@ func NewStore(
 		},
 		cfg.RangeLogWriter,
 	)
-
 	// NB: buffer up to RaftElectionTimeoutTicks in Raft scheduler to avoid
 	// unnecessary elections when ticks are temporarily delayed and piled up.
+	// 9. 创建 Raft 调度器（核心：管理所有 Replica 的 Raft 状态机）
 	s.scheduler = newRaftScheduler(cfg.AmbientCtx, s.metrics, s,
-		cfg.RaftSchedulerConcurrency, cfg.RaftSchedulerShardSize, cfg.RaftSchedulerConcurrencyPriority,
-		cfg.RaftElectionTimeoutTicks)
+		cfg.RaftSchedulerConcurrency,         /*worker 数量（通常是 CPU*8）*/
+		cfg.RaftSchedulerShardSize,           // shard 大小（通常是 256）
+		cfg.RaftSchedulerConcurrencyPriority, // 优先级 worker 数量
+		cfg.RaftElectionTimeoutTicks)         // 选举超时（用于缓冲 tick）
 
 	// Run a log SyncWaiter loop for every 32 raft scheduler goroutines.
 	// Experiments on c5d.12xlarge instances (48 vCPUs, the largest single-socket
 	// instance AWS offers) show that with fewer SyncWaiters, raft log callback
 	// processing can become a bottleneck for write heavy workloads, which can
 	// drive about 100k raft log appends per second, per store.
+	// 10. 创建 Raft log fsync 等待器
+	//     每 32 个 Raft worker 对应 1 个 SyncWaiter
+	//     在 48 核机器上约有 12 个 SyncWaiter
 	numSyncWaiters := (cfg.RaftSchedulerConcurrency-1)/32 + 1 // ceil division
 	s.syncWaiters = make([]*logstore.SyncWaiterLoop, numSyncWaiters)
 	for i := range s.syncWaiters {
 		s.syncWaiters[i] = logstore.NewSyncWaiterLoop()
 	}
-
+	// 11. 创建 Raft entry 缓存
 	s.raftEntryCache = raftentry.NewCache(cfg.RaftEntryCacheSize)
 	s.metrics.registry.AddMetricStruct(s.raftEntryCache.Metrics())
 
@@ -2118,6 +2142,46 @@ func (s *Store) IsStarted() bool {
 	return atomic.LoadInt32(&s.started) == 1
 }
 
+// Store.Start()
+//
+//	├─ 1. 读取 Store 标识（L2127）
+//	│   └─ ident = kvstorage.ReadStoreIdent(engine)
+//	│
+//	├─ 2. 启动 Rangefeed 调度器（L2145-L2157）
+//	│   └─ rangefeedScheduler.Start()
+//	│
+//	├─ 3. 创建 ID 分配器（L2184-L2193）
+//	│   └─ idAlloc = idalloc.NewAllocator(RangeIDGenerator)
+//	│
+//	├─ 4. 创建 Intent Resolver（L2202-L2212）
+//	│   └─ 用于清理未提交的事务意图
+//	│
+//	├─ 5. 启动 Store Liveness（L2230-L2243）
+//	│   └─ storeLiveness.Start()  // 类似 NodeLiveness，但针对 Store
+//	│
+//	├─ 6. 加载所有 Replica（L2300-L2364）
+//	│   └─ repls = kvstorage.LoadAndReconcileReplicas(engine)
+//	│   └─ for each repl:
+//	│       ├─ newInitializedReplica()  // 创建 Replica 对象
+//	│       ├─ addToReplicasByRangeIDLocked()
+//	│       ├─ addToReplicasByKeyLocked()
+//	│       └─ maybeUnquiesce()  // 唤醒使用 leader lease 的 Replica
+//	│
+//	├─ 7. 注册 NodeLiveness 回调（L2370）
+//	│   └─ NodeLiveness.RegisterCallback(nodeIsLiveCallback)
+//	│
+//	├─ 8. 启动 Gossip（L2402）
+//	│   └─ startGossip()  // 定期广播 Store 的容量信息
+//	│
+//	├─ 9. 启动 Raft 处理循环（L2429）
+//	│   └─ processRaft()  // 核心：处理 Raft 消息和心跳
+//	│
+//	├─ 10. 启动 Rangefeed 更新器（L2434）
+//	│   └─ startRangefeedUpdater()
+//	│
+//	└─ 11. 启动 Store Rebalancer（L2441-L2447）
+//	    └─ storeRebalancer.Start()  // 定期执行 Replica 再平衡
+//
 // Start the engine, set the GC and read the StoreIdent.
 func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	s.stopper = stopper
@@ -2142,11 +2206,13 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	}
 
 	{
+		//### 创建并启动 Rangefeed Scheduler（L2184-2197）
+		//**目的**：为 Changefeeds、Logical Data Replication (LDR) 等功能提供实时数据流
 		m := rangefeed.NewSchedulerMetrics(s.cfg.HistogramWindowInterval)
 		rfs := rangefeed.NewScheduler(rangefeed.SchedulerConfig{
-			Workers:         s.cfg.RangeFeedSchedulerConcurrency,
+			Workers:         s.cfg.RangeFeedSchedulerConcurrency, // 默认 8 * CPU或者64
 			PriorityWorkers: s.cfg.RangeFeedSchedulerConcurrencyPriority,
-			ShardSize:       s.cfg.RangeFeedSchedulerShardSize,
+			ShardSize:       s.cfg.RangeFeedSchedulerShardSize, // 默认 8
 			Metrics:         m,
 		})
 		s.Registry().AddMetricStruct(m)
@@ -2196,9 +2262,16 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	var intentResolverRangeCache intentresolver.RangeCache
 	rngCache := s.cfg.RangeDescriptorCache
 	if s.cfg.RangeDescriptorCache != nil {
+		//- **为什么可选**？某些测试场景不需要 RangeCache
+		//- **作用**：允许 IntentResolver 查询 Intent 所在的 RangeID
+		//- **优化价值**：同一 Range 的 Intent 可以合并在同一个 Batch 中
 		intentResolverRangeCache = rngCache
 	}
-
+	//- **默认值**：1000（`defaultTaskLimit`）
+	//- **语义**：最多允许 1000 个并发异步 goroutine
+	//- **背压机制**：达到上限时，新的异步任务会：
+	//    - 同步执行（如果 `allowSyncProcessing = true`）
+	//    - 返回错误（如果 `allowSyncProcessing = false`）
 	s.intentResolver = intentresolver.New(intentresolver.Config{
 		Clock:                s.cfg.Clock,
 		DB:                   s.db,
@@ -2216,7 +2289,29 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	{
 		truncator := s.raftTruncator
 		// When state machine has persisted new RaftAppliedIndex, fire callback.
+		//- 在分离的 Raft log 架构中，有两个引擎：
+		//    - **LogEngine**: 存储 Raft log entries
+		//    - **StateEngine**: 存储状态机数据（包括 `RangeAppliedState`）
+		//- 这里注册到 StateEngine，因为 **RaftAppliedIndex 存储在状态机中**
 		s.StateEngine().RegisterFlushCompletedCallback(func() {
+			//**为什么不直接写**：
+			//
+			//```go
+			//s.StateEngine().RegisterFlushCompletedCallback(func() {
+			//    s.raftTruncator.durabilityAdvancedCallback()
+			//})
+			//```
+			//
+			//**原因**：
+			//1. **避免闭包捕获整个 Store**：
+			//```go
+			//// 当前方案：
+			//truncator := s.raftTruncator // 只捕获 truncator 指针（8 字节）
+			//
+			//// 如果直接引用 s：
+			//// 闭包会捕获整个 Store（可能数 KB）
+			//// 虽然实际是指针，但语义不清晰
+			//```
 			truncator.durabilityAdvancedCallback()
 		})
 	}
@@ -2297,6 +2392,8 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	//
 	// TODO(sep-raft-log): this will need to learn to stitch and reconcile data from
 	// both engines.
+	//输入：Pebble 引擎实例
+	//输出：[]LoadedReplicaDescriptor（Replica 描述符列表）
 	repls, err := kvstorage.LoadAndReconcileReplicas(ctx, s.TODOEngine())
 	if err != nil {
 		return err
@@ -2314,6 +2411,10 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			continue
 		}
 		// TODO(pavelkalinnikov): integrate into kvstorage.LoadAndReconcileReplicas.
+		//这行代码的作用是 “去底层 Storage Engine 中把这个 Replica 的家底（Raft 状态、Lease、Range 描述符等）全部读出来”。
+		//读取到的 state 随后会作为参数传递给下一行的 newInitializedReplica(s, state, ...)，用于在内存中构造出一个全功能的、准备好参与 Raft 协议和处理请求的
+		//Replica
+		// 对象。
 		state, err := repl.Load(ctx, s.TODOEngine(), s.StoreID())
 		if err != nil {
 			return err
@@ -2461,6 +2562,52 @@ func (s *Store) WaitForInit() {
 }
 
 // GetConfReader exposes access to a configuration reader.
+// Span Config 是 CockroachDB 的配置系统,替代了旧的 Zone Config
+//
+// 核心组件:
+//   - SpanConfigSubscriber: 订阅 span config 变更
+//   - StoreReader: 读取 span config
+//   - SpanConfig: 配置本身 (副本数、约束、GC TTL 等)
+//
+// 数据流:
+//
+//	System Range (存储 span config)
+//	  ↓ Rangefeed
+//	SpanConfigSubscriber (每个 Store 一个)
+//	  ↓
+//	StoreReader (内存缓存)
+//	  ↓
+//	Queue 读取配置
+
+// 场景 1: Store 启动早期
+//   - Store.Start() 正在执行
+//   - SpanConfigSubscriber 尚未初始化
+//   - GetConfReader() → errSpanConfigsUnavailable
+//
+// 场景 2: System Range 不可用
+//   - Span config range 没有 quorum
+//   - Rangefeed 断开
+//   - SpanConfigSubscriber 数据过期
+//
+// 场景 3: 测试环境
+//   - 某些测试不需要 span config
+//   - cfg.SpanConfigSubscriber = nil
+//
+// 为什么需要 Span Config?
+// Replicate Queue:
+//   - 需要知道 ReplicationFactor (副本数)
+//   - 需要知道 Constraints (副本放置约束)
+//   - 例如: "至少 3 个副本,分布在不同 AZ"
+//
+// Split Queue:
+//   - 需要知道 RangeMaxBytes (Range 最大大小)
+//   - 需要知道是否有 split key
+//   - 例如: "Range 超过 512MB 自动分裂"
+//
+// Merge Queue:
+//   - 需要知道 RangeMinBytes (Range 最小大小)
+//   - 需要知道相邻 Range 的配置是否兼容
+//   - 例如: "Range 小于 16MB 且配置相同时合并"
 func (s *Store) GetConfReader(ctx context.Context) (spanconfig.StoreReader, error) {
 	if s.cfg.TestingKnobs.MakeSystemConfigSpanUnavailableToQueues {
 		return nil, errSpanConfigsUnavailable
@@ -2769,6 +2916,7 @@ func (s *Store) UpdateIOThreshold(ioThreshold *admissionpb.IOThreshold) {
 
 	s.ioThreshold.Lock()
 	s.ioThreshold.t = ioThreshold
+	//  记录到滑动窗口（关键操作）
 	s.ioThreshold.maxL0NumSubLevels.Record(now, float64(ioThreshold.L0NumSubLevels))
 	s.ioThreshold.maxL0NumFiles.Record(now, float64(ioThreshold.L0NumFiles))
 	s.ioThreshold.maxL0Size.Record(now, float64(ioThreshold.L0Size))
@@ -2793,11 +2941,17 @@ func (s *Store) UpdateIOThreshold(ioThreshold *admissionpb.IOThreshold) {
 // that a replicas' lease will be transferred away when encountered by the
 // lease queue.
 func (s *Store) existingLeaseCheckIOOverload(ctx context.Context) bool {
+	//获取 StoreList (集群所有 Store 的容量信息)
 	storeList, _, _ := s.cfg.StorePool.GetStoreList(storepool.StoreFilterNone)
+	//获取本地 Store 的 StoreDescriptor
 	storeDescriptor, ok := s.cfg.StorePool.GetStoreDescriptor(s.StoreID())
 	if !ok {
 		return false
 	}
+	//检查逻辑:
+	//  1. 本地 Store 的 IOThreshold > 配置的阈值?
+	//  2. 本地 Store 的 IOThreshold > 集群平均值 × 某个倍数?
+	//返回 true (不过载) 或 false (过载)
 	return s.allocator.IOOverloadOptions().ExistingLeaseCheck(
 		ctx, storeDescriptor, storeList)
 }
@@ -2807,21 +2961,68 @@ func (s *Store) existingLeaseCheckIOOverload(ctx context.Context) bool {
 // change is for the local store and (2) the store's IO is considered too
 // overloaded to hold onto its existing leases. The leases will be processed
 // via the lease queue and shed to another replica, if available.
+// 检测到 IO 过载 → 触发 lease 转移 → 将 lease 迁移到健康 Store →
+// 降低本地 IO 负载 → 恢复正常
+// 关键设计理念:
+// 1. 反应式(Reactive): 不是预防性调度,而是在问题发生后快速响应
+// 2. 批量处理: 一次性将所有 lease 加入转移队列,而不是逐个处理
+// 3. 限流保护: 避免频繁触发导致的”震荡”(thrashing)
+// 4. 异步执行: 不阻塞 Gossip 消息处理主线程
+// Gossip 收到 StoreCapacity 变更
+//
+//	↓
+//
+// StorePool.capacityChanged() (store_pool.go:950)
+//
+//	↓
+//
+// 遍历所有注册的 CapacityChangeFn 回调
+//
+//	↓
+//
+// makeIOOverloadCapacityChangeFn 被调用
+//
+//	↓
+//
+// 检查 Swag 窗口中的历史 IO 峰值
+//
+//	↓
+//
+// 触发 lease 转移
+// 每个 Store 只负责自己的 lease 转移。如果 Store-3 过载了:
+// - Store-3 自己会触发 lease 转移(将 lease 转移给 Store-1 或 Store-2)
+// - Store-1 不需要(也不应该)代替 Store-3 做决策
 func (s *Store) makeIOOverloadCapacityChangeFn() storepool.CapacityChangeFn {
+	//- storeID: 发生变更的 Store ID(如 Store-3)
+	//- prev: 变更前的容量信息(旧的 L0 文件数、lease 数量等)
+	//- cur: 变更后的容量信息(新的 L0 文件数、lease 数量等
 	return func(storeID roachpb.StoreID, old, cur roachpb.StoreCapacity) {
 		// There's nothing to do when there are no leases on the store.
+		//如果 Store 上没有 lease,无需转移
+		//场景:
+		//- 新加入的 Store(刚启动,还未获得任何 lease)
+		//- 已经完全转移了 lease 的 Store(正在下线)
 		if cur.LeaseCount == 0 {
 			return
 		}
 
 		// Don't react to other stores capacity changes, only IO overload change on
 		// the local store descriptor is relevant.
+		//**两个子条件**:
+		//1. **`!s.IsStarted()`**: Store 尚未完全启动
+		//    - 启动过程中会多次更新容量信息,但此时不应触发 lease 转移
+		//    - `IsStarted()` 在 `Store.Start()` 的最后一步设置为 true
+		//2. **`s.StoreID() != storeID`**: 变更的不是本地 Store
+		//    - `storeID` 参数可能是集群中任意 Store(因为 Gossip 会广播所有 Store 的容量)
+		//    - 只有本地 Store 才应该触发 lease 转移
 		if !s.IsStarted() || s.StoreID() != storeID {
 			return
 		}
 
 		// Avoid shedding leases too frequently by checking the last time a shed
 		// was attempted.
+		//当前时间 - 上次转移时间 < 30 秒 → 拒绝本次转移
+		//当前时间 - 上次转移时间 ≥ 30 秒 → 允许本次转移
 		if lastShed := s.lastIOOverloadLeaseShed.Load(); lastShed != nil {
 			minInterval := MinIOOverloadLeaseShedInterval.Get(&s.cfg.Settings.SV)
 			if timeutil.Since(lastShed.(time.Time)) < minInterval {
@@ -2833,6 +3034,20 @@ func (s *Store) makeIOOverloadCapacityChangeFn() storepool.CapacityChangeFn {
 		// the configured threshold and the cluster average.
 		ctx := context.Background()
 		s.AnnotateCtx(ctx)
+		//如果超过负载了，就直接return
+		//existingLeaseCheckIOOverload()
+		//  ↓
+		//获取 StoreList (集群所有 Store 的容量信息)
+		//  ↓
+		//获取本地 Store 的 StoreDescriptor
+		//  ↓
+		//allocator.IOOverloadOptions().ExistingLeaseCheck()
+		//  ↓
+		//检查逻辑:
+		//  1. 本地 Store 的 IOThreshold > 配置的阈值?
+		//  2. 本地 Store 的 IOThreshold > 集群平均值 × 某个倍数?
+		//  ↓
+		//返回 true (不过载) 或 false (过载)
 		if s.existingLeaseCheckIOOverload(ctx) {
 			return
 		}
@@ -2850,6 +3065,7 @@ func (s *Store) makeIOOverloadCapacityChangeFn() storepool.CapacityChangeFn {
 		// goroutine.
 		if err := s.stopper.RunTask(ctx, "io-overload: shed leases", func(ctx context.Context) {
 			newStoreReplicaVisitor(s).Visit(func(repl *Replica) bool {
+				//加入 lease 转移队列
 				s.leaseQueue.maybeAdd(ctx, repl, repl.Clock().NowAsClockTimestamp())
 				return true /* wantMore */
 			})
@@ -4235,7 +4451,8 @@ func (s *storeForTruncatorImpl) acquireReplicaForTruncator(
 		// can ignore it.
 		return nil
 	}
-	r.raftMu.Lock()
+	r.raftMu.Lock() // 关键：锁定 raftMu
+	// 检查 Replica 是否存活
 	if isAlive := func() bool {
 		r.mu.Lock()
 		defer r.mu.Unlock()

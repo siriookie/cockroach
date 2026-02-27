@@ -599,7 +599,7 @@ type RaftConfig struct {
 	// an election. The actual election timeout is randomized by each replica to
 	// between the interval: [defaultRaftElectionTimeoutTicks,
 	//  defaultRaftElectionTimeoutTicks+defaultRaftElectionTimeoutJitterTicks).
-	RaftElectionTimeoutTicks int64
+	RaftElectionTimeoutTicks int64 // 选举超时（tick 数）
 
 	// RaftElectionTimeoutJitterTicks is the maximum number of ticks after
 	// RaftElectionTimeoutTicks to hold an election.

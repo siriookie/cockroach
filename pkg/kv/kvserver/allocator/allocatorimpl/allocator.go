@@ -123,25 +123,24 @@ type AllocatorAction int
 
 // These are the possible allocator actions.
 const (
-	_ AllocatorAction = iota
-	AllocatorNoop
-	AllocatorRemoveVoter
-	AllocatorRemoveNonVoter
-	AllocatorAddVoter
-	AllocatorAddNonVoter
-	AllocatorReplaceDeadVoter
-	AllocatorReplaceDeadNonVoter
-	AllocatorRemoveDeadVoter
-	AllocatorRemoveDeadNonVoter
-	AllocatorReplaceDecommissioningVoter
-	AllocatorReplaceDecommissioningNonVoter
-	AllocatorRemoveDecommissioningVoter
-	AllocatorRemoveDecommissioningNonVoter
-	AllocatorRemoveLearner
-	AllocatorConsiderRebalance
-	AllocatorRangeUnavailable
-	AllocatorFinalizeAtomicReplicationChange
-	AllocatorMaxPriority
+	_                                        AllocatorAction = iota
+	AllocatorNoop                                            // 无操作
+	AllocatorRemoveVoter                                     // 移除 Voter
+	AllocatorRemoveNonVoter                                  // 移除 NonVoter
+	AllocatorAddVoter                                        // 添加 Voter
+	AllocatorAddNonVoter                                     // 添加 NonVoter
+	AllocatorReplaceDeadVoter                                // 替换 Dead Voter
+	AllocatorReplaceDeadNonVoter                             // 替换 Dead NonVoter
+	AllocatorRemoveDeadVoter                                 // 移除 Dead Voter
+	AllocatorRemoveDeadNonVoter                              // 移除 Dead NonVoter
+	AllocatorReplaceDecommissioningVoter                     // 替换 Decommissioning Voter
+	AllocatorReplaceDecommissioningNonVoter                  // 替换 Decommissioning NonVoter
+	AllocatorRemoveDecommissioningVoter                      // 移除 Decommissioning Voter
+	AllocatorRemoveDecommissioningNonVoter                   // 移除 Decommissioning NonVoter
+	AllocatorRemoveLearner                                   // 移除 Learner
+	AllocatorConsiderRebalance                               // 考虑 Rebalance
+	AllocatorRangeUnavailable                                // Range 不可用
+	AllocatorFinalizeAtomicReplicationChange                 // 完成原子副本变更
 )
 
 // Add indicates an action adding a replica.
@@ -269,21 +268,24 @@ func (a AllocatorAction) SafeValue() {}
 // and AllocatorReplaceDeadVoter violates the spacing of 100. These cases
 // predate this comment, so we allow them as they belong to the same general
 // priority category.
+// 优先级间隔 100 是为了给 CheckPriorityInversion 提供判断空间
+// - AllocatorAddVoter 的优先级会根据 desiredQuorum - haveVoters 动态调整（最多 ±49）
+// - 这样设计避免了”紧急修复被低优先级 Rebalance 阻塞”的问题
 func (a AllocatorAction) Priority() float64 {
 	const maxPriority = 12002
 	switch a {
 	case AllocatorMaxPriority:
 		return maxPriority
 	case AllocatorFinalizeAtomicReplicationChange:
-		return maxPriority
+		return maxPriority // 最高：完成中断的 Raft Conf Change
 	case AllocatorRemoveLearner:
-		return 12001
+		return 12001 // 清理临时 Learner
 	case AllocatorReplaceDeadVoter:
-		return 12000
+		return 12000 // 紧急：替换 Dead Voter
 	case AllocatorAddVoter:
-		return 10000
+		return 10000 // 高：补充缺失的 Voter（可动态调整）
 	case AllocatorReplaceDecommissioningVoter:
-		return 5000
+		return 5000 // 中：替换 Decommissioning Voter
 	case AllocatorRemoveDeadVoter:
 		return 1000
 	case AllocatorRemoveDecommissioningVoter:
@@ -303,7 +305,7 @@ func (a AllocatorAction) Priority() float64 {
 	case AllocatorRemoveNonVoter:
 		return 200
 	case AllocatorConsiderRebalance, AllocatorRangeUnavailable, AllocatorNoop:
-		return 0
+		return 0 // 最低：常规 Rebalance
 	default:
 		panic(fmt.Sprintf("unknown AllocatorAction: %s", a))
 	}
@@ -618,17 +620,18 @@ type AllocatorMetrics struct {
 
 // Allocator tries to spread replicas as evenly as possible across the stores
 // in the cluster.
+// 关键特性：
+// - 无状态决策器：Allocator 本身不持有 Range 级别的可变状态，每次调用都基于传入的参数做决策
+// - 并发安全：randGen 带互斥锁，支持多个 goroutine 并发调用
+// - 可测试性：deterministic 模式下使用固定随机种子，保证测试可重现
 type Allocator struct {
-	st            *cluster.Settings
-	as            *mmaintegration.AllocatorSync
-	deterministic bool
-	nodeLatencyFn func(nodeID roachpb.NodeID) (time.Duration, bool)
-	// TODO(aayush): Let's replace this with a *rand.Rand that has a rand.Source
-	// wrapped inside a mutex, to avoid misuse.
-	randGen allocatorRand
-	Metrics AllocatorMetrics
-
-	knobs *allocator.TestingKnobs
+	st            *cluster.Settings                                 // 集群配置
+	as            *mmaintegration.AllocatorSync                     // MMA 集成
+	deterministic bool                                              // 测试模式（固定随机种子）
+	nodeLatencyFn func(nodeID roachpb.NodeID) (time.Duration, bool) // 节点延迟查询
+	randGen       allocatorRand                                     // 带锁的随机数生成器
+	Metrics       AllocatorMetrics                                  // 决策指标
+	knobs         *allocator.TestingKnobs                           // 测试钩子
 }
 
 func makeAllocatorMetrics() AllocatorMetrics {
@@ -658,6 +661,11 @@ func makeAllocatorMetrics() AllocatorMetrics {
 // In test cases where the store pool is nil, deterministic should be false.
 // TODO(sarkesian): Eliminate the need for this flag, which is a remnant of
 // close coupling with the StorePool.
+// 输入/输出：
+// - 输入：
+// - latencyFunc：查询节点间延迟（用于评估放置质量）
+// - deterministic：测试模式（固定随机种子）
+// - 输出：Allocator 对象（方法集）
 func MakeAllocator(
 	st *cluster.Settings,
 	as *mmaintegration.AllocatorSync,
@@ -686,6 +694,8 @@ func MakeAllocator(
 // GetNeededVoters calculates the number of voters a range should have given its
 // zone config and the number of nodes available for up-replication (i.e. not
 // decommissioning).
+// 计算一个 range 在当前集群条件下 实际需要的 voter 副本数（即 Raft quorum 中的投票副本数），
+// 结合 zone 配置 和 可用节点数（不在 decommissioning 的节点）。
 func GetNeededVoters(zoneConfigVoterCount int32, clusterNodes int) int {
 	numZoneReplicas := int(zoneConfigVoterCount)
 	need := numZoneReplicas
@@ -915,6 +925,7 @@ func FilterReplicasForAction(
 // ComputeAction determines the exact operation needed to repair the
 // supplied range, as governed by the supplied zone configuration. It
 // returns the required action that should be taken and a priority.
+// ComputeAction 是 Allocator 的入口，它按照严格的优先级顺序检查 Range 状态：
 func (a *Allocator) ComputeAction(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
@@ -928,14 +939,31 @@ func (a *Allocator) ComputeAction(
 	}
 
 	if desc.Replicas().InAtomicReplicationChange() {
+		// 1. 最高优先级：清理临时状态
 		// With a similar reasoning to the learner branch below, if we're in a
 		// joint configuration the top priority is to leave it before we can
 		// even think about doing anything else.
 		action = AllocatorFinalizeAtomicReplicationChange
 		return action, action.Priority()
 	}
-
+	//背景知识：learner 是什么状态？
+	//在 CockroachDB 里，新增副本是一个三步原子流程：
+	//learner → snapshot → voter
+	//learner：不投票、不进 quorum
+	//snapshot：拷贝数据
+	//voter：正式参与 Raft
+	//这是一个“短命的过渡态”，理论上不应该长时间存在。
 	if learners := desc.Replicas().LearnerDescriptors(); len(learners) > 0 {
+		//正常情况下，replicate queue 再次看到这个 range 时，learner 应该已经消失（升级为 voter），而不是卡在那里。
+		//learner 可能来自哪里？（作者做了穷举）
+		//Only two places could have added a learner
+		//1️⃣ replicate queue
+		//只在 leaseholder 上运行
+		//理论上：
+		//一个 range 同时只有一个 leaseholder
+		//极端情况下：
+		//lease 发生切换
+		//老 leaseholder 和新 leaseholder 都发起操作（race）
 		// Seeing a learner replica at this point is unexpected because learners are
 		// a short-lived (ish) transient state in a learner+snapshot+voter cycle,
 		// which is always done atomically. Only two places could have added a
@@ -978,7 +1006,7 @@ func (a *Allocator) ComputeAction(
 		action = AllocatorRemoveLearner
 		return action, action.Priority()
 	}
-
+	// 2. 调用内部 computeAction 处理常规逻辑
 	action, priority = a.computeAction(ctx, storePool, conf, desc.Replicas().VoterDescriptors(),
 		desc.Replicas().NonVoterDescriptors())
 	// Ensure that priority is never -1. Typically, computeAction return
@@ -1060,6 +1088,19 @@ func (a *Allocator) computeAction(
 	// first handle operations that correspond to repairing/recovering the range.
 	// After that we handle rebalancing related actions, followed by removal
 	// actions.
+	//haveVoters
+	//表示 当前 range 里所有 voter 副本的数量（包括正常的和正在退役的）
+	//voter 是 Raft quorum 中的成员，参与投票
+	//decommissioningVoters
+	//表示 正在退役（decommission）的 voter 副本，也就是即将从集群中摘除的节点
+	//它们尚在 quorum 里，但已经标记为退出
+	//postDecommissionVoters
+	//就是这一行计算的结果：
+	//postDecommissionVoters = haveVoters - len(decommissioningVoters)
+	//二、语义解释
+	//postDecommissionVoters 表示：
+	//如果当前所有正在退役的 voter 都被移除后，range 里剩下的 voter 数量
+	//换句话说，它表示退役操作完成之后，quorum 中剩余的可用 voter 数量。
 	haveVoters := len(voterReplicas)
 	decommissioningVoters := storePool.DecommissioningReplicas(voterReplicas)
 	postDecommissionVoters := haveVoters - len(decommissioningVoters)
@@ -1078,7 +1119,7 @@ func (a *Allocator) computeAction(
 		// Priority is adjusted by the difference between the current voter
 		// count and the quorum of the desired voter count.
 		action = AllocatorAddVoter
-		adjustedPriority = action.Priority() + float64(desiredQuorum-haveVoters)
+		adjustedPriority = action.Priority() + float64(desiredQuorum-haveVoters) //(优先级 10000 + 动态调整)
 		log.KvDistribution.VEventf(ctx, 3, "%s - missing voter need=%d, have=%d, priority=%.2f",
 			action, neededVoters, haveVoters, adjustedPriority)
 		return action, adjustedPriority
@@ -1098,7 +1139,7 @@ func (a *Allocator) computeAction(
 		// live voters. If we're correctly assessing the unavailable state of the
 		// range, we also won't be able to add replicas as we try above, but hope
 		// springs eternal.
-		action = AllocatorRangeUnavailable
+		action = AllocatorRangeUnavailable // (优先级 0)
 		log.KvDistribution.VEventf(ctx, 1, "unable to take action - live voters %v don't meet quorum of %d",
 			liveVoters, quorum)
 		return action, action.Priority()
@@ -1112,7 +1153,7 @@ func (a *Allocator) computeAction(
 		action = AllocatorReplaceDeadVoter
 		log.KvDistribution.VEventf(ctx, 3, "%s - replacement for %d dead voters priority=%.2f",
 			action, len(deadVoters), action.Priority())
-		return action, action.Priority()
+		return action, action.Priority() // (优先级 12000)
 	}
 
 	if postDecommissionVoters < neededVoters {
@@ -1134,7 +1175,7 @@ func (a *Allocator) computeAction(
 		adjustedPriority = action.Priority() + float64(quorum-len(liveVoters))
 		log.KvDistribution.VEventf(ctx, 3, "%s - dead=%d, live=%d, quorum=%d, priority=%.2f",
 			action, len(deadVoters), len(liveVoters), quorum, adjustedPriority)
-		return action, adjustedPriority
+		return action, adjustedPriority // (优先级 1000 + 动态调整)
 	}
 
 	if len(decommissioningVoters) > 0 {
@@ -1144,14 +1185,14 @@ func (a *Allocator) computeAction(
 		log.KvDistribution.VEventf(ctx, 3,
 			"%s - need=%d, have=%d, num_decommissioning=%d, priority=%.2f",
 			action, neededVoters, haveVoters, len(decommissioningVoters), action.Priority())
-		return action, action.Priority()
+		return action, action.Priority() //(优先级 900)
 	}
 
 	if haveVoters > neededVoters {
 		// Range is over-replicated, and should remove a voter.
 		// Ranges with an even number of voters get extra priority because
 		// they have a more fragile quorum.
-		action = AllocatorRemoveVoter
+		action = AllocatorRemoveVoter // (优先级 800 - 偶数副本惩罚)
 		adjustedPriority = action.Priority() - float64(haveVoters%2)
 		log.KvDistribution.VEventf(ctx, 3, "%s - need=%d, have=%d, priority=%.2f", action, neededVoters,
 			haveVoters, adjustedPriority)
@@ -1159,12 +1200,23 @@ func (a *Allocator) computeAction(
 	}
 
 	// Non-voting replica actions follow.
-	//
 	// Non-voting replica addition / replacement.
+	//Non-Voter 的作用
+	//提高数据可用性 / 读扩展
+	//因为 Non-Voter 不计入 quorum，可以在不同节点上额外创建副本
+	//这些副本可以被 用于读操作，降低主副本负载
+	//为副本迁移或节点退役做准备
+	//在节点退役（decommission）或者副本重新分布时，先创建 Non-Voter
+	//等 Non-Voter 同步完成后，再 升级为 Voter（通过 Raft 配置变更）
+	//这样可以 安全地扩展副本而不影响 quorum
+	//支持低优先级 / 延迟副本
+	//非投票副本可以放在资源较少的节点上
+	//不会影响写操作性能
+	//例如备份、地理分布节点或者只读节点
 	haveNonVoters := len(nonVoterReplicas)
 	neededNonVoters := GetNeededNonVoters(haveVoters, int(conf.GetNumNonVoters()), clusterNodes)
 	if haveNonVoters < neededNonVoters {
-		action = AllocatorAddNonVoter
+		action = AllocatorAddNonVoter //Non-Voter 的核心特点：复制数据，但不影响 Raft 决策
 		log.KvDistribution.VEventf(ctx, 3, "%s - missing non-voter need=%d, have=%d, priority=%.2f",
 			action, neededNonVoters, haveNonVoters, action.Priority())
 		return action, action.Priority()
@@ -1222,6 +1274,7 @@ func (a *Allocator) computeAction(
 	}
 
 	// Nothing needs to be done, but we may want to rebalance.
+	//都不满足?
 	action = AllocatorConsiderRebalance
 	return action, action.Priority()
 }
@@ -1229,6 +1282,14 @@ func (a *Allocator) computeAction(
 // getReplicasForDiversityCalc returns the set of replica descriptors that
 // should be used for computing the diversity scores for a target when
 // allocating/removing/rebalancing a replica of `targetType`.
+// 输入：
+// targetType TargetReplicaType → 要操作的副本类型：Voter 或 Non-Voter
+// existingVoters []roachpb.ReplicaDescriptor → 当前 range 的投票副本
+// allExistingReplicas []roachpb.ReplicaDescriptor → 当前 range 的所有副本（投票 + 非投票）
+// 输出：
+// 用于 计算 diversity score（分布多样性分数） 的副本集合
+// Diversity score 用于 决定将副本放在哪个节点 / 数据中心 / 可用区
+// 核心作用：根据副本类型，选择正确的副本集合计算 副本分布多样性，以优化容错性和数据可靠性。
 func getReplicasForDiversityCalc(
 	targetType TargetReplicaType, existingVoters, allExistingReplicas []roachpb.ReplicaDescriptor,
 ) []roachpb.ReplicaDescriptor {
@@ -1268,11 +1329,16 @@ type decisionDetails struct {
 
 // CandidateSelector is an interface to select a store from a list of
 // candidates.
+// Strategy 模式的应用：
+// - Uprelication 场景：Replica 存活，追求最优平衡 → BestCandidateSelector
+// - Recovery 场景：Replica Dead/Decommissioning，追求快速恢复 → GoodCandidateSelector
+// - 这是 Strategy Pattern 的典型应用，将”如何选择候选者”的策略从 Allocator 主逻辑中解耦
 type CandidateSelector interface {
 	selectOne(cl candidateList) *candidate
 }
 
 // BestCandidateSelector in used to choose the best store to allocate.
+// BestCandidateSelector: 用于 Uprelication（选择最优）
 type BestCandidateSelector struct {
 	randGen allocatorRand
 }
@@ -1289,6 +1355,7 @@ func (s *BestCandidateSelector) selectOne(cl candidateList) *candidate {
 
 // GoodCandidateSelector is used to choose a random store out of the stores that
 // are good enough.
+// GoodCandidateSelector: 用于 Recovery（选择任意足够好的）
 type GoodCandidateSelector struct {
 	randGen allocatorRand
 }
@@ -1307,6 +1374,7 @@ func (s *GoodCandidateSelector) selectOne(cl candidateList) *candidate {
 // non-voting replica with the required attributes. Nodes already accommodating
 // voting replicas are ruled out in the voter case, and nodes accommodating
 // _any_ replicas are ruled out in the non-voter case.
+// 决定应该添加 Replica 到哪个 Store
 func (a *Allocator) AllocateTarget(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
@@ -1324,6 +1392,7 @@ func (a *Allocator) AllocateTarget(
 	// dead or decommissioned, and we want to recover the missing replica as soon
 	// as possible, and therefore any store that is good enough will be
 	// considered.
+	//步骤 1：选择 CandidateSelector
 	var selector CandidateSelector
 	if replicaStatus == Alive || recoveryStoreSelector.Get(&a.st.SV) == "best" {
 		selector = a.NewBestCandidateSelector()
@@ -1336,11 +1405,26 @@ func (a *Allocator) AllocateTarget(
 	// a store being dead but no remaining live stores meet all constraints, they
 	// should be considered of otherwise equal validity, with candidate ranking
 	// chosing the best of the available options.
+	//注释说明：
+	//约束影响只在 decommission 场景考虑
+	//当副本迁移是因为节点退役时，才需要检查迁移后是否仍符合约束
+	//如果节点死掉，且剩余节点无法满足所有约束
+	//这些节点被视为“同等有效”，allocator 只从中选出最合适的
+	//避免因为严格约束导致迁移阻塞
+	//核心意思：只有在节点退役时才严格考虑约束，死掉节点场景下宽松处理
+	//简单一句话总结：如果是“计划内下线（Decommission）”，
+	//必须严格遵守约束；如果是“节点挂了（Dead）”，则保命要紧，约束可以先放放。
+	// 声明一个变量，默认是 nil
 	var decommissioningReplica *roachpb.ReplicaDescriptor
+
+	// 检查当前副本的状态：是不是正在被“计划性下线”（Decommissioning）
 	if replicaStatus == Decommissioning {
+		// 如果是，就把当前正在被替换的副本（replacing）赋值给变量。
+		// 这意味着后续的逻辑会拿到这个对象，进行严格的“新旧对比”或“约束检查”。
 		decommissioningReplica = replacing
 	}
-
+	// 如果 replicaStatus 是 Dead（节点挂了），这个变量保持为 nil。
+	//步骤 2：调用 allocateTargetFromList
 	target, details := a.allocateTargetFromList(
 		ctx,
 		storePool,
@@ -1525,6 +1609,7 @@ func (a *Allocator) allocateTargetFromList(
 		// constraint is satisfied to one in which we are not. In this case, we
 		// consider no candidates to be valid, as no sorting of replicas would lead
 		// to a satisfying candidate being selected.
+		// 替换场景：确保不降低约束满足度
 		if replacing != nil && replacingStoreOK {
 			constraintsChecker = voterConstraintsCheckerForReplace(
 				analyzedOverallConstraints,
@@ -1532,6 +1617,7 @@ func (a *Allocator) allocateTargetFromList(
 				replacingStore,
 			)
 		} else {
+			// 新增场景：确保满足约束
 			constraintsChecker = voterConstraintsCheckerForAllocation(
 				analyzedOverallConstraints,
 				analyzedVoterConstraints,
@@ -1555,6 +1641,19 @@ func (a *Allocator) allocateTargetFromList(
 	// non-voters. For instance, in cases where we can only satisfy constraints
 	// for either 1 voter or 1 non-voter, we want the voter to be able to displace
 	// the non-voter.
+	//步骤 5：生成候选列表并排序
+	//示例：
+	//Replica	类型	Region
+	//R1	Voter	A
+	//R2	Voter	B
+	//R3	Non-Voter	C
+	//candidate stores = [节点A, 节点B, 节点C]
+	//getReplicasForDiversityCalc(Voter) → [R1, R2]
+	//计算 diversity score：
+	//节点A → score低（已有 Voter）
+	//节点B → score低（已有 Voter）
+	//节点C → score高（没有 Voter）
+	//最终 allocator 会选 R3 所在节点（Region C），因为这样能最大化 Voter 的 fault tolerance。
 	existingReplicaSet := getReplicasForDiversityCalc(targetType, existingVoters, existingReplicas)
 	candidates := rankedCandidateListForAllocation(
 		ctx,
@@ -1570,6 +1669,7 @@ func (a *Allocator) allocateTargetFromList(
 	)
 
 	log.KvDistribution.VEventf(ctx, 3, "allocate %s: %s", targetType, candidates)
+	//步骤 6：选择最终目标
 	if target := selector.selectOne(candidates); target != nil {
 		log.KvDistribution.VEventf(ctx, 3, "add target: %s", target)
 		details := decisionDetails{Target: target.compactString()}
@@ -1588,9 +1688,9 @@ func (a *Allocator) allocateTargetFromList(
 func (a Allocator) simulateRemoveTarget(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
-	targetStore roachpb.StoreID,
+	targetStore roachpb.StoreID, // 新添加的 Store
 	conf *roachpb.SpanConfig,
-	candidates []roachpb.ReplicaDescriptor,
+	candidates []roachpb.ReplicaDescriptor, // 包括 targetStore 的副本列表
 	existingVoters []roachpb.ReplicaDescriptor,
 	existingNonVoters []roachpb.ReplicaDescriptor,
 	sl storepool.StoreList,
@@ -1610,6 +1710,7 @@ func (a Allocator) simulateRemoveTarget(
 	// Update statistics first
 	switch t := targetType; t {
 	case VoterTarget:
+		// 1. 临时修改 StorePool 统计,模拟"添加副本到 targetStore"
 		storePool.UpdateLocalStoreAfterRebalance(targetStore, rangeUsageInfo, roachpb.ADD_VOTER)
 		defer storePool.UpdateLocalStoreAfterRebalance(
 			targetStore,
@@ -1618,7 +1719,7 @@ func (a Allocator) simulateRemoveTarget(
 		)
 		log.KvDistribution.VEventf(ctx, 3, "simulating which voter would be removed after adding s%d",
 			targetStore)
-
+		// 2. 调用 RemoveTarget,决定应该移除哪个副本
 		return a.RemoveTarget(
 			ctx, storePool, conf, storepool.MakeStoreList(candidateStores),
 			existingVoters, existingNonVoters, VoterTarget, options,
@@ -1643,6 +1744,7 @@ func (a Allocator) simulateRemoveTarget(
 
 // RemoveTarget returns a suitable replica (of the given type) to remove from
 // the provided set of replicas.
+// 决定应该从哪个 Store 移除 Replica
 func (a Allocator) RemoveTarget(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
@@ -1786,6 +1888,20 @@ func (a Allocator) RemoveNonVoter(
 
 // RebalanceTarget returns a suitable store for a rebalance target (of the given
 // type) with required attributes.
+// RebalanceTarget 是 Allocator 中最复杂的方法，因为它需要：
+// 1. **同时选择 Add 和 Remove 目标**
+// 2. **模拟 Add 后的状态，验证 Remove 是否合理**
+// 3. **与 MMA（Multi-Metric Allocator）协调**
+// **非阻塞** (异步决策):
+//
+// ```
+// RebalanceTarget() 只返回决策,不执行操作:
+//  1. RebalanceTarget() 返回 (addTarget, removeTarget)
+//  2. 调用者将决策放入 Replication Queue
+//  3. Queue Worker 异步执行 Raft ChangeReplicas
+//  4. 执行期间,RebalanceTarget() 可以继续决策其他 Range
+//
+// ```
 func (a Allocator) RebalanceTarget(
 	ctx context.Context,
 	storePool storepool.AllocatorStorePool,
@@ -1923,7 +2039,20 @@ func (a Allocator) RebalanceTarget(
 		// Skip mma conflict checks for critical rebalances, which repairs a bad
 		// state such as constraint violation, disk-fullness, and diversity
 		// improvements.
+		//Critical Rebalance (跳过 MMA 检查)
+		//**为什么 Critical Rebalance 跳过 MMA 检查?**
+		//```
+		//原因:
+		//  - Critical Rebalance 修复系统"坏状态"(约束违反、磁盘满、分散性差)
+		//  - 这些状态威胁系统可用性和数据安全
+		//  - 必须立即修复,不能因为"负载均衡冲突"而延迟
+		//示例:
+		//  场景: Store S1 磁盘 99% 满,需要移副本到 S5
+		//  MMA 建议: "S5 负载已高,应该移到 S3"
+		//  决策: 忽略 MMA,立即移到 S5(磁盘满更紧急)
+		//```
 		if !existingCandidate.isCriticalRebalance(target) {
+			// 非 Critical,检查 MMA 冲突
 			// If the rebalance is not critical, we check if it conflicts with mma's
 			// goal. advisor for bestIdx should always be cached by
 			// bestRebalanceTarget. If mma rejects the rebalance, we will continue to
@@ -1932,7 +2061,7 @@ func (a Allocator) RebalanceTarget(
 			// selected again.
 			if advisor := results[bestIdx].advisor; advisor != nil {
 				if a.as.IsInConflictWithMMA(ctx, target.store.StoreID, advisor, false) {
-					continue
+					continue // MMA 拒绝,选择下一个候选
 				}
 			} else {
 				if buildutil.CrdbTestBuild {
@@ -1977,12 +2106,43 @@ func (a Allocator) RebalanceTarget(
 		// necessary to satisfy an all-replica, or voter constraint, the simulated
 		// remove replica will not always be the existingCandidate depending on
 		// whether every voter is considered necessary.
+		//跳过模拟移除
+		//**场景**: NonVoter 提升为 Voter
+		//
+		//```
+		//配置: VoterConstraints: 至少 1 个 Voter 在 us-west
+		//当前副本:
+		//  - s1: Voter,   region=us-east
+		//  - s2: NonVoter, region=us-west  ← 需要提升
+		//  - s3: NonVoter, region=us-east
+		//
+		//决策:
+		//  - target = s2 (提升为 Voter)
+		//  - target.voterNecessary = true (满足 Voter 约束)
+		//  - existing = s1 (降级为 NonVoter 或移除)
+		//  - 不需要模拟移除,因为已知 s1 是最优移除候选
+		//```
+		//
+		//**为什么跳过模拟移除?**
+		//
+		//```
+		//原因:
+		//  1. 提升场景的移除目标已确定(必须移除 existingCandidate)
+		//  2. 模拟移除可能返回其他候选(如果 existingCandidate 不是最差)
+		//  3. 但提升场景要求"原子交换"(s2 升级,s1 降级)
+		//
+		//如果不跳过:
+		//  - simulateRemoveTarget() 可能返回 s3
+		//  - 导致: 添加 s2(Voter),移除 s3(NonVoter)
+		//  - 结果: s1 仍然是 Voter,Voter 约束仍未满足
+		//```
+		//
 		if target.voterNecessary {
 			removeReplica = roachpb.ReplicationTarget{
 				NodeID:  existingCandidate.store.Node.NodeID,
 				StoreID: existingCandidate.store.StoreID,
 			}
-			break
+			break // 直接使用 existingCandidate 作为移除目标
 		}
 
 		var removeDetails string

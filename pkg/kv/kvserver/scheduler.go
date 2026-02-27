@@ -135,6 +135,12 @@ type raftProcessor interface {
 type raftScheduleFlags int
 
 const (
+	//    = 1 << 0  // 已入队
+	//    stateRaftReady                   = 1 << 1  // 需要处理 Ready
+	//    stateRaftRequest                 = 1 << 2  // 有待处理消息
+	//    stateRaftTick                    = 1 << 3  // 有待处理 Tick
+	//    stateRACv2PiggybackedAdmitted    = 1 << 4  // RACv2 准入状态
+	//    stateRACv2RangeController        = 1 << 5  // RACv2 控制器
 	stateQueued raftScheduleFlags = 1 << iota
 	stateRaftReady
 	stateRaftRequest
@@ -145,7 +151,7 @@ const (
 )
 
 type raftScheduleState struct {
-	flags raftScheduleFlags
+	flags raftScheduleFlags // 待处理事件集合（bitmap）
 	// The number of ticks queued. Usually it's 0 or 1, but may go above if the
 	// scheduling or processing is slow. It is limited by raftScheduler.maxTicks,
 	// so that the cost of processing all the ticks doesn't grow uncontrollably.
@@ -220,13 +226,20 @@ func shardIndex(id roachpb.RangeID, numShards int, priority bool) int {
 
 type raftScheduler struct {
 	ambientContext log.AmbientContext
-	processor      raftProcessor
+	processor      raftProcessor // 实际处理接口（指向 Store）
 	metrics        *StoreMetrics
 	// shards contains scheduler shards. Ranges and workers are allocated to
 	// separate shards to reduce contention at high worker counts. Allocation
 	// is modulo range ID, with shard 0 reserved for priority ranges.
-	shards      []*raftSchedulerShard // 1 + RangeID % (len(shards) - 1)
-	priorityIDs syncutil.Set[roachpb.RangeID]
+	//普通 Range
+	//根据 RangeID 做 hash（取模）
+	//稳定映射到某一个 shard
+	//同一个 Range 永远进同一个 shard
+	//优先 Range
+	//强制进入 shard[0]
+	//与普通 Range 完全隔离
+	shards      []*raftSchedulerShard         // 1 + RangeID % (len(shards) - 1)
+	priorityIDs syncutil.Set[roachpb.RangeID] // 优先级 Range 集合
 	done        sync.WaitGroup
 }
 
@@ -236,14 +249,15 @@ type queuedRangeID struct {
 	queued crtime.Mono
 }
 
+// 单个调度分片（每个 shard 独立锁）
 type raftSchedulerShard struct {
-	syncutil.Mutex
-	cond       *sync.Cond
-	queue      rangeIDQueue[queuedRangeID]
-	state      map[roachpb.RangeID]raftScheduleState
-	numWorkers int
-	maxTicks   int64
-	stopped    bool
+	syncutil.Mutex                                       // 保护以下字段
+	cond           *sync.Cond                            // worker 唤醒信号
+	queue          rangeIDQueue[queuedRangeID]           // 待处理 Range 队列
+	state          map[roachpb.RangeID]raftScheduleState // 每个 Range 的状态
+	numWorkers     int                                   // 本 shard 的 worker 数
+	maxTicks       int64                                 // tick 限流阈值
+	stopped        bool
 }
 
 func newRaftScheduler(
@@ -260,7 +274,9 @@ func newRaftScheduler(
 		processor:      processor,
 		metrics:        metrics,
 	}
-
+	// ========================================
+	// 第一步：创建 Priority Shard (shard 0)
+	// ========================================
 	// Priority shard at index 0.
 	if priorityWorkers <= 0 {
 		priorityWorkers = 1
@@ -268,17 +284,31 @@ func newRaftScheduler(
 	s.shards = append(s.shards, newRaftSchedulerShard(priorityWorkers, maxTicks))
 
 	// Regular shards, excluding priority shard.
+	// ========================================
+	// 第二步：计算 Regular Shard 数量
+	// ========================================
 	numShards := 1
 	if shardSize > 0 && numWorkers > shardSize {
-		numShards = (numWorkers-1)/shardSize + 1 // ceiling division
+		numShards = (numWorkers-1)/shardSize + 1 // ceiling division // 向上取整
 	}
+	// 示例：numWorkers=384, shardSize=256
+	//   numShards = 383/256 + 1 = 2
+
+	// ========================================
+	// 第三步：分配 Worker 到各 Shard
+	// ========================================
 	for i := 0; i < numShards; i++ {
-		shardWorkers := numWorkers / numShards
-		if i < numWorkers%numShards { // distribute remainder
+		shardWorkers := numWorkers / numShards // 基础分配
+		if i < numWorkers%numShards {          // distribute remainder// 分配余数
 			shardWorkers++
 		}
+		// 示例：384 workers, 2 shards
+		//   shard 0 (priority): 1 worker
+		//   shard 1: 192 workers
+		//   shard 2: 192 workers
+
 		if shardWorkers <= 0 {
-			shardWorkers = 1 // ensure we always have a worker
+			shardWorkers = 1 // ensure we always have a worker// 保证每个 shard 至少 1 worker
 		}
 		s.shards = append(s.shards, newRaftSchedulerShard(shardWorkers, maxTicks))
 	}
@@ -364,6 +394,9 @@ func (ss *raftSchedulerShard) worker(
 	// the raftScheduler work is already buffered on the internal queue. Lastly,
 	// signaling a sync.Cond is significantly faster than selecting and sending
 	// on a buffered channel.
+	// ========================================
+	// 阶段1：等待工作
+	// ========================================
 	ss.Lock()
 	for {
 		var q queuedRangeID
@@ -376,23 +409,33 @@ func (ss *raftSchedulerShard) worker(
 			if q, ok = ss.queue.PopFront(); ok {
 				break
 			}
-			ss.cond.Wait()
+			ss.cond.Wait() // 释放锁，睡眠，被唤醒后重新获取锁
 		}
 
 		// Grab and clear the existing state for the range ID. Note that we leave
 		// the range ID marked as "queued" so that a concurrent Enqueue* will not
 		// queue the range ID again.
+		// ========================================
+		// 阶段2：获取状态并清空（保留stateQueued）
+		// ========================================
 		state := ss.state[q.rangeID]
 		ss.state[q.rangeID] = raftScheduleState{flags: stateQueued}
-		ss.Unlock()
+		ss.Unlock() // ← 关键：处理期间不持锁
 
 		// Record the scheduling latency for the range.
+		// 记录调度延迟
 		metrics.RaftSchedulerLatency.RecordValue(int64(q.queued.Elapsed()))
 
 		// Process requests first. This avoids a scenario where a tick and a
 		// "quiesce" message are processed in the same iteration and intervening
 		// raft ready processing unquiesces the replica because the tick triggers
 		// an election.
+		// ========================================
+		// 阶段3：按顺序处理事件
+		// ========================================
+
+		// [1] Request 优先于 Tick
+		// 原因：避免 Quiesce 竞争
 		if state.flags&stateRaftRequest != 0 {
 			// processRequestQueue returns true if the range should perform ready
 			// processing. Do not reorder this below the call to processReady.
@@ -400,11 +443,16 @@ func (ss *raftSchedulerShard) worker(
 				state.flags |= stateRaftReady
 			}
 		}
+
 		if util.RaceEnabled { // assert the ticks invariant
 			if tick := state.flags&stateRaftTick != 0; tick != (state.ticks != 0) {
 				log.KvExec.Fatalf(ctx, "stateRaftTick is %v with ticks %v", tick, state.ticks)
 			}
 		}
+		// 场景：Range收到MsgApp和MsgQuiesce，必须先处理MsgApp（Step）
+		// 才能正确处理Quiesce。若先Tick可能触发选举，打破Quiesce。
+
+		// [2] Tick（可能批量）
 		if state.flags&stateRaftTick != 0 {
 			for t := state.ticks; t > 0; t-- {
 				// processRaftTick returns true if the range should perform ready
@@ -414,26 +462,36 @@ func (ss *raftSchedulerShard) worker(
 				}
 			}
 		}
+		// 场景：积累的10个tick需要逐一处理，确保心跳超时递增正确。
+
+		// [3] RACv2 Piggyback（准入状态更新）
 		if state.flags&stateRACv2PiggybackedAdmitted != 0 {
 			processor.processRACv2PiggybackedAdmitted(ctx, q.rangeID)
 		}
+		// [4] Ready（最后处理）
+		// 原因：Ready是Step/Tick的输出，必须在它们之后
 		if state.flags&stateRaftReady != 0 {
 			processor.processReady(q.rangeID)
 		}
+		// 场景：Step(MsgApp) → hasReady → handleRaftReady() → apply entries
+
+		// [5] RACv2 Controller
 		if state.flags&stateRACv2RangeController != 0 {
 			processor.processRACv2RangeController(ctx, q.rangeID)
 		}
 		if buildutil.CrdbTestBuild && state.flags&stateTestIntercept != 0 {
 			processor.(testProcessorI).processTestEvent(q, ss, state)
 		}
-
+		// ========================================
+		// 阶段4：检查新事件并决定是否重新入队
+		// ========================================
 		ss.Lock()
 		state = ss.state[q.rangeID]
-		if state.flags == stateQueued {
+		if state.flags == stateQueued { // 无新事件
 			// No further processing required by the range ID, clear it from the
 			// state map.
-			delete(ss.state, q.rangeID)
-		} else {
+			delete(ss.state, q.rangeID) // 清理
+		} else { // 有新事件
 			// There was a concurrent call to one of the Enqueue* methods. Queue
 			// the range ID for further processing.
 			//
@@ -459,7 +517,10 @@ func (ss *raftSchedulerShard) worker(
 			// NB: this is a new insertion into the queue, so we set a new timestamp.
 			// We do not want the scheduler latency to pick up the time spent handling
 			// this replica.
+			// 重新入队（使用新时间戳）
 			ss.queue.Push(queuedRangeID{rangeID: q.rangeID, queued: crtime.NowMono()})
+			// 不需要signal：当前worker会继续循环，不会睡眠
+
 		}
 	}
 }
@@ -474,24 +535,47 @@ func (s *raftScheduler) NewEnqueueBatch() *raftSchedulerBatch {
 func (ss *raftSchedulerShard) enqueue1Locked(
 	addFlags raftScheduleFlags, id roachpb.RangeID, now crtime.Mono,
 ) int {
+	// ========================================
+	// 第一步：计算 ticks 增量（仅对 stateRaftTick）
+	// ========================================
 	ticks := int64((addFlags & stateRaftTick) / stateRaftTick) // 0 or 1
+	// 位操作技巧：
+	//   addFlags=stateRaftTick(0b1000) → ticks=1
+	//   addFlags=stateRaftReady(0b0010) → ticks=0
 
+	// ========================================
+	// 第二步：检查是否已有完全相同的标志
+	// ========================================
 	prevState := ss.state[id]
 	if prevState.flags&addFlags == addFlags && ticks == 0 {
-		return 0
+		return 0 // 幂等：无需重复设置
 	}
+	// 示例：
+	//   prevState.flags = stateQueued | stateRaftReady
+	//   addFlags = stateRaftReady
+	//   → prevState.flags&addFlags = stateRaftReady == addFlags
+	//   → return 0（已有该标志）
+
+	// ========================================
+	// 第三步：合并状态
+	// ========================================
 	var queued int
 	newState := prevState
 	newState.flags = newState.flags | addFlags
 	newState.ticks += ticks
+	// 限流：截断 ticks
 	if newState.ticks > ss.maxTicks {
 		newState.ticks = ss.maxTicks
 	}
+	// ========================================
+	// 第四步：决定是否入队
+	// ========================================
 	if newState.flags&stateQueued == 0 {
 		newState.flags |= stateQueued
 		queued++
 		ss.queue.Push(queuedRangeID{rangeID: id, queued: now})
 	}
+	// 否则：Range 已在队列中，仅更新状态表
 	ss.state[id] = newState
 	return queued
 }

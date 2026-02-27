@@ -45,7 +45,7 @@ import (
 // Delete, LoadAndDelete, and Store are write operations;
 // and LoadOrStore is a write operation when it returns loaded set to false.
 type Map[K comparable, V any] struct {
-	mu Mutex
+	mu Mutex // 保护 dirty 的写锁
 
 	// read contains the portion of the map's contents that are safe for
 	// concurrent access (with or without mu held).
@@ -56,6 +56,9 @@ type Map[K comparable, V any] struct {
 	// Entries stored in read may be updated concurrently without mu, but updating
 	// a previously-expunged entry requires that the entry be copied to the dirty
 	// map and unexpunged with mu held.
+	// ===== read：无锁读取的快照 =====
+	// 原子指针，指向 readOnly 结构体
+	// 读取操作大多数情况下只需要原子 Load，无需加锁
 	read atomic.Pointer[readOnly[K, V]]
 
 	// dirty contains the portion of the map's contents that require mu to be
@@ -68,6 +71,9 @@ type Map[K comparable, V any] struct {
 	//
 	// If the dirty map is nil, the next write to the map will initialize it by
 	// making a shallow copy of the clean map, omitting stale entries.
+	// ===== dirty：需要加锁的可变部分 =====
+	// 包含所有最新的 key-value 对
+	// 当 read 中没有某个 key 时，会在这里查找
 	dirty map[K]*entry[V]
 
 	// misses counts the number of loads since the read map was last updated that
@@ -76,16 +82,21 @@ type Map[K comparable, V any] struct {
 	// Once enough misses have occurred to cover the cost of copying the dirty
 	// map, the dirty map will be promoted to the read map (in the unamended
 	// state) and the next store to the map will make a new dirty copy.
+	// ===== misses：触发晋升的计数器 =====
+	// 记录从 dirty 中查找的次数
+	// 当 misses 达到 len(dirty) 时，dirty 会被晋升为 read
 	misses int
 }
 
 // readOnly is an immutable struct stored atomically in the Map.read field.
+// readOnly 是一个不可变的快照，存储在 Map.read 中
 type readOnly[K comparable, V any] struct {
 	m       map[K]*entry[V]
 	amended bool // true if the dirty map contains some key not in m.
 }
 
 // An entry is a slot in the map corresponding to a particular key.
+// entry 是 map 中的一个槽位
 type entry[V any] struct {
 	// p points to the value stored for the entry.
 	//
@@ -106,6 +117,11 @@ type entry[V any] struct {
 	// p != expunged. If p == expunged, an entry's associated value can be updated
 	// only after first setting m.dirty[key] = e so that lookups using the dirty
 	// map find the entry.
+	// p 指向实际存储的值
+	// p 的三种状态：
+	// 1. p = nil：entry 被删除，但可能还在 dirty 中
+	// 2. p = expunged：entry 被删除，且不在 dirty 中
+	// 3. p = *V：entry 有效，指向实际的值
 	p atomic.Pointer[V]
 }
 

@@ -49,9 +49,11 @@ type replicaQueue interface {
 type replicaSet interface {
 	// Visit calls the given function for every replica in the set btree
 	// until the function returns false.
+	// Visit 遍历所有 Replica，直到 visitor 返回 false
 	Visit(func(*Replica) bool)
 	// EstimatedCount returns the number of replicas estimated to remain
 	// in the iteration. This value does not need to be exact.
+	// EstimatedCount 返回剩余 Replica 的估计数量
 	EstimatedCount() int
 }
 
@@ -65,24 +67,26 @@ type replicaScanner struct {
 	clock   *hlc.Clock
 	stopper *stop.Stopper
 
-	targetInterval time.Duration  // Target duration interval for scan loop
-	minIdleTime    time.Duration  // Min idle time for scan loop
-	maxIdleTime    time.Duration  // Max idle time for scan loop
-	waitTimer      timeutil.Timer // Shared timer to avoid allocations
-	replicas       replicaSet     // Replicas to be scanned
-	queues         []replicaQueue // Replica queues managed by this scanner
-	removed        chan *Replica  // Replicas to remove from queues
+	// 扫描配置
+	targetInterval time.Duration // 目标扫描周期（如 10 分钟）
+	minIdleTime    time.Duration // 最小等待时间（如 10ms）
+	maxIdleTime    time.Duration // 最大等待时间（如 1s）
+
+	waitTimer timeutil.Timer // 共享定时器（避免重复分配）
+	replicas  replicaSet     // Replica 集合（实际是 storeReplicaVisitor）
+	queues    []replicaQueue // 管理的队列列表
+	removed   chan *Replica  // Replica 移除通知通道
 	// Count of times and total duration through the scanning loop.
+	// 统计信息（加锁保护）
 	mu struct {
 		syncutil.Mutex
-		scanCount        int64
-		waitEnabledCount int64
-		total            time.Duration
-		// Some tests in this package disable scanning.
-		disabled bool
+		scanCount        int64         // 扫描轮数
+		waitEnabledCount int64         // 等待启用的次数
+		total            time.Duration // 总扫描时间
+		disabled         bool          // 是否禁用
 	}
 	// Used to notify processing loop if the disabled state changes.
-	setDisabledCh chan struct{}
+	setDisabledCh chan struct{} // 禁用状态变化通知
 }
 
 // newReplicaScanner creates a new replica scanner with the provided
@@ -186,19 +190,26 @@ func (rs *replicaScanner) RemoveReplica(repl *Replica) {
 // paceInterval returns a duration between iterations to allow us to pace
 // the scan.
 func (rs *replicaScanner) paceInterval(start, now time.Time) time.Duration {
+	// Step 1: 计算已经过的时间
 	elapsed := now.Sub(start)
+	// Step 2: 计算剩余时间
 	remainingNanos := rs.targetInterval.Nanoseconds() - elapsed.Nanoseconds()
 	if remainingNanos < 0 {
 		remainingNanos = 0
 	}
+	// Step 3: 获取剩余 Replica 数量
 	count := rs.replicas.EstimatedCount()
 	if count < 1 {
+		//避免除以 0
 		count = 1
 	}
+	// Step 4: 计算平均等待时间
 	interval := time.Duration(remainingNanos / int64(count))
+	// Step 5: 应用最小空闲时间约束
 	if rs.minIdleTime > 0 && interval < rs.minIdleTime {
 		interval = rs.minIdleTime
 	}
+	// Step 6: 应用最大空闲时间约束
 	if rs.maxIdleTime > 0 && interval > rs.maxIdleTime {
 		interval = rs.maxIdleTime
 	}
@@ -228,6 +239,18 @@ func (rs *replicaScanner) waitAndProcess(ctx context.Context, start time.Time, r
 			if log.V(2) {
 				log.KvDistribution.Infof(ctx, "replica scanner processing %s", repl)
 			}
+			// 分发到所有队列
+			//- 每个 Replica 可能需要被多个队列处理
+			//- 例如：同时需要 GC、分裂检查、一致性检查
+			//- 统一扫描避免每个队列独立扫描
+			//不变量：
+			//- 如果返回 true，调用者应该停止扫描
+			//- 如果返回 false，调用者应该继续扫描
+			//- waitTimer 在函数返回前必须被停止或重置
+			//并发安全分析：
+			//- waitTimer 是 scanner 独占的，无竞争
+			//- removed 通道可能被多个 goroutine 发送（但通道是并发安全的）
+			//- MaybeAddAsync() 是异步的，队列内部处理并发安全
 			for _, q := range rs.queues {
 				q.MaybeAddAsync(ctx, repl, rs.clock.NowAsClockTimestamp())
 			}
@@ -261,7 +284,7 @@ func (rs *replicaScanner) removeReplica(repl *Replica) {
 func (rs *replicaScanner) scanLoop() {
 	ctx := rs.AnnotateCtx(context.Background())
 	_ = rs.stopper.RunAsyncTask(ctx, "scan-loop", func(ctx context.Context) {
-		start := timeutil.Now()
+		start := timeutil.Now() // 记录扫描开始时间
 
 		// waitTimer is reset in each call to waitAndProcess.
 		defer rs.waitTimer.Stop()

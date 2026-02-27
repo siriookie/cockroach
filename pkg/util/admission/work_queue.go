@@ -1074,6 +1074,27 @@ func (q *WorkQueue) Admit(ctx context.Context, info WorkInfo) (enabled bool, err
 		//continueGrantChain(chainID)  ← 重要！继续授权链
 		//    ↓
 		//返回 (true, nil)
+		//Channel 通信机制：
+		//GrantCoordinator 线程                 等待的 Goroutine
+		//        │                                     │
+		//        │ (调用 granted)                      │
+		//        ↓                                     │
+		//    获取 waitingWork                          │
+		//        ↓                                     │
+		//    item.ch <- grantChainID  ────────────────►│ (阻塞在 select)
+		//        ↓                                     │
+		//    返回 requestedCount                       │
+		//        ↓                                     ↓
+		//    继续授权下一个请求                    收到 chainID!
+		//                                              ↓
+		//                                         从 select 返回
+		//                                              ↓
+		//                                         清理 waitingWork
+		//                                              ↓
+		//                                         continueGrantChain(chainID)
+		//                                              ↓
+		//                                         执行业务逻辑
+
 		if !ok {
 			panic(errors.AssertionFailedf("channel should not be closed"))
 		}
@@ -1114,6 +1135,10 @@ func recordAdmissionWorkQueueStats(
 // AdmittedWorkDone is used to inform the WorkQueue that some admitted work is
 // finished. It must be called iff the WorkKind of this WorkQueue uses slots
 // (not tokens), i.e., KVWork.
+// AdmittedWorkDone 在工作完成后被调用，用于归还资源,仅限用slot的
+// 参数:
+//   - tenantID: 租户 ID
+//   - cpuTime: 实际消耗的 CPU 时间（仅 SQL work 使用）
 func (q *WorkQueue) AdmittedWorkDone(tenantID roachpb.TenantID, cpuTime time.Duration) {
 	if q.usesTokens {
 		panic(errors.AssertionFailedf("tokens should not be returned"))
@@ -1182,13 +1207,20 @@ func (q *WorkQueue) granted(grantChainID grantChainID) int64 {
 	// reused.
 	tenantID := tenant.id
 	q.mu.Unlock()
-
+	// ============================================================
+	// 步骤 4: 通知等待的 Goroutine
+	// ============================================================
 	if !item.replicated.Enabled {
+		// 普通请求：通过 channel 通知
 		// Reduce critical section by sending on channel after releasing mutex.
-		item.ch <- grantChainID
+		item.ch <- grantChainID // ← 核心！发送通知
+		// Goroutine 会在 Admit() 的 select 中收到这个值
+		// 然后调用 continueGrantChain(grantChainID)
 	} else {
 		// NB: We don't use grant chains for store tokens, so they don't apply
 		// to replicated writes.
+		// 复制写入：直接调用回调
+		// （Store 层不使用 Grant Chain）
 		if log.V(1) {
 			q.mu.Lock()
 			queueLen := tenant.waitingWorkHeap.Len()
@@ -1247,11 +1279,21 @@ func (q *WorkQueue) adjustTenantUsed(tenantID roachpb.TenantID, additionalUsed i
 	tid := tenantID.ToUint64()
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	// ============================================================
+	// 步骤 1: 更新租户统计
+	// ============================================================
 	tenant, ok := q.mu.tenants[tid]
 	if !ok {
+		// 租户不存在（可能已被 GC）
+		// 直接归还资源到 granter
 		return
 	}
+
+	// ============================================================
+	// 步骤 2: 减少租户使用量
+	// ============================================================
 	if additionalUsed < 0 {
+		// KVWork: 归还 1 slot
 		toReturn := uint64(-additionalUsed)
 		if tenant.used < toReturn {
 			tenant.used = 0

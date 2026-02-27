@@ -16,10 +16,13 @@ import (
 // A nodeSet keeps a set of nodes and provides simple node-matched
 // management functions. nodeSet is not thread safe.
 type nodeSet struct {
-	nodes        map[roachpb.NodeID]struct{} // Set of roachpb.NodeID
-	placeholders int                         // Number of nodes whose ID we don't know yet.
-	maxSize      int                         // Maximum size of set
-	gauge        *metric.Gauge               // Gauge for the number of nodes in the set.
+	nodes map[roachpb.NodeID]struct{} // Set of roachpb.NodeID
+	//### Placeholder 机制
+	//**问题**：启动客户端时，我们可能还不知道对端的 `NodeID`（首次连接时）。但 `outgoing` nodeSet 需要跟踪所有出向连接的 NodeID。
+	//**解决方案**：使用 **Placeholder** 机制
+	placeholders int           // Number of nodes whose ID we don't know yet.
+	maxSize      int           // Maximum size of set
+	gauge        *metric.Gauge // Gauge for the number of nodes in the set.
 }
 
 func makeNodeSet(maxSize int, gauge *metric.Gauge) nodeSet {

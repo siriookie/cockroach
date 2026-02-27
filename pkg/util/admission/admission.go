@@ -474,6 +474,45 @@ type grantChainID uint64
 
 // WorkKind represents various types of work that are subject to admission
 // control.
+// 设计原则（来自 admission.go 的注释）：
+//
+// 1. KVWork > SQLKVResponseWork > SQLSQLResponseWork
+//
+//  2. KVWork 最高优先级的原因：
+//     ├─► 包含非 SQL 的 KV 层工作（node liveness, range splits, etc.）
+//     ├─► 防止 KV 层工作被 SQL 层饿死
+//     └─► 是整个系统的基础层
+//
+//  3. SQLKVResponseWork > SQLSQLResponseWork 的原因：
+//     ├─► SQLKVResponseWork 包含 DistSQL 叶子节点处理
+//     ├─► 尽早释放 RPC 树底层节点的内存
+//     └─► 减少分布式查询的总延迟
+//
+//  4. 延迟 SQLSQLResponseWork 的好处：
+//     ├─► 自然的背压机制
+//     ├─► 减少新工作的发起速率
+//     └─► 避免雪崩
+//
+// 示例：单节点 OLAP vs OLTP
+//
+// 时刻 T0：OLAP 查询占用所有 KVWork slots
+// ├─► OLTP 查询到达，在 KVWork 队列中等待
+// └─► OLAP 的 KVWork 完成
+//
+// 时刻 T1：OLAP 尝试执行 SQLKVResponseWork
+// ├─► 但 OLTP 的 KVWork 开始执行，占用 CPU
+// ├─► OLAP 的 SQLKVResponseWork 被阻塞
+// └─► 等待 OLTP 的 KVWork 完成
+//
+// 时刻 T2：OLTP 的 KVWork 完成，执行 SQLKVResponseWork
+// ├─► OLAP 和 OLTP 的 SQLKVResponseWork 竞争
+// ├─► WorkQueue 优先处理高优先级的 OLTP 请求
+// └─► OLAP 查询被进一步延迟
+//
+// 结果：
+// - OLTP 查询快速完成 ✓
+// - OLAP 查询被自然降级 ✓
+// - 无需显式的 query priority 设置 ✓
 type WorkKind int8
 
 // The list of WorkKinds are ordered from lower level to higher level, and

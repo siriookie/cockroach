@@ -250,50 +250,58 @@ type Storage interface {
 // During bootstrapping, the bootstrap list contains candidates for
 // entry to the gossip network.
 type Gossip struct {
+	// 标记是否已启动（用于断言）
 	started bool // for assertions
-
+	// 嵌入的 Gossip RPC 服务器
 	*server // Embedded gossip RPC server
 
-	Connected     chan struct{}       // Closed upon initial connection
-	hasConnected  bool                // Set first time network is connected
-	outgoing      nodeSet             // Set of outgoing client node IDs
-	storage       Storage             // Persistent storage interface
-	bootstrapInfo BootstrapInfo       // BootstrapInfo proto for persistent storage
-	bootstrapping map[string]struct{} // Set of active bootstrap clients
-	hasCleanedBS  bool
+	// 连接状态
+	Connected    chan struct{} // 首次连接成功时关闭此 channel
+	hasConnected bool          // 是否已连接过
+	outgoing     nodeSet       // 出向连接的节点集合
+	// Bootstrap 相关
+	storage       Storage             // 持久化存储接口
+	bootstrapInfo BootstrapInfo       // 持久化的 bootstrap 地址
+	bootstrapping map[string]struct{} // 当前正在尝试的 bootstrap 地址
+
+	hasCleanedBS bool
 
 	// Note that access to each client's internal state is serialized by the
 	// embedded server's mutex. This is surprising!
+	// Client 管理
 	clientsMu struct {
 		syncutil.Mutex
-		clients []*client
+		clients []*client // 所有出向 gossip 客户端
 	}
+	disconnected chan *client // 断开连接的客户端通知 channel
+	// 状态管理
+	stalled   bool          // 是否处于 stalled 状态（无连接或缺 sentinel）
+	stalledCh chan struct{} // 用于唤醒 bootstrap goroutine
 
-	disconnected chan *client  // Channel of disconnected clients
-	stalled      bool          // True if gossip is stalled (i.e. host doesn't have sentinel)
-	stalledCh    chan struct{} // Channel to wake up stalled bootstrap
-
-	stallInterval     time.Duration
-	bootstrapInterval time.Duration
-	cullInterval      time.Duration
+	// 定时器配置
+	stallInterval     time.Duration // 检查 stall 的间隔（默认 1s）
+	bootstrapInterval time.Duration // Bootstrap 重试间隔（默认 1s）
+	cullInterval      time.Duration // 淘汰低效连接的间隔（默认 60s）
 
 	// TODO(baptist): Remember the localities for each remote address. Then pass
 	// it into the Dial.
 	// addresses is a list of bootstrap host addresses for
 	// connecting to the gossip network.
-	addressIdx     int
-	addresses      []util.UnresolvedAddr
-	addressesTried map[int]struct{} // Set of attempted address indexes
-	nodeDescs      syncutil.Map[roachpb.NodeID, roachpb.NodeDescriptor]
-	storeDescs     syncutil.Map[roachpb.StoreID, roachpb.StoreDescriptor]
+	// 地址管理
+	addresses      []util.UnresolvedAddr                  // bootstrap 地址列表
+	addressIdx     int                                    // 当前尝试的地址索引
+	addressesTried map[int]struct{}                       // 已尝试过的地址索引
+	bootstrapAddrs map[util.UnresolvedAddr]roachpb.NodeID // bootstrap 地址 -> NodeID 映射
+	addressExists  map[util.UnresolvedAddr]bool
+	// 节点描述符缓存
+	nodeDescs  syncutil.Map[roachpb.NodeID, roachpb.NodeDescriptor]
+	storeDescs syncutil.Map[roachpb.StoreID, roachpb.StoreDescriptor]
 
 	// Membership sets for bootstrap addresses. bootstrapAddrs also tracks which
 	// address is associated with which node ID to enable faster node lookup by
 	// address.
-	addressExists  map[util.UnresolvedAddr]bool
-	bootstrapAddrs map[util.UnresolvedAddr]roachpb.NodeID
 
-	locality roachpb.Locality
+	locality roachpb.Locality // 本节点的 locality 信息
 }
 
 // New creates an instance of a gossip node.
@@ -435,6 +443,8 @@ func (g *Gossip) SetCullInterval(interval time.Duration) {
 // for reading and writing gossip bootstrap data from persistent
 // storage. This should be invoked as early in the lifecycle of a
 // gossip instance as possible, but can be called at any time.
+// - Gossip 需要持久化已知节点的地址（用于下次启动时的 bootstrap）
+// - 通过 n.stores 实现 gossip.Storage 接口，将地址写入 Store 的系统键
 func (g *Gossip) SetStorage(storage Storage) error {
 	ctx := g.AnnotateCtx(context.TODO())
 	// Maintain lock ordering.
@@ -728,7 +738,17 @@ func (g *Gossip) maybeCleanupBootstrapAddressesLocked() {
 // maximum for number of hops allowed before the gossip network
 // will seek to "tighten" by creating new connections to distant
 // nodes.
+// 连接数动态调整
 func maxPeers(nodeCount int) int {
+	// 公式：maxPeers = ceil(e^(log(nodeCount) / (maxHops-2)))
+	//
+	// 推导（简化）：
+	// - 假设每个节点连接 P 个 peer
+	// - 信息在 H 跳内覆盖 P^H 个节点
+	// - 要求 P^H >= N（总节点数）
+	// - 则 P >= N^(1/H)
+	//
+	// 使用 maxHops-2（而非 maxHops）是为了留出"余量"
 	// This formula uses maxHops-2, instead of maxHops, to provide a
 	// "fudge" factor for max connected peers, to account for the
 	// arbitrary, decentralized way in which gossip networks are created.
@@ -1219,12 +1239,35 @@ func (g *Gossip) MaxHops() uint32 {
 func (g *Gossip) Start(
 	advertAddr net.Addr, addresses []util.UnresolvedAddr, rpcContext *rpc.Context,
 ) {
+	// Step 1: 断言未启动（防御性编程）
 	g.AssertNotStarted(context.Background())
+
+	// Step 2: 标记已启动
 	g.started = true
+
+	// Step 3: 设置 bootstrap 地址
 	g.setAddresses(addresses)
-	g.server.start(advertAddr) // serve gossip protocol
-	g.bootstrap(rpcContext)    // bootstrap gossip client
-	g.manage(rpcContext)       // manage gossip clients
+	//   - 将 addresses 存入 g.addresses
+	//   - 初始化 g.addressIdx = len(addresses) - 1
+	//   - 清空 g.addressesTried
+	//   - 发送信号到 g.stalledCh（如果有地址）
+
+	// Step 4: 启动 Gossip 服务器
+	g.server.start(advertAddr)
+	//   - 设置 g.mu.is.NodeAddr = advertAddr
+	//   - 注册全局回调：任何 info 变更 → broadcast()
+	//   - 启动 "gossip-wait-quiesce" goroutine
+
+	// Step 5: 启动 Bootstrap 循环
+	g.bootstrap(rpcContext)
+	//   - 启动 "gossip-bootstrap" goroutine
+	//   - 持续检查是否需要 bootstrap
+	//   - 通过 g.stalledCh 被唤醒
+
+	// Step 6: 启动 Management 循环
+	g.manage(rpcContext)
+	//   - 启动 "gossip-manage" goroutine
+	//   - 处理断开连接、tighten、cull、stall 检查
 }
 
 // hasIncomingLocked returns whether the server has an incoming gossip
@@ -1259,19 +1302,20 @@ func (g *Gossip) hasOutgoingLocked(nodeID roachpb.NodeID) bool {
 // getNextBootstrapAddress returns the next available bootstrap
 // address. The caller must hold the lock.
 func (g *Gossip) getNextBootstrapAddressLocked() util.UnresolvedAddr {
-	// Run through addresses round-robin starting at last address index.
+	// Round-robin 遍历所有地址
 	for range g.addresses {
 		g.addressIdx++
 		g.addressIdx %= len(g.addresses)
 		g.addressesTried[g.addressIdx] = struct{}{}
 		addr := g.addresses[g.addressIdx]
-		addrStr := addr.String()
-		if _, addrActive := g.bootstrapping[addrStr]; !addrActive {
-			g.bootstrapping[addrStr] = struct{}{}
+
+		// 跳过正在尝试的地址
+		if _, addrActive := g.bootstrapping[addr.String()]; !addrActive {
+			g.bootstrapping[addr.String()] = struct{}{}
 			return addr
 		}
 	}
-	return util.UnresolvedAddr{}
+	return util.UnresolvedAddr{} // 所有地址都在尝试中
 }
 
 // bootstrap connects the node to the gossip network. Bootstrapping
@@ -1280,6 +1324,20 @@ func (g *Gossip) getNextBootstrapAddressLocked() util.UnresolvedAddr {
 // connection, this method will block on the stalled condvar, which
 // receives notifications that gossip network connectivity has been
 // lost and requires re-bootstrapping.
+// ### **主动连接 Bootstrap 节点**
+// **时机**：
+// 1. **启动时立即触发**（如果没有连接或缺少 sentinel）
+// 2. **连接断开后被唤醒**（通过 `g.stalledCh`）
+// 3. **定期检查**（`bootstrapInterval`，默认 1s）
+// **关键决策点**：
+// - **何时 bootstrap？**
+// - 条件 1：`g.outgoing.len() == 0`（没有出向连接）
+// - 条件 2：`g.mu.is.getInfo(KeySentinel) == nil`（缺少 sentinel，表示未连接到集群）
+//
+// - **Sentinel Key 的作用**：
+//   - Sentinel 是一个由集群的”第一个节点”定期 gossip 的特殊 key
+//   - 如果一个节点能收到 sentinel，说明它连接到了正常的集群
+//   - 如果收不到，说明可能处于网络分区或所有连接都是无效的
 func (g *Gossip) bootstrap(rpcContext *rpc.Context) {
 	ctx := g.AnnotateCtx(context.Background())
 	_ = g.server.stopper.RunAsyncTask(ctx, "gossip-bootstrap", func(ctx context.Context) {
@@ -1287,6 +1345,7 @@ func (g *Gossip) bootstrap(rpcContext *rpc.Context) {
 		var bootstrapTimer timeutil.Timer
 		defer bootstrapTimer.Stop()
 		for {
+			// 1️⃣ 检查是否需要 bootstrap
 			func(ctx context.Context) {
 				g.mu.Lock()
 				defer g.mu.Unlock()
@@ -1294,6 +1353,7 @@ func (g *Gossip) bootstrap(rpcContext *rpc.Context) {
 				haveSentinel := g.mu.is.getInfo(KeySentinel) != nil
 				log.Eventf(ctx, "have clients: %t, have sentinel: %t", haveClients, haveSentinel)
 				if !haveClients || !haveSentinel {
+					// 需要 bootstrap
 					// Try to get another bootstrap address.
 					//
 					// TODO(baptist): The bootstrap address from the
@@ -1311,6 +1371,7 @@ func (g *Gossip) bootstrap(rpcContext *rpc.Context) {
 						}
 						g.startClientLocked(addr, locality, rpcContext)
 					} else {
+						// 没有可用地址，标记为 stalled
 						bootstrapAddrs := make([]string, 0, len(g.bootstrapping))
 						for addr := range g.bootstrapping {
 							bootstrapAddrs = append(bootstrapAddrs, addr)
@@ -1318,11 +1379,13 @@ func (g *Gossip) bootstrap(rpcContext *rpc.Context) {
 						log.Eventf(ctx, "no next bootstrap address; currently bootstrapping: %v", bootstrapAddrs)
 						// We couldn't start a client, signal that we're stalled so that
 						// we'll retry.
+						// 没有可用地址，标记为 stalled
 						g.maybeSignalStatusChangeLocked()
 					}
 				}
 			}(ctx)
 
+			// 2️⃣ 暂停一段时间后继续
 			// Pause an interval before next possible bootstrap.
 			bootstrapTimer.Reset(g.bootstrapInterval)
 			log.Eventf(ctx, "sleeping %s until bootstrap", g.bootstrapInterval)
@@ -1334,6 +1397,7 @@ func (g *Gossip) bootstrap(rpcContext *rpc.Context) {
 			}
 			log.Eventf(ctx, "idling until bootstrap required")
 			// Block until we need bootstrapping again.
+			// 3️⃣ 阻塞直到需要再次 bootstrap
 			select {
 			case <-g.stalledCh:
 				log.Eventf(ctx, "detected stall; commencing bootstrap")
@@ -1355,6 +1419,12 @@ func (g *Gossip) bootstrap(rpcContext *rpc.Context) {
 // the outgoing address set. If there are no longer any outgoing
 // connections or the sentinel gossip is unavailable, the bootstrapper
 // is notified via the stalled conditional variable.
+// Management Loop：连接维护与优化
+// 时机：
+// 1. 客户端断开连接时（g.disconnected channel）
+// 2. 收到 tighten 信号时（g.tighten channel）
+// 3. 定期淘汰低效连接（cullTimer，默认 60s）
+// 4. 定期检查 stall 状态（stallTimer，默认 1s）
 func (g *Gossip) manage(rpcContext *rpc.Context) {
 	ctx := g.AnnotateCtx(context.Background())
 	_ = g.server.stopper.RunAsyncTask(ctx, "gossip-manage", func(ctx context.Context) {
@@ -1370,10 +1440,15 @@ func (g *Gossip) manage(rpcContext *rpc.Context) {
 			case <-g.server.stopper.ShouldQuiesce():
 				return
 			case c := <-g.disconnected:
+				//客户端断开
 				g.doDisconnected(c, rpcContext)
-			case <-g.tighten:
+			case <-g.tighten: //Tighten 网络
 				g.tightenNetwork(ctx, rpcContext)
 			case <-cullTimer.C:
+				//淘汰低效连接（cullTimer）：
+				//- **触发时机**：每隔 `cullInterval`（默认 60s）
+				//- **目的**：释放出空间，为更优的连接让路
+				//- **选择策略**：关闭”最不有用”的客户端（`leastUseful`，基于信息新鲜度和跳数计算）
 				cullTimer.Reset(jitteredInterval(g.cullInterval, rng))
 				func() {
 					g.mu.Lock()
@@ -1404,6 +1479,9 @@ func (g *Gossip) manage(rpcContext *rpc.Context) {
 					g.mu.Unlock()
 				}()
 			case <-stallTimer.C:
+				//2. **检查 Stall 状态（`stallTimer`）**：
+				//    - **触发时机**：每隔 `stallInterval`（默认 1s）
+				//    - **目的**：检测是否失去连接或 sentinel，及时触发 bootstrap
 				stallTimer.Reset(jitteredInterval(g.stallInterval, rng))
 				func() {
 					g.mu.Lock()
@@ -1430,6 +1508,7 @@ func (g *Gossip) tightenNetwork(ctx context.Context, rpcContext *rpc.Context) {
 	defer g.mu.Unlock()
 
 	now := timeutil.Now()
+	// 防抖：距离上次 tighten 不到 1s，跳过
 	if now.Before(g.mu.lastTighten.Add(gossipTightenInterval)) {
 		// It hasn't been long since we last tightened the network, so skip it.
 		return
@@ -1440,10 +1519,11 @@ func (g *Gossip) tightenNetwork(ctx context.Context, rpcContext *rpc.Context) {
 		distantNodeID, distantHops := g.mu.is.mostDistant(g.hasOutgoingLocked)
 		log.VEventf(ctx, 2, "distantHops: %d from %d", distantHops, distantNodeID)
 		if distantHops <= maxHops {
-			return
+			return // 网络已经足够紧密
 		}
 		// If tightening is needed, then reset lastTighten to avoid restricting how
 		// soon we try again.
+		// 连接到最远的节点
 		g.mu.lastTighten = time.Time{}
 		if nodeAddr, locality, err := g.getNodeIDAddress(distantNodeID, true /* locked */); err != nil || nodeAddr == nil {
 			log.Health.Errorf(ctx, "unable to get address for n%d: %s", distantNodeID, err)
@@ -1459,9 +1539,10 @@ func (g *Gossip) tightenNetwork(ctx context.Context, rpcContext *rpc.Context) {
 func (g *Gossip) doDisconnected(c *client, rpcContext *rpc.Context) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.removeClientLocked(c)
+	g.removeClientLocked(c) // 从 outgoing 中移除
 
 	// If the client was disconnected with a forwarding address, connect now.
+	// 如果断开时带了转发地址，立即连接
 	if c.forwardAddr != nil {
 		locality := roachpb.Locality{}
 		// If we have a node descriptor for this node use it when dialing.
@@ -1475,18 +1556,31 @@ func (g *Gossip) doDisconnected(c *client, rpcContext *rpc.Context) {
 
 // maybeSignalStatusChangeLocked checks whether gossip should transition its
 // internal state from connected to stalled or vice versa.
+// ## **使用上下文**
+// 这个函数在以下情况下被调用：
+// 1. 网络连接状态可能因失去连接而变化时
+// 2. 在维护例程中定期检查网络状态时
+// 3. 在更新节点地址列表后需要重新评估连接状态时
+// 4. 当客户端断开连接后需要检查是否要切换状态时
 func (g *Gossip) maybeSignalStatusChangeLocked() {
 	ctx := g.AnnotateCtx(context.TODO())
+	//是否有传入和传出的连接（为0表示无连接）
 	orphaned := g.outgoing.len()+g.mu.incoming.len() == 0
+	//是否是一个多节点集群（根据引导地址列表长度判断）
 	multiNode := len(g.bootstrapInfo.Addresses) > 0
 	// We're stalled if we don't have the sentinel key, or if we're a multi node
 	// cluster and have no gossip connections.
+	//- 网络是否处于"stalled"状态，条件是：
+	//    - 同时是多节点集群且无连接（orphaned && multiNode）
+	//    - 或者缺少主信息（g.mu.is.getInfo(KeySentinel) == nil）
 	stalled := (orphaned && multiNode) || g.mu.is.getInfo(KeySentinel) == nil
 	if stalled {
+		//如果检测到stalled状态且之前不是stalled状态：
 		// We employ the stalled boolean to avoid filling logs with warnings.
 		if !g.stalled {
 			log.Eventf(ctx, "now stalled")
 			if orphaned {
+				// 分情况输出了不同警告的日志记录
 				if len(g.addresses) == 0 {
 					log.Ops.Warningf(ctx, "no addresses found; use --join to specify a connected node")
 				} else {
@@ -1499,16 +1593,18 @@ func (g *Gossip) maybeSignalStatusChangeLocked() {
 			}
 		}
 		if len(g.addresses) > 0 {
-			g.signalStalledLocked()
+			g.signalStalledLocked() //发送stalled信号
 		}
 	} else {
+		//处理恢复正常连接状态
 		if g.stalled {
 			log.Eventf(ctx, "connected")
 			log.Ops.Infof(ctx, "node has connected to cluster via gossip")
-			g.signalConnectedLocked()
+			g.signalConnectedLocked() //发送已连接信号
 		}
-		g.maybeCleanupBootstrapAddressesLocked()
+		g.maybeCleanupBootstrapAddressesLocked() //清理引导地址
 	}
+	//状态更新
 	g.stalled = stalled
 }
 
@@ -1539,6 +1635,7 @@ func (g *Gossip) signalConnectedLocked() {
 
 // startClientLocked launches a new client connected to remote address.
 // The client is added to the outgoing address set and launched in
+// 创建一个新的 client 实例，连接到指定地址，并启动 gossip 循环。
 // a goroutine.
 func (g *Gossip) startClientLocked(
 	addr util.UnresolvedAddr, locality roachpb.Locality, rpcContext *rpc.Context,
@@ -1547,8 +1644,11 @@ func (g *Gossip) startClientLocked(
 	defer g.clientsMu.Unlock()
 	ctx := g.AnnotateCtx(context.TODO())
 	log.VEventf(ctx, 1, "starting new client to %s", addr)
+	// 1️⃣ 创建新客户端
 	c := newClient(g.server.AmbientContext, &addr, locality, g.serverMetrics)
+	// 2️⃣ 加入客户端列表
 	g.clientsMu.clients = append(g.clientsMu.clients, c)
+	// 3️⃣ 启动客户端（异步）
 	c.startLocked(g, g.disconnected, rpcContext, g.server.stopper)
 }
 

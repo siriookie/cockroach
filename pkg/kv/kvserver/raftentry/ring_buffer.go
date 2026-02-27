@@ -15,10 +15,20 @@ import (
 )
 
 // ringBuf is a ring buffer of raft entries.
+// **为什么使用环形缓冲区？**
+// ```
+// Raft log的特点：
+// 1. Index连续：[100, 101, 102, 103, ...]
+// 2. 顺序追加：新entries追加到尾部
+// 3. 从头清理：旧entries从头部删除
+// 4. 范围查询：Scan [lo, hi)
+//
+// 环形缓冲区完美匹配这些特点！
+// ```
 type ringBuf struct {
-	buf  []raftpb.Entry
-	head int
-	len  int
+	buf  []raftpb.Entry // 底层数组（容量是2的幂）
+	head int            // 第一个有效entry的位置
+	len  int            // 有效entry数量
 }
 
 const (
@@ -29,13 +39,32 @@ const (
 // add adds ents to the ringBuf keeping track of how much was actually added
 // given that ents may overlap with existing entries or may be rejected from
 // the buffer. ents must not be empty.
+// 1. 添加entries
 func (b *ringBuf) add(ents []raftpb.Entry) (addedBytes, addedEntries int32) {
+	// 步骤1：检查是否需要扩展
+	// - 如果ents是连续的（紧接着最后一个entry）
+	// - 如果buf空间不足，扩展buf（realloc）
+
+	// 步骤2：处理index重叠
+	// - 如果ents[0].Index <= lastCachedIndex
+	// - 覆盖重叠的部分
+
+	// 步骤3：写入新entries
+	// - 使用iterator遍历
+	// - 处理环形边界
 	if it := last(b); it.valid(b) && kvpb.RaftIndex(ents[0].Index) > it.index(b)+1 {
+		// 检测gap：如果新entries不连续且更新
+		// 例如：
+		// 当前：[3, 4, 5]，last=5
+		// 添加：[8, 9]，first=8
+		// gap：8 > 5+1，不连续
 		// If ents is non-contiguous and later than the currently cached range then
 		// remove the current entries and add ents in their place.
+		// 清除当前所有entries
 		removedBytes, removedEntries := b.clearTo(it.index(b))
 		addedBytes, addedEntries = -1*removedBytes, -1*removedEntries
 	}
+	// 计算重叠部分
 	before, after, ok := computeExtension(b, kvpb.RaftIndex(ents[0].Index), kvpb.RaftIndex(ents[len(ents)-1].Index))
 	if !ok {
 		return
@@ -46,12 +75,20 @@ func (b *ringBuf) add(ents []raftpb.Entry) (addedBytes, addedEntries int32) {
 		it, _ = iterateFrom(b, kvpb.RaftIndex(ents[0].Index)) // safe by construction
 	}
 	firstNewAfter := len(ents) - after
+	// before: 在当前范围之前的新entries数量
+	// after: 在当前范围之后的新entries数量
+	// 中间部分：重叠，需要覆盖
+
+	// 覆盖写入
 	for i, e := range ents {
 		if i < before || i >= firstNewAfter {
+			// 新增的entry
 			addedEntries++
 			addedBytes += int32(e.Size())
 		} else {
+			// 覆盖的entry
 			addedBytes += int32(e.Size() - it.entry(b).Size())
+			// 注意：可能变大或变小
 		}
 		it = it.push(b, e)
 	}
@@ -81,7 +118,26 @@ func (b *ringBuf) truncateFrom(lo kvpb.RaftIndex) (removedBytes, removedEntries 
 		it, ok = it.next(b)
 	}
 	b.len -= int(removedEntries)
+	//收缩策略：
+	//- 当使用率 < 12.5% 时收缩
+	//- 避免频繁收缩：阈值是8
+	//
+	//示例1：
+	//buf容量 = 128
+	//len = 15 (< 128/8 = 16)
+	//→ 收缩到32（大于等于15的最小2的幂）
+	//
+	//示例2：
+	//buf容量 = 64
+	//len = 10 (> 64/8 = 8)
+	//→ 不收缩
+	//
+	//为什么是8？
+	//- 太小（如2）：频繁收缩，性能差
+	//- 太大（如16）：内存浪费多
+	//- 8是经验值：平衡性能和内存
 	if b.len < (len(b.buf) / shrinkThreshold) {
+		// 在clearTo()和truncateFrom()中
 		realloc(b, 0, b.len)
 	}
 	if util.RaceEnabled {
@@ -166,19 +222,40 @@ func realloc(b *ringBuf, before, newLen int) {
 
 // reallocLen returns a new length which is a power-of-two greater than or equal
 // to need and at least minBufSize.
+// 示例：
+// reallocLen(10)  = 16    (2^4)
+// reallocLen(20)  = 32    (2^5)
+// reallocLen(50)  = 64    (2^6)
+// reallocLen(100) = 128   (2^7)
+// bits.Len()的工作原理：
+// bits.Len(50) = 6  // 50 = 0b110010, 需要6位
+// 1 << 6 = 64       // 2^6
+//
+// 保证：
+// 1. 容量始终是2的幂
+// 2. 容量 >= need
+// 3. 容量 >= minBufSize (16)
 func reallocLen(need int) (newLen int) {
 	if need <= minBufSize {
 		return minBufSize
 	}
+	// bits.Len(n) 返回表示n需要的位数
+	// 1 << bits.Len(n) 返回大于等于n的最小的2的幂
 	return 1 << uint(bits.Len(uint(need)))
 }
 
 // extend takes a number of entries before and after the current cached values
 // to increase the length of b. The before-length prefix of b will now be zero
 // valued entries.
+// 示例：
+// 当前：buf=[16个entry], len=16, 满了
+// 添加：10个新entry
+// 需要：16 + 10 = 26
+// 扩容到：32（下一个2的幂）
 func extend(b *ringBuf, before, after int) {
 	size := before + b.len + after
 	if size > len(b.buf) {
+		//需要扩容
 		realloc(b, before, size)
 	} else {
 		b.head = (b.head - before) % len(b.buf)

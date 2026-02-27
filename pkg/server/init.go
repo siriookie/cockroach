@@ -130,12 +130,12 @@ func newInitServer(
 // constructs an initState with the details needed to fully start up a CRDB
 // server.
 type initState struct {
-	nodeID               roachpb.NodeID
+	nodeID               roachpb.NodeID // 节点 ID（持久化在 Store）
 	clusterID            uuid.UUID
 	clusterVersion       clusterversion.ClusterVersion
-	initializedEngines   []storage.Engine
-	uninitializedEngines []storage.Engine
-	initialSettingsKVs   []roachpb.KeyValue
+	initializedEngines   []storage.Engine   // 已有数据的引擎（立即启动）
+	uninitializedEngines []storage.Engine   // 新添加的引擎（异步初始化）
+	initialSettingsKVs   []roachpb.KeyValue // 初始集群设置
 	initType             serverpb.InitType
 }
 

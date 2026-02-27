@@ -2411,7 +2411,12 @@ func (p *Pebble) Compact(ctx context.Context) error {
 	return p.db.Compact(ctx, nil /* start */, EncodeMVCCKey(MVCCKeyMax), true /* parallel */)
 }
 
-// CompactRange implements the Engine interface.
+// CompactRange 强制存储引擎对指定范围的数据执行手动压缩（Compaction）。
+// 这一操作具有以下重要作用：
+// 1. 物理清理：彻底删除打上删除标记（Tombstones）的旧版本数据。在 Liveness 心跳这种极高频率更新的场景下，可以防止垃圾数据堆积。
+// 2. 层级合并：通过合并 LSM 树中不同层级的 SSTable，减少查询时需要探测的文件数量，大幅降低读放大（Read Amplification）。
+// 3. 空间回收：重写数据文件，消除由于删除或更新产生的空隙，提高存储空间的利用率。
+// 4. 优化读取性能：在 Liveness Range 启动扫描或故障恢复时，压缩过的紧凑数据能显著加快恢复速度。
 func (p *Pebble) CompactRange(ctx context.Context, start, end roachpb.Key) error {
 	// TODO(jackson): Consider changing Engine.CompactRange's signature to take
 	// in EngineKeys so that it's unambiguous that the arguments have already

@@ -129,9 +129,16 @@ type infoStore struct {
 	stopper *stop.Stopper
 	metrics Metrics
 
-	Infos           infoMap                  `json:"infos,omitempty"` // Map from key to info
-	NodeAddr        util.UnresolvedAddr      `json:"-"`               // Address of node owning this info store: "host:port"
-	highWaterStamps map[roachpb.NodeID]int64 // Per-node information for gossip peers
+	Infos    infoMap             `json:"infos,omitempty"` // Map from key to info
+	NodeAddr util.UnresolvedAddr `json:"-"`               // Address of node owning this info store: "host:port"
+	//HighWaterStamps 的作用：
+	//- 告诉服务端”我已经知道的信息”
+	//- 服务端只发送 OrigStamp > HighWaterStamps[NodeID] 的 info
+	//- 增量同步：避免重复传输相同信息
+	//为什么是 map 而非单个时间戳？
+	//- Gossip 网络是去中心化的，每个 Node 独立生成信息
+	//- 需要跟踪每个 Node 的最新时间戳，而非全局单一时间戳
+	highWaterStamps map[roachpb.NodeID]int64 // Per-node information for gossip peers,每个节点的最新信息时间戳（用于增量同步）
 	callbacks       []*callback
 }
 
@@ -165,6 +172,8 @@ func monotonicUnixNano() int64 {
 // even in the presence of local infos that were received from a remote with a
 // timestamp in the future (which can happen in the presence of backward clock
 // jumps and a crash).
+// ratchetMonotonic 确保本地节点的单调时钟始终大于等于已见到的最大 OrigStamp，
+// 避免后续产生的时间戳与已传播的信息冲突。
 func ratchetMonotonic(v int64) {
 	monoTime.Lock()
 	if monoTime.last < v {
@@ -344,6 +353,7 @@ func (is *infoStore) addInfo(key string, i *Info) error {
 	// Only replace an existing info if new timestamp is greater, or if
 	// timestamps are equal, but new hops is smaller.
 	existingInfo, ok := is.Infos[key]
+	//如果 key 已存在，比较时间戳和跳数
 	if ok {
 		iNanos := i.Value.Timestamp.WallTime
 		existingNanos := existingInfo.Value.Timestamp.WallTime
@@ -530,17 +540,30 @@ func (is *infoStore) visitInfos(visitInfo func(string, *Info) error, deleteExpir
 // All hop distances on infos are incremented to indicate they've
 // arrived from an external source. Returns the count of "fresh"
 // infos in the provided delta.
+// 将来自远程节点的增量 gossip 信息（delta）合并到本地信息存储（infoStore）中，
+// 同时更新信息的传播路径元数据（跳数、对等节点ID）。
+// 在 gossip 协议中，信息通过节点间的连接链式传播。当一个节点 A 从节点 B 收到信息时，这些信息可能：
+// - 来自节点 B 本身（Hops = 0）
+// - 来自其他节点，已经过多次转发（Hops > 0）
+//
+// `combine` 方法必须：
+// 1. **增加跳数**：表示信息又经过了一次转发
+// 2. **记录对等节点**：标记信息是从哪个节点接收的（PeerID），用于网络拓扑分析
+// 3. **处理回环检测**：如果收到的是本地节点产生的信息，需要特殊处理（时钟同步）
+// 4. **增量合并**：只接受比本地已有的”更新”的信息（基于时间戳和跳数）
 func (is *infoStore) combine(
-	infos map[string]*Info, nodeID roachpb.NodeID,
-) (freshCount int, err error) {
+	infos map[string]*Info, nodeID roachpb.NodeID, /*nodeID roachpb.NodeID：发送这些信息的远程节点 ID*/
+) (freshCount int /*成功合并的”新鲜”信息数量（即本地没有或比本地更新的信息）*/, err error) {
 	localNodeID := is.nodeID.Get()
+	//infos 来自远程节点的增量信息集合
 	for key, i := range infos {
 		if i.NodeID == localNodeID {
+			//作用：如果信息的原始来源是本地节点，调用 ratchetMonotonic 同步单调时钟。
 			ratchetMonotonic(i.OrigStamp)
 		}
 
 		infoCopy := *i
-		infoCopy.Hops++
+		infoCopy.Hops++ //增加跳数：Hops++ 表示信息又经过了一次转发
 		infoCopy.PeerID = nodeID
 		if infoCopy.OrigStamp == 0 {
 			panic(errors.Errorf("combining info from n%d with 0 original timestamp", nodeID))
@@ -577,6 +600,8 @@ func (is *infoStore) delta(highWaterTimestamps map[roachpb.NodeID]int64) map[str
 	return infos
 }
 
+// 这个函数的目的，是为后续 gossip / 同步逻辑准备一份
+// “我当前已知的所有节点描述信息的快照
 // populateMostDistantMarkers adds the node ID infos to the infos map. The node
 // ID infos are used as markers in the mostDistant calculation and need to be
 // propagated regardless of high water stamps.
@@ -601,6 +626,16 @@ func (is *infoStore) populateMostDistantMarkers(infos map[string]*Info) {
 // in quick succession.
 //
 // May modify the infoStore.
+// - **核心功能**：
+//  1. **遍历所有节点描述信息**：遍历 infoStore 中所有以节点描述键（NodeDescKey）为键的信息
+//  2. **筛选条件**：
+//     - 节点 ID 不是本地节点（`i.NodeID != localNodeID`）
+//     - 跳数大于当前最大值（`i.Hops > maxHops`）
+//     - 键是节点描述键（`IsNodeDescKey(key)`）
+//     - **排除已有出向连接的节点**（`!hasOutgoingConn(i.NodeID)`）
+//  3. **返回结果**：
+//     - `nodeID`：距离最远的节点 ID
+//     - `maxHops`：到达该节点的跳数
 func (is *infoStore) mostDistant(
 	hasOutgoingConn func(roachpb.NodeID) bool,
 ) (roachpb.NodeID, uint32) {

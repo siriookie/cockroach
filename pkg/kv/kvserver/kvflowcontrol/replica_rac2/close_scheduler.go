@@ -18,25 +18,30 @@ import (
 )
 
 type streamCloseScheduler struct {
-	clock     timeutil.TimeSource
-	scheduler RaftScheduler
+	clock     timeutil.TimeSource // 时钟抽象（便于测试）
+	scheduler RaftScheduler       // Raft 调度器接口
 	// nonEmptyCh is used to signal the scheduler that there are events to
 	// process. When the heap is empty, the scheduler will wait for the next
 	// event to be added before processing, by waiting on this channel.
-	nonEmptyCh chan struct{}
+	nonEmptyCh chan struct{} // 信号通道（通知有新事件）
 
 	mu struct {
 		syncutil.Mutex
-		scheduled scheduledQueue
+		scheduled scheduledQueue // 优先队列（最小堆）
 	}
 }
 
+// 关键设计决策：
+// - 最小堆：事件按 at 时间排序，堆顶是最早的事件
+// - 无去重：同一个 RangeID 可以有多个事件（允许重复调度）
+// - 信号驱动：nonEmptyCh 使用缓冲为 1 的通道，避免信号丢失
 type scheduledCloseEvent struct {
-	rangeID roachpb.RangeID
-	at      time.Time
+	rangeID roachpb.RangeID // 需要处理的 Range
+	at      time.Time       // 触发时间
 }
 
 // scheduledQueue implements the heap.Interface.
+// scheduledQueue 实现 heap.Interface
 type scheduledQueue struct {
 	items []scheduledCloseEvent
 }

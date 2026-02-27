@@ -5038,7 +5038,7 @@ func (sm *StoreMetrics) getCounterForRangeLogEventType(
 	case kvserverpb.RangeLogEventType_remove_voter:
 		return sm.RangeRemoves
 	default:
-		return nil
+		return nil // add_non_voter/remove_non_voter/unsafe_quorum_recovery无对应counter
 	}
 }
 

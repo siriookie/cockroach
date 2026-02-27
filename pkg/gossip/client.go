@@ -33,16 +33,18 @@ type client struct {
 	// peerID is the node ID of the peer we're connected to. This is set when we
 	// receive a response from the peer. The gossip mu should be held when
 	// accessing.
-	peerID                roachpb.NodeID
-	resolvedPlaceholder   bool                     // Whether we've resolved the nodeSet's placeholder for this client
-	addr                  net.Addr                 // Peer node network address
-	locality              roachpb.Locality         // Peer node locality (if known)
-	forwardAddr           *util.UnresolvedAddr     // Set if disconnected with an alternate addr
-	prevHighWaterStamps   map[roachpb.NodeID]int64 // Last high water timestamps sent to remote server
-	remoteHighWaterStamps map[roachpb.NodeID]int64 // Remote server's high water timestamps
-	closer                chan struct{}            // Client shutdown channel
-	clientMetrics         Metrics
-	nodeMetrics           Metrics
+	peerID              roachpb.NodeID       // 对端节点 ID（收到响应后设置）
+	resolvedPlaceholder bool                 // 是否已将 placeholder 解析为实际 NodeID
+	addr                net.Addr             // 对端地址
+	locality            roachpb.Locality     // 对端 locality（如果已知）
+	forwardAddr         *util.UnresolvedAddr // 如果被转发，记录转发地址
+
+	prevHighWaterStamps   map[roachpb.NodeID]int64 // 上次发送给对端的高水位
+	remoteHighWaterStamps map[roachpb.NodeID]int64 // 对端的高水位
+
+	closer        chan struct{} // 用于关闭客户端的 channel
+	clientMetrics Metrics       // 客户端 metrics
+	nodeMetrics   Metrics       // 引用 node 级别的 metrics
 }
 
 // extractKeys returns a string representation of a gossip delta's keys.
@@ -75,13 +77,19 @@ var logFailedStartEvery = log.Every(5 * time.Second)
 // start dials the remote addr and commences gossip once connected. Upon exit,
 // the client is sent on the disconnected channel. This method starts client
 // processing in a goroutine and returns immediately.
+// ### 核心职责
+//
+// 1. **建立 RPC 连接**：通过 gRPC 或 DRPC 连接到对端节点
+// 2. **启动 Gossip 流**：持续交换 gossip delta
+// 3. **处理连接生命周期**：连接成功、失败、断开的处理
 func (c *client) startLocked(
 	g *Gossip, disconnected chan *client, rpcCtx *rpc.Context, stopper *stop.Stopper,
 ) {
 	// Add a placeholder for the new outgoing connection because we may not know
 	// the ID of the node we're connecting to yet. This will be resolved in
 	// (*client).handleResponse once we know the ID.
-	g.outgoing.addPlaceholder()
+	// Step 1: 添加 placeholder（占位符）
+	g.outgoing.addPlaceholder() // 在 startClientLocked 调用前
 
 	ctx, cancel := context.WithCancel(c.AnnotateCtx(context.Background()))
 	if err := stopper.RunAsyncTask(ctx, "gossip-client", func(ctx context.Context) {
@@ -92,15 +100,15 @@ func (c *client) startLocked(
 			//
 			// Note: it is still possible for incoming gossip to be processed after
 			// this point.
-			cancel()
+			cancel() // 关闭出向流
 
 			// The stream is closed, but there may still be some incoming gossip
 			// being processed. Wait until that is complete to avoid racing the
 			// client's removal against the discovery of its remote's node ID.
-			wg.Wait()
-			disconnected <- c
+			wg.Wait()         // 等待入向 gossip 处理完成
+			disconnected <- c // 通知 management goroutine
 		}()
-
+		// 2️⃣ 建立连接和 gossip 流
 		stream, err := func() (RPCGossip_GossipClient, error) {
 			gc, err := c.dialGossipClient(ctx, rpcCtx)
 			if err != nil {
@@ -111,6 +119,7 @@ func (c *client) startLocked(
 			if err != nil {
 				return nil, err
 			}
+			// 3️⃣ 发送初始请求（包含本节点的 HighWaterStamps）
 			if err := c.requestGossip(g, stream); err != nil {
 				return nil, err
 			}
@@ -125,6 +134,7 @@ func (c *client) startLocked(
 
 		// Start gossiping.
 		log.Dev.Infof(ctx, "started gossip client to n%d (%s)", c.peerID, c.addr)
+		// 4️⃣ 启动 gossip 循环
 		if err := c.gossip(ctx, g, stream, stopper, &wg); err != nil {
 			if !grpcutil.IsClosedConnection(err) {
 				peerID, addr := func() (roachpb.NodeID, net.Addr) {
@@ -156,18 +166,28 @@ func (c *client) close() {
 // requestGossip requests the latest gossip from the remote server by
 // supplying a map of this node's knowledge of other nodes' high water
 // timestamps.
+// ### 职责
+//
+// 发送初始的 `Request`，告诉服务端：
+// 1. **我是谁**：`NodeID` 和 `Addr`
+// 2. **我知道什么**：`HighWaterStamps`（各个 Node 的最新时间戳）
+// 3. **我属于哪个集群**：`ClusterID`
 func (c *client) requestGossip(g *Gossip, stream RPCGossip_GossipClient) error {
+	// 1️⃣ 获取本节点的信息（需要持有读锁）
 	nodeAddr, highWaterStamps := func() (util.UnresolvedAddr, map[roachpb.NodeID]int64) {
 		g.mu.RLock()
 		defer g.mu.RUnlock()
 		return g.mu.is.NodeAddr, g.mu.is.getHighWaterStamps()
 	}()
+	// 2️⃣ 构造请求
+
 	args := &Request{
 		NodeID:          g.NodeID.Get(),
 		Addr:            nodeAddr,
 		HighWaterStamps: highWaterStamps,
 		ClusterID:       g.clusterID.Get(),
 	}
+	// 3️⃣ 记录 metrics 和状态
 
 	bytesSent := int64(args.Size())
 	c.clientMetrics.BytesSent.Inc(bytesSent)
@@ -232,10 +252,17 @@ func (c *client) sendGossip(g *Gossip, stream RPCGossip_GossipClient, firstReq b
 
 // handleResponse handles errors, remote forwarding, and combines delta
 // gossip infos from the remote server with this node's infostore.
+// 处理服务端响应
+// ### 核心职责
+//
+// 1. **合并 Gossip Delta**：将对端的信息合并到本地 InfoStore
+// 2. **解析 Placeholder**：首次收到 `reply.NodeID` 时解析 placeholder
+// 3. **处理转发**：如果对端满载，接受转发到其他节点
+// 4. **检测重复连接**：避免同一对节点之间的多条连接
 func (c *client) handleResponse(ctx context.Context, g *Gossip, reply *Response) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-
+	// 1️⃣ 记录 metrics
 	bytesReceived := int64(reply.Size())
 	infosReceived := int64(len(reply.Delta))
 	c.clientMetrics.BytesReceived.Inc(bytesReceived)
@@ -244,7 +271,7 @@ func (c *client) handleResponse(ctx context.Context, g *Gossip, reply *Response)
 	c.nodeMetrics.BytesReceived.Inc(bytesReceived)
 	c.nodeMetrics.InfosReceived.Inc(infosReceived)
 	c.nodeMetrics.MessagesReceived.Inc(1)
-
+	// 2️⃣ 合并 gossip delta
 	// Combine remote node's infostore delta with ours.
 	if reply.Delta != nil {
 		freshCount, err := g.mu.is.combine(reply.Delta, reply.NodeID)
@@ -258,6 +285,7 @@ func (c *client) handleResponse(ctx context.Context, g *Gossip, reply *Response)
 		}
 		g.maybeTightenLocked()
 	}
+	// 3️⃣ 记录对端 NodeID 和高水位
 	c.peerID = reply.NodeID
 	mergeHighWaterStamps(&c.remoteHighWaterStamps, reply.HighWaterStamps)
 
@@ -265,12 +293,14 @@ func (c *client) handleResponse(ctx context.Context, g *Gossip, reply *Response)
 	// nodeSet, do so now. Note that we only want to do this if the peer has a
 	// node ID allocated (i.e. if it's nonzero), because otherwise it could change
 	// after we record it.
+	// Step 2: 连接成功后，解析 placeholder
 	if !c.resolvedPlaceholder && c.peerID != 0 {
 		c.resolvedPlaceholder = true
 		g.outgoing.resolvePlaceholder(c.peerID)
 	}
 
 	// Handle remote forwarding.
+	// 5️⃣ 处理转发
 	if reply.AlternateAddr != nil {
 		if g.hasIncomingLocked(reply.AlternateNodeID) || g.hasOutgoingLocked(reply.AlternateNodeID) {
 			return errors.Errorf(
@@ -283,14 +313,17 @@ func (c *client) handleResponse(ctx context.Context, g *Gossip, reply *Response)
 	}
 
 	// Check whether we're connected at this point.
+	// 6️⃣ 检查连接状态
 	g.signalConnectedLocked()
 
 	// Check whether this outgoing client is duplicating work already
 	// being done by an incoming client, either because an outgoing
 	// matches an incoming or the client is connecting to itself.
+	// 7️⃣ 检测重复连接
 	if nodeID := g.NodeID.Get(); nodeID == c.peerID {
 		return errors.Errorf("stopping outgoing client to n%d (%s); loopback connection", c.peerID, c.addr)
 	} else if g.hasIncomingLocked(c.peerID) && nodeID > c.peerID {
+		// 双向连接冲突解决：NodeID 较大的一方关闭出向连接
 		// To avoid mutual shutdown, we only shutdown our client if our
 		// node ID is higher than the peer's.
 		return errors.Errorf("stopping outgoing client to n%d (%s); already have incoming", c.peerID, c.addr)
@@ -312,10 +345,13 @@ func (c *client) gossip(
 	sendGossipChan := make(chan struct{}, 1)
 
 	// Register a callback for gossip updates.
+	// 1️⃣ 注册回调：本地信息变更时触发发送
 	updateCallback := func(_ string, _ roachpb.Value, _ int64) {
 		select {
-		case sendGossipChan <- struct{}{}:
-		default:
+		//- **批量发送**：多个信息变更只触发一次发送
+		//- **背压控制**：如果发送速度跟不上，跳过部分触发（下次发送会包含所有未发送的 delta）
+		case sendGossipChan <- struct{}{}: // 非阻塞发送
+		default: // 如果 channel 已满，跳过（已有待处理的发送任务）
 		}
 	}
 
@@ -325,6 +361,7 @@ func (c *client) gossip(
 	// This wait group is used to allow the caller to wait until gossip
 	// processing is terminated.
 	wg.Add(1)
+	// 2️⃣ 启动接收 goroutine
 	if err := stopper.RunAsyncTask(ctx, "client-gossip", func(ctx context.Context) {
 		defer wg.Done()
 
@@ -339,7 +376,7 @@ func (c *client) gossip(
 					return err
 				}
 				if init {
-					initCh <- struct{}{}
+					initCh <- struct{}{} // 首次响应后通知主循环
 				}
 			}
 		}()
@@ -356,6 +393,16 @@ func (c *client) gossip(
 	// send a response when receiving an incoming connection, so we also start a
 	// timer and perform initialization after 1s if we haven't heard from the
 	// remote.
+	// 3️⃣ 延迟注册回调（等待首次响应或 1 秒超时）
+	//**1. 为什么延迟注册回调？**
+	//
+	//**问题**：如果在连接建立后立即注册回调，本地的所有 info 都会触发发送，导致**全量同步**。
+	//
+	//**解决方案**：
+	//- 等待首次响应（包含对端的 `HighWaterStamps`）
+	//- 或者超时 1 秒（防止旧版本节点不发送初始响应）
+	//- 之后才注册回调，实现**增量同步**
+	//
 	var unregister func()
 	defer func() {
 		if unregister != nil {
@@ -370,24 +417,42 @@ func (c *client) gossip(
 			unregister = g.RegisterCallback(".*", updateCallback, Redundant)
 		}
 	}
+	// 版本 < 2.1 的节点可能不发送初始响应
+	// 所以设置 1 秒超时，强制注册回调
 	initTimer := time.NewTimer(time.Second)
 	defer initTimer.Stop()
-
+	// 4️⃣ 主循环：处理发送和控制信号
 	for count := 0; ; {
 		select {
-		case <-c.closer:
+		//manage() goroutine
+		//  ↓
+		//c.close()  // 关闭 c.closer channel
+		//  ↓
+		//c.gossip() 主循环检测到 c.closer 关闭
+		//  ↓
+		//c.gossip() 返回 nil
+		//  ↓
+		//startLocked() 的 defer 函数执行
+		//  ↓
+		//disconnected <- c  // 向 channel 发送 client
+		//  ↓
+		//manage() goroutine 的 select 接收到 disconnected
+		//  ↓
+		//doDisconnected(c, rpcContext)  // 处理断开连接
+		case <-c.closer: // 客户端被关闭
 			return nil
-		case <-stopper.ShouldQuiesce():
+		case <-stopper.ShouldQuiesce(): // 节点正在关闭
 			return nil
-		case err := <-errCh:
+		case err := <-errCh: // 接收 goroutine 出错
 			return err
 		case <-initCh:
-			maybeRegister()
+			maybeRegister() // 收到首次响应，注册回调
 		case <-initTimer.C:
-			maybeRegister()
+			maybeRegister() // 超时 1 秒，强制注册回调
 		case <-sendGossipChan:
 			// We need to send the gossip delta to the remote server. Wait a bit to
 			// batch the updates in one message.
+			// 5️⃣ 批量发送 gossip delta
 			batchAndConsume(sendGossipChan, infosBatchDelay)
 			if err := c.sendGossip(g, stream, count == 0); err != nil {
 				return err

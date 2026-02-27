@@ -81,11 +81,11 @@ var SplitSampleResetDuration = settings.RegisterDurationSetting(
 func (obj LBRebalancingObjective) ToSplitObjective() split.SplitObjective {
 	switch obj {
 	case LBRebalancingQueries:
-		return split.SplitQPS
+		return split.SplitQPS // 按 QPS 分裂
 	case LBRebalancingCPU:
-		return split.SplitCPU
+		return split.SplitCPU // 按 CPU 使用率分裂
 	default:
-		panic(fmt.Sprintf("unknown objective %d", obj))
+		panic("unknown objective")
 	}
 }
 

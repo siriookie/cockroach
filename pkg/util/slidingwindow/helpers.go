@@ -5,7 +5,10 @@
 
 package slidingwindow
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // NewMaxSwag returns a sliding window aggregator with a maximum aggregator.
 func NewMaxSwag(now time.Time, interval time.Duration, size int) *Swag {
@@ -13,11 +16,6 @@ func NewMaxSwag(now time.Time, interval time.Duration, size int) *Swag {
 		now,
 		interval,
 		size,
-		func(acc, val float64) float64 {
-			if acc > val {
-				return acc
-			}
-			return val
-		},
+		math.Max,
 	)
 }

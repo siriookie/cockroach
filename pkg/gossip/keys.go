@@ -51,6 +51,7 @@ const (
 	// else the node considers itself partitioned and will retry with
 	// bootstrap hosts.  The sentinel is gossiped by the node that holds
 	// the range lease for the first range.
+	//Gossip网络中用于检测网络健康状况的特殊信息
 	KeySentinel = "sentinel"
 
 	// KeyFirstRangeDescriptor is the descriptor for the "first" range. The

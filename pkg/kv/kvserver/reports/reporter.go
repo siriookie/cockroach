@@ -111,18 +111,33 @@ func (stats *Reporter) reportInterval() (time.Duration, <-chan struct{}) {
 	return ReporterInterval.Get(&stats.settings.SV), stats.frequencyMu.changeCh
 }
 
-// Start the periodic calls to Update().
+// Start 函数启动后台周期性任务，生成并持久化集群范围的复制报告。
+//
+// 核心作用：
+// 1. 集群协调：该任务在所有节点上运行，但只有持有 Meta 1 Range 租约（Leaseholder）的节点才会实际执行报告生成逻辑。
+//    这保证了整个集群只有一个节点在做这份工作，避免了资源浪费和写冲突。
+// 2. 动态调节：支持通过集群设置 `kv.replication_reports.interval` 动态调整报告生成的频率（支持即时生效）。
+// 3. 多样化报告：一次运行会生成三种关键报告：复制约束统计、复制状态汇总、以及关键局部性分析。
+//
+// 例子：
+// - 默认情况下，每分钟运行一次。
+// - 节点 A 是 Meta 1 的租约持有者。当定时器触发时，节点 A 会扫描集群中所有的 Range，
+//   检查它们的副本健康状况、是否违反了 Zone Config 约束。
+// - 如果节点 A 突然关机，Meta 1 的租约会转移到节点 B。随后节点 B 的 `Start` 循环
+//   会检测到自己成为了 Leaseholder，并接替节点 A 继续按周期生成报告。
 func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
+	// 监听集群设置的变更。
 	ReporterInterval.SetOnChange(&stats.settings.SV, func(ctx context.Context) {
 		stats.frequencyMu.Lock()
 		defer stats.frequencyMu.Unlock()
-		// Signal the current waiter (if any), and prepare the channel for future
-		// ones.
+		// 关闭旧通道并创建新通道，以通知正在 select 等待的 goroutine 立即醒来检查新间隔。
 		ch := stats.frequencyMu.changeCh
 		close(ch)
 		stats.frequencyMu.changeCh = make(chan struct{})
 		stats.frequencyMu.interval = ReporterInterval.Get(&stats.settings.SV)
 	})
+
+	// 启动异步后台任务。
 	_ = stopper.RunAsyncTask(ctx, "stats-reporter", func(ctx context.Context) {
 		ctx = logtags.AddTag(ctx, "replication-reporter", nil /* value */)
 		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
@@ -131,35 +146,33 @@ func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 		var timer timeutil.Timer
 		defer timer.Stop()
 
+		// 初始化三份报告的持久化工具（Saver）。
 		replStatsSaver := makeReplicationStatsReportSaver()
 		constraintsSaver := makeReplicationConstraintStatusReportSaver()
 		criticalLocSaver := makeReplicationCriticalLocalitiesReportSaver()
 
 		for {
-			// Read the interval setting. We'll generate a report and then sleep for
-			// that long. We'll also wake up if the setting changes; that's useful for
-			// tests which want to lower the setting drastically and expect the report
-			// to be regenerated quickly, and also for users increasing the frequency.
+			// 获取当前的报告间隔时长和变更通知通道。
 			interval, changeCh := stats.reportInterval()
 
 			var timerCh <-chan time.Time
 			if interval != 0 {
-				// If (some store on) this node is the leaseholder for range 1, do the
-				// work.
+				// 关键点：检查本节点是否是 Meta 1 (Range 1) 的租约持有者。
 				stats.meta1LeaseHolder = stats.meta1LeaseHolderStore(ctx)
 				if stats.meta1LeaseHolder != nil {
+					// 只有 Leaseholder 才会调用 update 执行实际的扫描和计算工作。
 					if err := stats.update(
 						ctx, &constraintsSaver, &replStatsSaver, &criticalLocSaver,
 					); err != nil {
 						log.KvDistribution.Errorf(ctx, "failed to generate replication reports: %s", err)
 					}
 				}
+				// 重置定时器。
 				timer.Reset(interval)
 				timerCh = timer.C
 			}
 
-			// Wait until the timer expires (if there's a timer) or until there's an
-			// update to the frequency setting.
+			// 等待下一次运行：可以是定时器到期、设置被修改、或者服务器关闭。
 			select {
 			case <-timerCh:
 			case <-changeCh:

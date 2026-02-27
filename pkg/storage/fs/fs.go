@@ -513,6 +513,23 @@ func (e *Env) GetDiskUsage(path string) (vfs.DiskUsage, error) {
 // CreateWithSync creates a file wrapped with logic to periodically sync
 // whenever more than bytesPerSync bytes accumulate. This syncing does not
 // provide any persistency guarantees, but can prevent latency spikes.
+// CreateWithSync 返回的文件会：
+// - 每写入 bytesPerSync 字节后自动调用 Sync()
+// - 平滑磁盘写入压力（避免大量数据积压在 page cache）
+// 为什么不是每次 Write() 都调用 Sync()？
+// 策略
+// 优点
+// 缺点
+// 每次 Write 都 Sync
+// 最强持久性
+// 性能极差（系统调用开销）
+// 定期 Sync
+// 平衡性能和持久性
+// 需要额外逻辑
+// 只在 Finish 时 Sync
+// 性能最佳
+// 写入压力集中
+// CockroachDB 选择定期 Sync（通过 bytesPerSync 控制），测试用例中使用 512 KB
 func CreateWithSync(
 	fs vfs.FS, name string, bytesPerSync int, category vfs.DiskWriteCategory,
 ) (vfs.File, error) {

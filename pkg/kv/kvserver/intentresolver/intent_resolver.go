@@ -174,28 +174,32 @@ type RangeCache interface {
 type IntentResolver struct {
 	Metrics Metrics
 
+	// 全局依赖
 	clock        *hlc.Clock
-	db           *kv.DB
+	db           *kv.DB // 发送 ResolveIntent RPC
 	stopper      *stop.Stopper
 	testingKnobs kvserverbase.IntentResolverTestingKnobs
 	settings     *cluster.Settings
 	ambientCtx   log.AmbientContext
-	sem          *quotapool.IntPool // semaphore to limit async goroutines
-
+	// 并发控制
+	sem *quotapool.IntPool // 限制异步任务数量（默认 1000）
 	rdc RangeCache
 
-	gcBatcher      *requestbatcher.RequestBatcher
-	irBatcher      *requestbatcher.RequestBatcher
-	irRangeBatcher *requestbatcher.RequestBatcher
+	// 批量处理器（核心优化）
+	gcBatcher      *requestbatcher.RequestBatcher // GC 事务记录
+	irBatcher      *requestbatcher.RequestBatcher // 单点 Intent 解析
+	irRangeBatcher *requestbatcher.RequestBatcher // Range Intent 解析
 
 	mu struct {
 		syncutil.Mutex
 		// Map from txn ID being pushed to a refcount of requests waiting on the
 		// push.
+		// 防止并发 Push 同一事务
 		inFlightPushes map[uuid.UUID]int
 		// Set of txn IDs whose list of lock spans are being resolved. Note
 		// that this pertains only to EndTxn-style lock cleanups, whether
 		// called directly after EndTxn evaluation or during GC of txn spans.
+		// 防止并发清理同一事务的 Intent
 		inFlightTxnCleanups map[uuid.UUID]struct{}
 	}
 	every                       log.EveryN
@@ -264,12 +268,13 @@ func New(c Config) *IntentResolver {
 	if c.TestingKnobs.MaxIntentResolutionBatchSize > 0 {
 		gcBatchSize = c.TestingKnobs.MaxGCBatchSize
 	}
+	// 创建三个 RequestBatcher（核心优化）
 	ir.gcBatcher = requestbatcher.New(requestbatcher.Config{
 		AmbientCtx:      c.AmbientCtx,
 		Name:            "intent_resolver_gc_batcher",
-		MaxMsgsPerBatch: gcBatchSize,
-		MaxWait:         c.MaxGCBatchWait,
-		MaxIdle:         c.MaxGCBatchIdle,
+		MaxMsgsPerBatch: gcBatchSize,      // 1024
+		MaxWait:         c.MaxGCBatchWait, // 1s
+		MaxIdle:         c.MaxGCBatchIdle, // -1 (disabled)
 		MaxTimeout:      intentResolutionSendBatchTimeout,
 		// NB: async GC work is not limited by ir.sem, so we do need an in-flight
 		// backpressure limit.
@@ -290,10 +295,10 @@ func New(c Config) *IntentResolver {
 	ir.irBatcher = requestbatcher.New(requestbatcher.Config{
 		AmbientCtx:                c.AmbientCtx,
 		Name:                      "intent_resolver_ir_batcher",
-		MaxMsgsPerBatch:           intentResolutionBatchSize,
-		TargetBytesPerBatchReq:    intentResolverRequestTargetBytes,
-		MaxWait:                   c.MaxIntentResolutionBatchWait,
-		MaxIdle:                   c.MaxIntentResolutionBatchIdle,
+		MaxMsgsPerBatch:           intentResolutionBatchSize,        // 100
+		TargetBytesPerBatchReq:    intentResolverRequestTargetBytes, // 4MB
+		MaxWait:                   c.MaxIntentResolutionBatchWait,   // 10ms
+		MaxIdle:                   c.MaxIntentResolutionBatchIdle,   // 5ms
 		MaxTimeout:                intentResolutionSendBatchTimeout,
 		InFlightBackpressureLimit: inFlightLimit.limit,
 		Stopper:                   c.Stopper,
@@ -302,10 +307,10 @@ func New(c Config) *IntentResolver {
 	ir.irRangeBatcher = requestbatcher.New(requestbatcher.Config{
 		AmbientCtx:                c.AmbientCtx,
 		Name:                      "intent_resolver_ir_range_batcher",
-		MaxMsgsPerBatch:           intentResolutionRangeBatchSize,
-		MaxKeysPerBatchReq:        intentResolverRangeRequestSize,
-		TargetBytesPerBatchReq:    intentResolverRequestTargetBytes,
-		MaxWait:                   c.MaxIntentResolutionBatchWait,
+		MaxMsgsPerBatch:           intentResolverRangeBatchSize,     // 10
+		MaxKeysPerBatchReq:        intentResolverRangeRequestSize,   // 200
+		TargetBytesPerBatchReq:    intentResolverRequestTargetBytes, // 4MB
+		MaxWait:                   c.MaxIntentResolutionBatchWait,   // 10ms
 		MaxIdle:                   c.MaxIntentResolutionBatchIdle,
 		MaxTimeout:                intentResolutionSendBatchTimeout,
 		InFlightBackpressureLimit: inFlightLimit.limit,
@@ -660,15 +665,25 @@ func (ir *IntentResolver) CleanupTxnIntentsAsync(
 		}
 		et := &endTxns[i] // copy for goroutine
 		if err := ir.runAsyncTask(ctx, allowSyncProcessing, func(ctx context.Context) {
+			// 1. 锁定事务清理（防止并发重复）
 			locked, release := ir.lockInFlightTxnCleanup(ctx, et.Txn.ID)
 			if !locked {
-				return
+				return // 已有其他 goroutine 在清理
 			}
 			defer release()
+			// 2. 执行清理
 			if err := ir.cleanupFinishedTxnIntents(
 				// The admission header is constructed using the completed
 				// transaction.
-				ctx, kv.AdmissionHeaderForLockUpdateForTxn(et.Txn), rangeID, et.Txn, et.Poison, onComplete,
+				//当你传：
+				//poison = true
+				//含义是：
+				//在清理 Intent 的同时，把这个事务“写进 AbortSpan”
+				ctx, kv.AdmissionHeaderForLockUpdateForTxn(et.Txn),
+				rangeID,
+				et.Txn,
+				et.Poison, /* 是否毒化 abort span .防止“僵尸事务 / 旧 coordinator”重新回来提交*/
+				onComplete,
 			); err != nil {
 				if ir.every.ShouldLog() {
 					log.KvExec.Warningf(ctx, "failed to cleanup transaction intents: %v", err)
@@ -686,16 +701,20 @@ func (ir *IntentResolver) CleanupTxnIntentsAsync(
 // to cleanup the intents belonging to the specified transaction. Returns
 // whether this attempt to lock succeeded and if so, a function to release
 // the lock, to be invoked subsequently by the caller.
+// - **目的**：防止同一事务的 Intent 被多次清理
+// - **场景**：EndTxn 和 MVCC GC Queue 可能同时尝试清理
 func (ir *IntentResolver) lockInFlightTxnCleanup(
 	ctx context.Context, txnID uuid.UUID,
 ) (locked bool, release func()) {
 	ir.mu.Lock()
 	defer ir.mu.Unlock()
+	// 检查是否已有清理任务
 	_, inFlight := ir.mu.inFlightTxnCleanups[txnID]
 	if inFlight {
 		log.Eventf(ctx, "skipping txn resolved; already in flight")
 		return false, nil
 	}
+	// 加锁
 	ir.mu.inFlightTxnCleanups[txnID] = struct{}{}
 	return true, func() {
 		ir.mu.Lock()
@@ -866,8 +885,12 @@ func (ir *IntentResolver) cleanupFinishedTxnIntents(
 		}
 	}()
 	// Resolve intents.
+	// 1. 解析所有 Intent
 	opts := ResolveOptions{
-		Poison: poison, MinTimestamp: txn.MinTimestamp, AdmissionHeader: admissionHeader}
+		Poison:          poison,
+		MinTimestamp:    txn.MinTimestamp, // 优化 Range 查询
+		AdmissionHeader: admissionHeader,
+	}
 	if pErr := ir.resolveIntents(ctx, (*txnLockUpdates)(txn), opts); pErr != nil {
 		return errors.Wrapf(pErr.GoError(), "failed to resolve intents")
 	}
@@ -877,6 +900,7 @@ func (ir *IntentResolver) cleanupFinishedTxnIntents(
 	// gcTxnRecord completes, which may cancel the context and abort the cleanup
 	// either due to a defer cancel() or client disconnection. We give it a timeout
 	// as well, to avoid goroutine leakage.
+	// 2. 启动新 goroutine GC 事务记录（与 Intent 解析分离）
 	ctx, hdl, err := ir.stopper.GetHandle(ir.ambientCtx.AnnotateCtx(context.Background()), stop.TaskOpts{
 		TaskName: "storage.IntentResolver: cleanup txn records",
 	})
@@ -1063,7 +1087,7 @@ func (ir *IntentResolver) resolveIntents(
 	log.Eventf(ctx, "resolving %d intents", intents.Len())
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
+	// 1. 构造请求
 	// Construct a slice of requests to send.
 	var singleReq [1]kvpb.Request //gcassert:noescape
 	reqs := resolveIntentReqs(intents, opts, singleReq[:])
@@ -1079,7 +1103,9 @@ func (ir *IntentResolver) resolveIntents(
 			"test-only warning: if you see this, please report to https://github.com/cockroachdb/cockroach/issues/112680. empty admission header provided by %s", debugutil.Stack())
 	}
 	// Send the requests ...
+	// 2. 选择执行路径
 	if opts.sendImmediately {
+		// 路径 A：立即发送（延迟敏感）
 		bypassAdmission := sendImmediatelyBypassAdmissionControl.Get(&ir.settings.SV)
 		if bypassAdmission {
 			h = kv.AdmissionHeaderForBypass(h)
@@ -1093,6 +1119,7 @@ func (ir *IntentResolver) resolveIntents(
 		}
 		return nil
 	}
+	// 路径 B：使用 Batcher（吞吐优先）
 	// ... using their corresponding request batcher.
 	respChan := make(chan requestbatcher.Response, len(reqs))
 	batcherBypassAdmission := batchBypassAdmissionControl.Get(&ir.settings.SV)
@@ -1109,12 +1136,14 @@ func (ir *IntentResolver) resolveIntents(
 		default:
 			panic("unexpected")
 		}
+		// 3. 查询 RangeID（用于批量优化）
 		rangeID := ir.lookupRangeID(ctx, req.Header().Key)
 		if err := batcher.SendWithChan(ctx, respChan, rangeID, req, h); err != nil {
 			return kvpb.NewError(err)
 		}
 	}
 	// Collect responses.
+	// 5. 收集响应
 	for range reqs {
 		select {
 		case resp := <-respChan:

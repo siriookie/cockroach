@@ -149,30 +149,68 @@ func (sg *slotGranter) tryGrantLocked(grantChainID grantChainID) grantResult {
 }
 
 //gcassert:inline
-func (sg *slotGranter) setTotalSlotsLocked(totalSlots int) {
-	// Mid-stack inlining.
-	if totalSlots == sg.totalSlots {
-		return
-	}
-	sg.setTotalSlotsLockedInternal(totalSlots)
-}
-
 func (sg *slotGranter) setTotalSlotsLockedInternal(totalSlots int) {
+	// ============================================================
+	// 分支 1: slots 增加
+	// ============================================================
 	if totalSlots > sg.totalSlots {
-		// 增加槽位
+		// 检查: 是否从耗尽状态恢复？
+		//
+		// 条件:
+		// - 旧值: totalSlots ≤ usedSlots (耗尽)
+		// - 新值: totalSlots > usedSlots (有余量)
 		if sg.totalSlots <= sg.usedSlots && totalSlots > sg.usedSlots {
-			// 从耗尽状态恢复
+			// 计算耗尽持续时间
 			now := timeutil.Now()
 			exhaustedMicros := now.Sub(sg.exhaustedStart).Microseconds()
+
+			// 累计到 metric
+			//这个 metric 回答了一个关键问题:
+			//"系统有多少时间处于 slot 耗尽状态？"
+			//
+			//用途:
+			//1. 容量规划: exhaustedDuration 高 → 需要增加节点
+			//2. 调优: exhaustedDuration 低 → 可以降低 maxCPUSlots
+			//3. 告警: exhaustedDuration 突增 → 可能有异常负载
+			//
+			//示例:
+			//    1 小时 = 3,600,000,000μs
+			//    slotsExhaustedDuration = 360,000,000μs
+			//    → 耗尽比例 = 10%
+			//    → 系统 10% 的时间处于 slot 饱和状态
 			sg.slotsExhaustedDurationMetric.Inc(exhaustedMicros)
+
+			// 示例:
+			// T=0: totalSlots=50, usedSlots=50, exhaustedStart=T0
+			// T=10ms: totalSlots→51, usedSlots=50
+			// → exhaustedMicros = 10,000μs
+			// → slotsExhaustedDurationMetric += 10,000
 		}
+
+		// ============================================================
+		// 分支 2: slots 减少
+		// ============================================================
 	} else if totalSlots < sg.totalSlots {
-		// 减少槽位
+		// 检查: 是否进入耗尽状态？
+		//
+		// 条件:
+		// - 旧值: totalSlots > usedSlots (有余量)
+		// - 新值: totalSlots ≤ usedSlots (耗尽)
 		if sg.totalSlots > sg.usedSlots && totalSlots <= sg.usedSlots {
+			// 记录耗尽开始时间
 			sg.exhaustedStart = timeutil.Now()
+
+			// 示例:
+			// T=0: totalSlots=51, usedSlots=50
+			// T=1ms: totalSlots→50, usedSlots=50
+			// → 进入耗尽状态
+			// → exhaustedStart = T1
 		}
 	}
 
+	// ============================================================
+	// 最终: 更新 totalSlots
+	// ============================================================
 	sg.totalSlots = totalSlots
 }
 
@@ -336,7 +374,7 @@ type kvStoreTokenGranter struct {
 		// 常规工作：availableIOTokens[RegularWorkClass] > 0
 		// 弹性工作：availableIOTokens[ElasticWorkClass] > 0
 		availableIOTokens            [admissionpb.NumWorkClasses]int64
-		elasticIOTokensUsedByElastic int64
+		elasticIOTokensUsedByElastic int64 // Elastic 专用（进一步限制弹性工作）
 		// TODO(aaditya): add support for read/IOPS tokens.
 		// Disk bandwidth tokens.
 		// 磁盘带宽令牌
@@ -490,6 +528,8 @@ func (sg *kvStoreTokenGranter) tryGetLocked(count int64, wt admissionpb.StoreWor
 	if wt != admissionpb.SnapshotIngestStoreWorkType {
 		// Snapshot ingests do not incur the write amplification described above, so
 		// we skip applying the model for those writes.
+		// 写放大模型：实际磁盘写入 = 逻辑写入 * 放大系数
+		// 例如：count=100, writeAmpLM=10x+1 → diskWriteTokens=1001
 		diskWriteTokens = sg.mu.writeAmpLM.applyLinearModel(count)
 	}
 	//**三种工作类型的令牌需求**：

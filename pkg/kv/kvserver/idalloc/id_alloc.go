@@ -20,7 +20,11 @@ import (
 )
 
 // Incrementer abstracts over the database which holds the key counter.
-type Incrementer func(_ context.Context, _ roachpb.Key, inc int64) (updated int64, _ error)
+type Incrementer func(
+	ctx context.Context,
+	key roachpb.Key,
+	inc int64, // 递增量
+) (updated int64, _ error) // 返回递增后的值
 
 // DBIncrementer wraps a suitable subset of *kv.DB for use with an allocator.
 func DBIncrementer(
@@ -33,28 +37,28 @@ func DBIncrementer(
 		if err != nil {
 			return 0, err
 		}
-		return res.Value.GetInt()
+		return res.Value.GetInt() // 从 KV 结果中提取 int64
 	}
 }
 
 // Options are the options passed to NewAllocator.
 type Options struct {
 	AmbientCtx  log.AmbientContext
-	Key         roachpb.Key
-	Incrementer Incrementer
-	BlockSize   int64
-	Stopper     *stop.Stopper
-	Fatalf      func(context.Context, string, ...interface{}) // defaults to log.KvExec.Fatalf
+	Key         roachpb.Key                                   // 计数器的 KV 键（如 keys.RangeIDGenerator）
+	Incrementer Incrementer                                   // 原子递增函数（通常是 db.Inc）
+	BlockSize   int64                                         // 每次批量获取的 ID 数量（默认 10）
+	Stopper     *stop.Stopper                                 // 用于优雅停止
+	Fatalf      func(context.Context, string, ...interface{}) // defaults to log.KvExec.Fatalf  // 致命错误处理（默认 log.KvExec.Fatalf）
 }
 
 // An Allocator is used to increment a key in allocation blocks of arbitrary
 // size.
 type Allocator struct {
 	log.AmbientContext
-	opts Options
+	opts Options // 配置选项
 
-	ids  chan int64 // Channel of available IDs
-	once sync.Once
+	ids  chan int64 // Channel of available IDs // 可用 ID 的缓冲池（核心！）
+	once sync.Once  // 确保后台任务只启动一次
 }
 
 // NewAllocator creates a new ID allocator which increments the specified key in

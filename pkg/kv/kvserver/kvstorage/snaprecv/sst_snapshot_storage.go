@@ -39,6 +39,25 @@ type SSTSnapshotStorage struct {
 }
 
 // NewSSTSnapshotStorage creates a new SST snapshot storage.
+// **输入**：
+// - `engine storage.Engine`：Pebble 存储引擎实例
+// - `limiter *rate.Limiter`：全局 IO 速率限制器
+//
+// **输出**：
+// - `SSTSnapshotStorage` 结构体（**注意不是指针**）
+//
+// **关键点 1：为什么返回值不是指针？**
+//
+// ```go
+// // store.go 中的使用
+// s.sstSnapshotStorage = snaprecv.NewSSTSnapshotStorage(...)
+// ```
+//
+// 这是 Go 的一个常见模式：
+// - 返回结构体值（而不是指针）可以避免堆分配
+// - SSTSnapshotStorage 结构体本身很小（3 个字段 + 一个嵌套结构体）
+// - 由于 rangeRefCount 是 map（引用类型），实际的 map 数据仍然在堆上
+// - 这种设计在拷贝开销小且需要值语义时很常见
 func NewSSTSnapshotStorage(engine storage.Engine, limiter *rate.Limiter) SSTSnapshotStorage {
 	return SSTSnapshotStorage{
 		env:     engine.Env(),
@@ -56,10 +75,22 @@ func NewSSTSnapshotStorage(engine storage.Engine, limiter *rate.Limiter) SSTSnap
 func (s *SSTSnapshotStorage) NewScratchSpace(
 	rangeID roachpb.RangeID, snapUUID uuid.UUID, st *cluster.Settings,
 ) *SSTSnapshotStorageScratch {
+	// Step 1: 增加引用计数（加锁保护）
 	s.mu.Lock()
+	//为什么不能使用 atomic.AddInt32？
+	//// ❌ 错误示例
+	//atomic.AddInt32(&s.mu.rangeRefCount[rangeID], 1)
+	//​
+	//问题：
+	//- map[...]int 不是线程安全的
+	//- 即使每个元素用原子操作，map 本身的增删也需要锁
 	s.mu.rangeRefCount[rangeID]++
 	s.mu.Unlock()
+	// Step 2: 构造快照专属目录路径
 	snapDir := filepath.Join(s.dir, strconv.Itoa(int(rangeID)), snapUUID.String())
+	// 例如：/data/auxiliary/sstsnapshot/123/550e8400-e29b-41d4-a716-446655440000
+	// Step 3: 返回 Scratch 对象（此时目录尚未创建）
+	//返回的 scratch 对象的 dirCreated 为 false
 	return &SSTSnapshotStorageScratch{
 		storage: s,
 		st:      st,
@@ -80,17 +111,21 @@ func (s *SSTSnapshotStorage) Clear() error {
 func (s *SSTSnapshotStorage) scratchClosed(rangeID roachpb.RangeID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Step 1: 减少引用计数
 	val := s.mu.rangeRefCount[rangeID]
 	if val <= 0 {
 		panic("inconsistent scratch ref count")
 	}
 	val--
 	s.mu.rangeRefCount[rangeID] = val
+	// Step 2: 如果没有更多活跃快照，清理 Range 目录
 	if val == 0 {
 		delete(s.mu.rangeRefCount, rangeID)
 		// Suppressing an error here is okay, as orphaned directories are at worst
 		// a performance issue when we later walk directories in pebble.Capacity()
 		// but not a correctness issue.
+		// 删除 Range 目录（抑制错误）
+		// 注释：孤儿目录最多影响 pebble.Capacity() 性能，不影响正确性
 		_ = s.env.RemoveAll(filepath.Join(s.dir, strconv.Itoa(int(rangeID))))
 	}
 }
@@ -129,9 +164,14 @@ func (s *SSTSnapshotStorageScratch) NewFile(
 	if s.closed {
 		return nil, errors.AssertionFailedf("SSTSnapshotStorageScratch closed")
 	}
+	// 分配文件 ID（从 0 开始递增）
+
 	id := len(s.ssts)
-	filename := s.filename(id)
+	filename := s.filename(id) // {snapDir}/{id}.sst
+	// 追加到文件列表（即使文件尚未创建）
 	s.ssts = append(s.ssts, filename)
+	// 返回 File 对象
+
 	f := &SSTSnapshotStorageFile{
 		scratch:      s,
 		filename:     filename,
@@ -184,9 +224,11 @@ func (s *SSTSnapshotStorageScratch) SSTs() []string {
 func (s *SSTSnapshotStorageScratch) Close() error {
 	if s.closed {
 		return nil
-	}
+	} // 幂等性：重复关闭不报错
 	s.closed = true
+	// Step 1: 通知父对象（引用计数 -1）
 	defer s.storage.scratchClosed(s.rangeID)
+	// Step 2: 删除快照目录（包括所有 SST 文件）
 	return s.storage.env.RemoveAll(s.snapDir)
 }
 
@@ -194,22 +236,28 @@ func (s *SSTSnapshotStorageScratch) Close() error {
 // SSTSnapshotStorageScratch.
 type SSTSnapshotStorageFile struct {
 	scratch      *SSTSnapshotStorageScratch
-	created      bool
-	file         vfs.File
-	filename     string
+	created      bool     // 延迟创建标记
+	file         vfs.File // Pebble 的虚拟文件系统接口
+	filename     string   // 文件路径：{snapDir}/{id}.sst
 	ctx          context.Context
-	bytesPerSync int64
+	bytesPerSync int64 // 每写入 N 字节后调用 Sync()（平滑 IO）
 }
 
 var _ objstorage.Writable = (*SSTSnapshotStorageFile)(nil)
 
+// 首次写入时：
+// - scratch.dirCreated 变为 true
+// - 磁盘上创建目录：/data/auxiliary/sstsnapshot/123/snap-123/
+// - 磁盘上创建文件：/data/auxiliary/sstsnapshot/123/snap-123/0.sst
+// - file.created 变为 true
 func (f *SSTSnapshotStorageFile) ensureFile() error {
 	if f.created {
 		if f.file == nil {
 			return errors.Errorf("file has already been closed")
 		}
-		return nil
+		return nil // 已创建，直接返回
 	}
+	// Step 1: 如果目录未创建，先创建目录
 	if !f.scratch.dirCreated {
 		if err := f.scratch.createDir(); err != nil {
 			return err
@@ -219,9 +267,12 @@ func (f *SSTSnapshotStorageFile) ensureFile() error {
 		return errors.AssertionFailedf("SSTSnapshotStorageScratch closed")
 	}
 	var err error
+	// Step 2: 创建文件
 	if f.bytesPerSync > 0 {
+		// 使用同步写入（定期调用 Sync）
 		f.file, err = fs.CreateWithSync(f.scratch.storage.env, f.filename, int(f.bytesPerSync), fs.RaftSnapshotWriteCategory)
 	} else {
+		// 普通写入
 		f.file, err = f.scratch.storage.env.Create(f.filename, fs.RaftSnapshotWriteCategory)
 	}
 	if err != nil {
@@ -240,28 +291,42 @@ func (f *SSTSnapshotStorageFile) StartMetadataPortion() error { return nil }
 func (f *SSTSnapshotStorageFile) Write(contents []byte) error {
 	if len(contents) == 0 {
 		return nil
-	}
+	} // 空写入不触发创建
+	// Step 1: 确保文件已创建
 	if err := f.ensureFile(); err != nil {
 		return err
 	}
+	// Step 2: 速率限制（关键！）
 	if err := kvserverbase.LimitBulkIOWrite(f.ctx, f.scratch.storage.limiter, len(contents)); err != nil {
-		return err
+		return err // 返回 context.Canceled 或速率限制错误
 	}
 	// Write always returns an error if it can't write all the contents.
+	// Step 3: 实际写入
 	_, err := f.file.Write(contents)
 	return err
 }
 
 // Finish is part of the objstorage.Writable interface.
+// **状态变化**：
+// - 文件数据落盘（持久化）
+// - `f.file` 设置为 `nil`（防止重复关闭）
+//
+// **关键点**：
+// - 如果 `Finish()` 返回错误，上层逻辑会调用 `scratch.Close()` 清理所有文件
+// - 空文件检查确保不会生成无效的 SST（Pebble 无法 ingest 空 SST）
 func (f *SSTSnapshotStorageFile) Finish() error {
 	// We throw an error for empty files because it would be an error to ingest
 	// an empty SST so catch this error earlier.
+	// 检查：空文件是错误的（SST 必须包含数据）
 	if !f.created {
 		return errors.New("file is empty")
 	}
+	// Step 1: 同步数据到磁盘
 	errSync := f.file.Sync()
+	// Step 2: 关闭文件句柄
 	errClose := f.file.Close()
 	f.file = nil
+	// Step 3: 返回错误（优先返回 Sync 错误）
 	if errSync != nil {
 		return errSync
 	}

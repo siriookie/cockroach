@@ -198,9 +198,27 @@ func (k EngineKey) Validate() error {
 	return errMVCC
 }
 
-// DecodeEngineKey decodes the given bytes as an EngineKey. If the caller
-// already knows that the key is an MVCCKey, the Version returned is the
-// encoded timestamp.
+// DecodeEngineKey 的作用：将引擎层存储的原始字节切片（[]byte）解码为结构化的 EngineKey。
+// 
+// 核心逻辑：
+// CockroachDB 在存储引擎（如 Pebble）中存储的键采用了特殊的编码格式，以支持高效的 Prefix Bloom Filter：
+// 格式：[原始 Key 字节] + [0x00 分隔符] + [可选的 Version 字节] + [1 字节的标记位]
+// 标记位的值 = Version 长度 + 1（如果没有 Version，则标记位为 0）。
+//
+// 例子：
+// 假设我们有一个 MVCC Key，其原始 Key 为 "user1"，版本（时间戳）编码后为 8 字节。
+// 1. 编码后的字节序列可能长这样：[ 'u', 's', 'e', 'r', '1', 0x00, v1, v2, v3, v4, v5, v6, v7, v8, 0x09 ]
+//    - 最后的 0x09 表示：Version 长度 (8) + 1 = 9。
+// 2. 调用 DecodeEngineKey 后，返回：
+//    - key.Key: "user1"
+//    - key.Version: [v1, v2, ..., v8]
+//    - ok: true
+//
+// 如果输入是 [ 't', 'e', 's', 't', 0x00, 0x00 ]：
+//    - 最后的 0x00 表示没有 Version。
+//    - key.Key: "test"
+//    - key.Version: nil
+//    - ok: true
 func DecodeEngineKey(b []byte) (key EngineKey, ok bool) {
 	if len(b) == 0 {
 		return EngineKey{}, false

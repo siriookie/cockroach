@@ -19,6 +19,9 @@ import (
 // LoadedReplicaState represents the state of a Replica loaded from storage, and
 // is used to initialize the in-memory Replica instance.
 // TODO(pavelkalinnikov): integrate with kvstorage.Replica.
+// - **生命周期**：瞬态，从 `Replica.Load()` 返回后立即用于初始化 `kvserver.Replica`
+// - **作用域**：传递给 `kvserver.Replica` 的初始化参数
+// - **语义**：**完整的 Replica 状态**，包含所有必要的字段
 type LoadedReplicaState struct {
 	ReplicaID   roachpb.ReplicaID
 	LastEntryID logstore.EntryID
@@ -75,6 +78,7 @@ func (r LoadedReplicaState) FullReplicaID() roachpb.FullReplicaID {
 }
 
 // check makes sure that the replica invariants hold for the loaded state.
+// 其核心作用是：在数据从磁盘加载到内存后，进行“生存校验”，确保该副本的数据没损坏且真的属于当前节点。
 func (r LoadedReplicaState) check(storeID roachpb.StoreID) error {
 	desc := r.ReplState.Desc
 	if r.ReplicaID == 0 {
@@ -85,6 +89,11 @@ func (r LoadedReplicaState) check(storeID roachpb.StoreID) error {
 		// An uninitialized replica must have an empty HardState.Commit at all
 		// times. Failure to maintain this invariant indicates corruption. And yet,
 		// we have observed this in the wild. See #40213.
+		//针对那些尚未初始化（即只有 RangeID，还没有同步到数据的“空壳”副本）的检查：
+		//
+		//代码：if !desc.IsInitialized() { if hs.Commit != 0 { ... } }
+		//逻辑：对于一个没初始化的副本，它的 Raft 硬状态（HardState）中的 Commit 索引必须是 0。
+		//原因：如果你还没拿到数据（未初始化），但磁盘上却记录你已经提交了某些日志，这说明状态机发生了混乱或磁盘数据出现了非法篡改（Corruption）。
 		if hs := r.hardState; hs.Commit != 0 {
 			return errors.AssertionFailedf(
 				"r%d/%d: non-zero HardState.Commit on uninitialized replica: %+v", desc.RangeID, r.ReplicaID, hs)

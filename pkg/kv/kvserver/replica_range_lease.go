@@ -1260,6 +1260,20 @@ func (s *Store) rangeLeaseAcquireTimeout() time.Duration {
 // redirectOnOrAcquireLeaseForRequest is like redirectOnOrAcquireLease,
 // but it accepts a specific request timestamp instead of assuming that
 // the request is operating at the current time.
+// 1. 检查当前 lease 状态:
+//   - 如果已持有 → 返回
+//   - 如果属于其他 Store → 返回 NotLeaseHolderError
+//   - 如果过期 → 继续
+//
+// 2. 发送 RequestLease Raft 提议:
+//   - 构造 Lease 对象
+//   - 提交到 Raft
+//   - 等待应用
+//
+// 3. 可能的结果:
+//   - 成功: 获得 lease
+//   - 失败: NotLeaseHolderError (其他 Store 抢先)
+//   - 失败: RangeNotFoundError (Range 已不存在)
 func (r *Replica) redirectOnOrAcquireLeaseForRequest(
 	ctx context.Context, reqTS hlc.Timestamp, brSig signaller,
 ) (status kvserverpb.LeaseStatus, pErr *kvpb.Error) {
@@ -1543,8 +1557,23 @@ func (r *Replica) shouldRequestLeaseRLocked(
 // maybeSwitchLeaseType will synchronously renew a lease using the appropriate
 // type if it is (or was) owned by this replica and has an incorrect type. This
 // typically happens when changing kv.expiration_leases_only.enabled.
+// Expiration Lease (旧类型):
+//   - 基于时间戳过期
+//   - 需要时钟同步
+//   - 可能因为时钟偏移导致问题
+//
+// Epoch Lease (新类型):
+//   - 基于 node liveness epoch
+//   - 不依赖时钟同步
+//   - 更可靠
+//
+// 迁移策略:
+//   - 新集群: 默认使用 Epoch lease
+//   - 旧集群: 逐步从 Expiration 切换到 Epoch
+//   - 切换时机: 获取 lease 后,检查是否需要转换
 func (r *Replica) maybeSwitchLeaseType(ctx context.Context) *kvpb.Error {
-	llHandle := func() *leaseRequestHandle {
+	llHandle := func() *leaseRequest
+	Handle {
 		now := r.store.Clock().NowAsClockTimestamp()
 		// The lease status needs to be checked and requested under the same lock,
 		// to avoid an interleaving lease request changing the lease between the

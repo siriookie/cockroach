@@ -15,7 +15,7 @@ func hottestRanges(
 	state state.State, storeID state.StoreID, dim load.Dimension,
 ) []kvserver.CandidateReplica {
 	replRankings := kvserver.NewReplicaRankings()
-	accumulator := kvserver.NewReplicaAccumulator(dim)
+	accumulator := kvserver.NewReplicaAccumulator(dim) // 创建accumulator
 	// NB: This follows the actual implementation, where replicas are included
 	// regardless of whether the replica is a lease holder. These are later
 	// filtered out in the store rebalancer.

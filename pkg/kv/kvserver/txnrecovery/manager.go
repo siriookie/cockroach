@@ -32,6 +32,8 @@ type Manager interface {
 	//
 	// The method may also return a transaction in any other state if it is
 	// discovered to still be live and undergoing state transitions.
+	// ResolveIndeterminateCommit 尝试解析被遗弃在 STAGING 状态的事务
+	// 与大多数事务状态机转换不同，从 STAGING 状态转换需要全局协调
 	ResolveIndeterminateCommit(
 		context.Context, *kvpb.IndeterminateCommitError,
 	) (*roachpb.Transaction, error)

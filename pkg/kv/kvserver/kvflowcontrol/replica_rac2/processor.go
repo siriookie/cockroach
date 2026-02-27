@@ -1178,6 +1178,33 @@ type RangeControllerFactoryImpl struct {
 	knobs                      *kvflowcontrol.TestingKnobs
 }
 
+// 时间线：Store 启动阶段
+//
+// Step 1: Store.Start()
+//
+//	↓
+//
+// Step 2: 初始化 store-level 共享组件
+//
+//	├─ 创建 hlc.Clock
+//	├─ 创建 StreamTokenCounterProvider
+//	├─ 创建 Scheduler (raftScheduler)
+//	├─ 创建 SendTokenWatcher
+//	├─ 创建 Metrics (evalWaitMetrics, rangeControllerMetrics)
+//	└─ 创建 WaitForEvalConfig
+//	↓
+//
+// Step 3: 调用 NewRangeControllerFactoryImpl
+//
+//	输入：上述所有依赖
+//	输出：RangeControllerFactoryImpl 实例
+//	↓
+//
+// Step 4: 将 factory 传递给每个 Replica 的 ProcessorOptions
+//
+//	↓
+//
+// Step 5: Replica 初始化时，将 factory 保存到 processorImpl.opts.RangeControllerFactory
 func NewRangeControllerFactoryImpl(
 	clock *hlc.Clock,
 	evalWaitMetrics *rac2.EvalWaitMetrics,

@@ -65,6 +65,9 @@ type pendingLogTruncations struct {
 		//   not possible for slot 0 to be empty and slot 1 to be non-empty.
 		//   An implication is that the queue is empty iff slot 0 is empty.
 		// - If slot 0 and 1 are both non-empty, truncs[0].Index < truncs[1].Index
+		// 固定大小的队列（最多 2 个条目）
+		// truncs[0] = 最老的待截断
+		// truncs[1] = 所有后续截断的合并
 		truncs [2]pendingTruncation
 	}
 }
@@ -489,16 +492,36 @@ func (t *raftLogTruncator) durabilityAdvanced(ctx context.Context) {
 func (t *raftLogTruncator) tryEnactTruncations(
 	ctx context.Context, rangeID roachpb.RangeID, reader storage.Reader,
 ) {
+	// 1. 获取 Replica（加锁 raftMu）
 	r := t.store.acquireReplicaForTruncator(rangeID)
 	if r == nil {
 		// Not found.
+		// Replica 已被销毁或不存在
 		return
 	}
 	defer t.store.releaseReplicaForTruncator(r)
+	// 2. 获取当前截断状态
 	truncState := r.getTruncatedState()
 	pendingTruncs := r.getPendingTruncs()
 	// Remove the noop pending truncations.
+	// 3. 移除 noop 截断（已被 snapshot 超越）
 	pendingTruncs.mu.Lock()
+	//初始状态：
+	//    truncState.Index = 1000
+	//    pendingTruncs[0] = {Index: 800}   // Noop（已被超越）
+	//    pendingTruncs[1] = {Index: 1200}
+	//
+	//为什么会出现这种情况？
+	//    T0: 提议截断到 800，加入队列
+	//    T1: 等待持久化...
+	//    T2: 收到 Snapshot，直接截断到 1000
+	//        └─ truncState.Index = 1000
+	//    T3: durabilityAdvanced() 被调用
+	//        └─ 发现 pendingTruncs[0].Index (800) <= truncState.Index (1000)
+	//        └─ 这是 Noop，直接移除
+	//
+	//移除后：
+	//    pendingTruncs[0] = {Index: 1200}
 	for !pendingTruncs.isEmptyLocked() {
 		pendingTrunc := pendingTruncs.frontLocked()
 		if pendingTrunc.Index <= truncState.Index {
@@ -520,6 +543,7 @@ func (t *raftLogTruncator) tryEnactTruncations(
 	// Have some useful pending truncations.
 
 	// Use the reader to decide what is durable.
+	// 4. 读取持久化的 RaftAppliedIndex
 	stateLoader := r.getStateLoader()
 	as, err := stateLoader.LoadRangeAppliedState(ctx, reader)
 	if err != nil {
@@ -531,20 +555,23 @@ func (t *raftLogTruncator) tryEnactTruncations(
 	// enactIndex represents the index of the latest queued truncation that
 	// can be enacted. We start with -1 since it is possible that nothing can
 	// be enacted.
+	// 5. 找到可以执行的截断
 	enactIndex := -1
 	pendingTruncs.iterateLocked(func(index int, trunc pendingTruncation) {
 		if trunc.Index > as.RaftAppliedIndex {
-			return
+			return // 尚未持久化，停止
 		}
 		enactIndex = index
 	})
 	if enactIndex < 0 {
 		// Enqueue the rangeID for the future.
+		// 无法执行任何截断，重新入队等待下次
 		t.enqueueRange(rangeID)
 		return
 	}
 	// Do the truncation of persistent raft entries, specified by enactIndex
 	// (this subsumes all the preceding queued truncations).
+	// 6. 执行截断
 	batch := t.store.getEngine().NewWriteBatch()
 	defer batch.Close()
 	if err := handleTruncatedStateBelowRaftPreApply(ctx, truncState,
@@ -557,6 +584,7 @@ func (t *raftLogTruncator) tryEnactTruncations(
 	}
 	// Need to update the Replica state first. This requires iterating over all
 	// the enacted truncations.
+	// 7. 更新 Replica 状态（两阶段）
 	pendingTruncs.iterateLocked(func(index int, trunc pendingTruncation) {
 		if index <= enactIndex {
 			r.stagePendingTruncation(ctx, trunc)
@@ -568,11 +596,38 @@ func (t *raftLogTruncator) tryEnactTruncations(
 	//
 	// If the truncated log interval contains sideloaded entries, we need to sync
 	// so that the subsequent removals from the sideloaded storage are safe.
+	// 8. 提交 WriteBatch
 	sync := pendingTruncs.mu.truncs[enactIndex].hasSideloaded
+	//**为什么需要 sync**？
+	//
+	//```
+	//场景：截断的日志包含 sideloaded entries（例如 Snapshot）
+	//
+	//T0: batch.Commit(sync=false)
+	//    └─ WriteBatch 写入 memtable
+	//    └─ 但尚未 fsync
+	//
+	//T1: finalizeTruncation()
+	//    └─ 删除 sideloaded 文件（不可逆）
+	//
+	//T2: 系统崩溃
+	//
+	//T3: 重启
+	//    └─ WriteBatch 丢失（memtable 未刷盘）
+	//    └─ 截断元数据丢失
+	//    └─ 但 sideloaded 文件已删除
+	//    └─ 致命错误：Raft 认为 log 存在，但文件缺失
+	//
+	//解决方案：
+	//    如果 hasSideloaded → sync=true (强制 fsync)
+	//    └─ 保证 WriteBatch 持久化后再删除文件
+	//```
+	//
 	if err := batch.Commit(sync); err != nil {
 		log.KvExec.Fatalf(ctx, "while committing batch to truncate raft log: %+v", err)
 		return
 	}
+	// 9. 完成截断（释放 sideloaded 文件等）
 	r.finalizeTruncation(ctx)
 	// Now remove the enacted truncations. It is the same iteration as the
 	// previous one, but we do it while holding pendingTruncs.mu. Note that
@@ -580,11 +635,13 @@ func (t *raftLogTruncator) tryEnactTruncations(
 	// truncations, a concurrent thread could race and compute a lower post
 	// truncation size. We ignore this race since it seems harmless, and closing
 	// it requires a more complicated replicaForTruncator interface.
+	// 10. 从队列中移除已执行的截断
 	pendingTruncs.mu.Lock()
 	for i := 0; i <= enactIndex; i++ {
 		pendingTruncs.popLocked()
 	}
 	pendingTruncs.mu.Unlock()
+	// 11. 如果还有未执行的截断，重新入队
 	if !pendingTruncs.isEmptyLocked() {
 		t.enqueueRange(rangeID)
 	}

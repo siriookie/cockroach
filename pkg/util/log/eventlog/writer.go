@@ -102,13 +102,15 @@ func Register(
 	ambientContext log.AmbientContext,
 	settings *cluster.Settings,
 ) {
+	//检查测试钩子并确定写入模式（同步/异步）
 	var writeAsync = true
 	if testKnob != nil {
 		if eventLogKnob, ok := testKnob.(*EventLogTestingKnobs); ok {
 			writeAsync = !eventLogKnob.SyncWrites
 		}
 	}
-
+	//- 将写入器注册到全局事件日志系统
+	//- 添加关闭钩子以便服务停止时清理
 	writer := NewWriter(db, writeAsync, stopper, ambientContext, settings)
 	log.RegisterEventLogWriter(ctx, &ambientContext, writer)
 	stopper.AddCloser(stop.CloserFn(func() {

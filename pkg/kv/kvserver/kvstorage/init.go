@@ -412,13 +412,16 @@ func iterateRangeDescriptorsFromDiskHelper(
 // A Replica references a CockroachDB Replica. The data in this struct does not
 // represent the data of the Replica but is sufficient to access all of its
 // contents via additional calls to the storage engine.
+// - **生命周期**：瞬态，仅在 Store 启动时存在
+// - **作用域**：每个物理 Replica 在磁盘上有一个对应的 `Replica` 结构
+// - **语义**：**磁盘视角的 Replica**，包含足够的信息来重建内存状态
 type Replica struct {
 	RangeID   roachpb.RangeID
-	ReplicaID roachpb.ReplicaID
-	Desc      *roachpb.RangeDescriptor // nil for uninitialized Replica
+	ReplicaID roachpb.ReplicaID        //本地副本的 ID（单调递增）
+	Desc      *roachpb.RangeDescriptor // nil for uninitialized Replica,Range 的完整描述符（包括副本集）
 
-	tombstone kvserverpb.RangeTombstone
-	hardState raftpb.HardState // internal to kvstorage, see migration in LoadAndReconcileReplicas
+	tombstone kvserverpb.RangeTombstone //删除标记（指示该 Replica 已被移除）
+	hardState raftpb.HardState          //Raft 的硬状态（Term、Vote、Commit）, internal to kvstorage, see migration in LoadAndReconcileReplicas
 }
 
 // ID returns the FullReplicaID.
@@ -456,6 +459,9 @@ func (r Replica) Load(
 }
 
 // A replicaMap organizes a set of Replicas with unique RangeIDs.
+// - **生命周期**：瞬态，在 `loadReplicas` 函数内部使用
+// - **作用域**：函数局部变量
+// - **语义**：**Builder Pattern**，逐步聚合每个 RangeID 的信息
 type replicaMap map[roachpb.RangeID]Replica
 
 func (m replicaMap) getOrMake(rangeID roachpb.RangeID) Replica {

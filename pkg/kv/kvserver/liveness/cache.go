@@ -175,6 +175,12 @@ func (c *Cache) maybeUpdate(ctx context.Context, newLivenessRec Record) {
 
 // livenessChanged checks to see if the new liveness is in fact newer
 // than the old liveness.
+// 首先比较 epoch 和 expiration。如果新的明显更大，返回 true。
+// 若二者时间戳一样，看看节点成员状态
+//
+// Membership
+// (是否在被移除) 等其他元数据是否发生改变。
+// 如果全部字面量都一样，看二进制的 Proto 序列化数据（raw）是否变了。如果发生改变返回 true。
 func livenessChanged(old, new Record) bool {
 	oldL, newL := old.Liveness, new.Liveness
 

@@ -363,6 +363,39 @@ type queueImpl interface {
 // replicaInQueue.
 type queueProcessTimeoutFunc func(*cluster.Settings, replicaInQueue) time.Duration
 
+// **不同 Queue 的配置差异**:
+//
+// | Queue | needsLease | needsSpanConfigs | acceptsUnsplitRanges | processDestroyedReplicas |
+// | --- | --- | --- | --- | --- |
+// | Replicate Queue | ✅ | ✅ | ❌ | ❌ |
+// | Split Queue | ✅ | ✅ | ✅ | ❌ |
+// | Merge Queue | ✅ | ✅ | ❌ | ❌ |
+// | GC Queue | ❌ | ❌ | ✅ | ✅ |
+// | Raft Snapshot Queue | ❌ | ❌ | ✅ | ❌ |
+// | Consistency Checker | ❌ | ❌ | ✅ | ❌ |
+//
+// **为什么配置不同?**
+//
+// ```
+// Replicate Queue:
+//   - needsLease=true: 只有 leaseholder 才能发起 replica 变更
+//   - acceptsUnsplitRanges=false: 必须先 split,否则不知道该用哪个 zone config
+//
+// Split Queue:
+//   - needsLease=true: 只有 leaseholder 才能发起 split
+//   - acceptsUnsplitRanges=true: Split Queue 的职责就是分裂,当然要接受未分裂的 Range
+//
+// GC Queue:
+//   - needsLease=false: 每个 Replica 都可以独立 GC 自己的 Raft 日志
+//   - processDestroyedReplicas=true: GC Queue 的职责之一就是清理 destroyReasonMergePending 的 Replica
+//
+// Raft Snapshot Queue:
+//   - needsLease=false: follower 也需要接收 snapshot
+//   - needsSpanConfigs=false: snapshot 可能是为了让 span config range 可用,不能依赖它
+//
+// ```
+//
+// ---
 type queueConfig struct {
 	// maxSize is the maximum number of replicas to queue.
 	maxSize int
@@ -375,14 +408,14 @@ type queueConfig struct {
 	// needsLease not because they literally need a lease, but because they work
 	// on a range level and use it to ensure that only one node in the cluster
 	// processes that range.
-	needsLease bool
+	needsLease bool // 是否需要 lease
 	// needsSpanConfigs controls whether this queue requires a valid copy of the
 	// span configs to operate on a replica. Not all queues require it, and it's
 	// unsafe for certain queues to wait on it. For example, a raft snapshot may
 	// be needed in order to make it possible for the span config range to
 	// become available (as observed in #16268), so the raft snapshot queue
 	// can't require the span configs to already be available.
-	needsSpanConfigs bool
+	needsSpanConfigs bool // 是否需要 span config
 	// acceptsUnsplitRanges controls whether this queue can process ranges that
 	// need to be split due to zone config settings. Ranges are checked before
 	// calling queueImpl.shouldQueue and queueImpl.process.
@@ -391,10 +424,24 @@ type queueConfig struct {
 	// want to try to replicate a range until we know which zone it is in and
 	// therefore how many replicas are required). If needsSpanConfig is not set
 	// then this setting is ignored.
-	acceptsUnsplitRanges bool
+	//**`acceptsUnsplitRanges` 的含义**:
+	//
+	//```
+	//acceptsUnsplitRanges=true:
+	//  - Split Queue: 职责就是分裂,当然要接受未分裂的 Range
+	//  - GC Queue: 清理 Raft 日志,与 split 无关
+	//  - Consistency Checker: 检查一致性,与 split 无关
+	//
+	//acceptsUnsplitRanges=false:
+	//  - Replicate Queue: 需要明确的副本配置
+	//  - Merge Queue: 需要确保配置兼容
+	//  - Lease Queue: 需要明确的 lease 偏好设置
+	//```
+	//
+	acceptsUnsplitRanges bool // 是否接受未分裂的 Range
 	// processDestroyedReplicas controls whether or not we want to process
 	// replicas that have been destroyed but not GCed.
-	processDestroyedReplicas bool
+	processDestroyedReplicas bool // 是否处理已销毁的 Replica
 	// processTimeout returns the timeout for processing a replica.
 	processTimeoutFunc queueProcessTimeoutFunc
 	// enqueueAdd is a counter of replicas that were successfully added to the
@@ -517,9 +564,9 @@ type baseQueue struct {
 	// from the constructor function will return a queueImpl containing
 	// a pointer to a structure which is a copy of the one within which
 	// it is contained. DANGER.
-	impl  queueImpl
-	store *Store
-	queueConfig
+	impl             queueImpl     // 具体队列实现
+	store            *Store        // 所属 Store
+	queueConfig                    // 配置 (needsLease, needsSpanConfigs, acceptsUnsplitRanges)
 	incoming         chan struct{} // Channel signaled when a new replica is added to the queue.
 	processSem       chan struct{}
 	addOrMaybeAddSem *quotapool.IntPool // for {Maybe,}AddAsync
@@ -873,16 +920,29 @@ func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.
 	}
 
 	// Load the system config if it's needed.
+	// 第一次调用: acquireLeaseIfNeeded=false
+	//**参数**: `acquireLeaseIfNeeded=false`
+	//- **为什么是 false?** 入队时不应该获取 lease,否则会导致:
+	//1. 无谓的 lease 竞争 (可能最终不需要处理)
+	//2. 扫描速度变慢 (每个 Replica 都可能等待 lease 获取)
+	//
+	//**检查内容**:
+	//1. Replica 是否初始化
+	//2. Replica 是否销毁
+	//3. Span Config 是否可用 (如果需要)
+	//4. Range 是否需要分裂 (如果不接受未分裂)
+	//5. **不获取 lease**,只检查当前是否持有
 	confReader, err := bq.replicaCanBeProcessed(ctx, repl, false /* acquireLeaseIfNeeded */)
 	if err != nil {
 		bq.updateMetricsOnEnqueueFailedPrecondition()
-		return
+		return // 不满足前置条件,不入队
 	}
 
 	// NB: in production code, this type assertion is always true. In tests,
 	// it may not be and shouldQueue will be passed a nil realRepl. These tests
 	// know what they're getting into so that's fine.
 	realRepl, _ := repl.(*Replica)
+	// 调用具体队列的 shouldQueue
 	should, priority := bq.impl.shouldQueue(ctx, now, realRepl, confReader)
 	if !should {
 		bq.updateMetricsOnEnqueueNoAction()
@@ -903,6 +963,7 @@ func (bq *baseQueue) maybeAdd(ctx context.Context, repl replicaInQueue, now hlc.
 			return
 		}
 	}
+	// 加入队列
 	_, err = bq.addInternal(ctx, repl.Desc(), repl.ReplicaID(), priority, noopProcessCallback)
 	if !isExpectedQueueError(err) {
 		log.KvDistribution.Errorf(ctx, "unable to add: %+v", err)
@@ -1272,9 +1333,87 @@ var errMarkNotAcquirableLease = errors.New("lease can't be acquired")
 // processed right now. In some cases we want to attempt to acquire or renew a
 // lease if we don't currently have it and the queue requires a lease. This will
 // only return a nil SpanConfig if the queue does not require span configs.
+// **输入**:
+// - `ctx`: 上下文,用于取消、超时、日志
+// - `repl`: 要检查的 Replica (接口类型,隐藏具体实现)
+// - `acquireLeaseIfNeeded`: 是否主动获取 lease
+//
+// **输出**:
+// - `spanconfig.StoreReader`: Span Config 读取器 (如果队列需要)
+// - `error`: 错误信息 (如果不满足前置条件)
+// **返回值语义**:
+//
+// ```go
+// 返回 (confReader, nil):
+//   - Replica 满足所有前置条件
+//   - 可以继续处理
+//   - confReader 可能是 nil (如果 needsSpanConfigs=false)
+//
+// 返回 (nil, err):
+//   - Replica 不满足前置条件
+//   - 不应该处理
+//   - err 描述具体原因
+//
+// ```
+//
+// **特殊错误**: `errMarkNotAcquirableLease`
+//
+// ```go
+// // queue.go:1264-1266
+// var errMarkNotAcquirableLease = errors.New("lease can't be acquired")
+// ```
+//
+// **用途**: 区分”无法获取 lease”和其他错误
+//
+// ```go
+// // processReplica 中的处理 (queue.go:1238-1240)
+//
+//	if errors.Is(err, errMarkNotAcquirableLease) {
+//	   return nil  // 不是真正的错误,跳过即可
+//	}
+//
+// ```
 func (bq *baseQueue) replicaCanBeProcessed(
 	ctx context.Context, repl replicaInQueue, acquireLeaseIfNeeded bool,
 ) (spanconfig.StoreReader, error) {
+	//**初始化的含义**: Replica 有完整的 RangeDescriptor,包含 replica 列表
+	//
+	//**未初始化的场景**:
+	//
+	//**场景 1: Preemptive Snapshot**
+	//
+	//```
+	//Node-1 创建新 Range-100:
+	//  T0: 发送 preemptive snapshot 到 Node-2
+	//  T1: Node-2 创建 Replica 对象,rangeID=100, replicaID=0 (未初始化)
+	//  T2: 接收 snapshot 数据
+	//  T3: 应用 RangeDescriptor → replicaID=2 (已初始化)
+	//
+	//如果 T2 时 Replica Scanner 扫描:
+	//  - IsInitialized()=false
+	//  - 不应该入队 (还没有完整信息)
+	//```
+	//
+	//**场景 2: Replica 被移除后重新添加**
+	//
+	//```
+	//原 Replica:
+	//  rangeID=100, replicaID=1 → 已初始化,已入队
+	//
+	//Rebalancing 移除:
+	//  T0: ChangeReplicas([Remove (n1,s1):1])
+	//  T1: Replica.IsDestroyed()=destroyReasonRemoved
+	//  T2: Replica 从 Store 移除
+	//
+	//重新添加:
+	//  T3: ChangeReplicas([Add (n1,s1):3])
+	//  T4: 创建新 Replica,rangeID=100, replicaID=3
+	//  T5: 接收 snapshot → 初始化
+	//
+	//问题: 队列中可能还有 rangeID=100 的旧 item
+	//解决: pop() 时检查 replicaID 是否匹配
+	//```
+	//
 	if !repl.IsInitialized() {
 		// We checked this when adding the replica, but we need to check it again
 		// in case this is a different replica with the same range ID (see #14193).
@@ -1286,13 +1425,14 @@ func (bq *baseQueue) replicaCanBeProcessed(
 
 	// The replica GC queue can process destroyed replicas if it is stuck in
 	// destroyReasonMergePending for too long.
+	//检查 2: Replica 销毁状态
 	if reason, err := repl.IsDestroyed(); err != nil {
 		if !bq.queueConfig.processDestroyedReplicas || reason == destroyReasonRemoved {
 			log.VEventf(ctx, 3, "replica destroyed (%s); skipping", err)
 			return nil, errors.Wrap(err, "cannot process destroyed replica")
 		}
 	}
-
+	//检查 3: Span Config 可用性
 	// The conf is only populated if the queue requires a span config. Otherwise
 	// nil is always returned.
 	var confReader spanconfig.StoreReader
@@ -1324,6 +1464,7 @@ func (bq *baseQueue) replicaCanBeProcessed(
 	// If the queue requires a replica to have the range lease in
 	// order to be processed, check whether this replica has range lease
 	// and renew or acquire if necessary.
+	// 检查 5: Lease 获取 (acquireLeaseIfNeeded=true)
 	if bq.needsLease {
 		if acquireLeaseIfNeeded {
 			_, pErr := repl.redirectOnOrAcquireLease(ctx)
@@ -1344,6 +1485,7 @@ func (bq *baseQueue) replicaCanBeProcessed(
 				return nil, pErr.GoError()
 			}
 		} else {
+			//acquireLeaseIfNeeded=false (入队时)
 			// Don't process if we don't own the lease.
 			st := repl.CurrentLeaseStatus(ctx)
 			if st.IsValid() && !st.OwnedBy(repl.StoreID()) {

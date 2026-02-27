@@ -16,23 +16,26 @@ import (
 )
 
 // syncWaiter is capable of waiting for a disk write to be durably committed.
+// syncWaiter - 等待磁盘写入完成的能力
 type syncWaiter interface {
 	// SyncWait waits for the write to be durable.
-	SyncWait() error
+	SyncWait() error // 阻塞直到fsync完成
 	// Close closes the syncWaiter and releases associated resources.
 	// Must be called after SyncWait returns.
-	Close()
+	Close() // 释放资源
 }
 
+// storage.Batch 实现了 syncWaiter 接口
 var _ syncWaiter = storage.Batch(nil)
 
 // syncWaiterCallback is a callback provided to a SyncWaiterLoop.
 // The callback is structured as an interface instead of a closure to allow
 // users to batch the callback and its inputs into a single heap object, and
 // then pool the allocation of that object.
+// syncWaiterCallback - 回调执行接口
 type syncWaiterCallback interface {
 	// run executes the callback.
-	run()
+	run() // 在fsync完成后执行
 }
 
 // SyncWaiterLoop waits on a sequence of in-progress disk writes, notifying
@@ -60,9 +63,12 @@ func NewSyncWaiterLoop() *SyncWaiterLoop {
 		// waiter loop from blocking on calls to enqueue, even if consumption from
 		// the queue is delayed. If the pipeline is going to block, we'd prefer for
 		// it to do so during the call to batch.CommitNoSyncWait.
+		/// 队列大小：2 × Pebble并发sync上限
+		//        // record.SyncConcurrency = 4096
+		//        // 2倍大小 = 8192，给予缓冲避免阻塞enqueue
 		q:                      make(chan syncBatch, 2*record.SyncConcurrency),
 		stopped:                make(chan struct{}),
-		logEveryEnqueueBlocked: log.Every(1 * time.Second),
+		logEveryEnqueueBlocked: log.Every(1 * time.Second), //限流日志（每秒最多1次）
 	}
 }
 
@@ -73,6 +79,7 @@ func (w *SyncWaiterLoop) Start(ctx context.Context, stopper *stop.Stopper) {
 			TaskName: "raft-logstore-sync-waiter-loop",
 			// This task doesn't reference a parent because it runs for the server's
 			// lifetime.
+			// SterileRootSpan：不继承父span，独立生命周期
 			SpanOpt: stop.SterileRootSpan,
 		},
 		func(ctx context.Context) {
@@ -83,17 +90,21 @@ func (w *SyncWaiterLoop) Start(ctx context.Context, stopper *stop.Stopper) {
 // waitLoop pulls off the SyncWaiterLoop's queue. For each syncWaiter, it waits
 // for the sync to complete and then calls the associated callback.
 func (w *SyncWaiterLoop) waitLoop(ctx context.Context, stopper *stop.Stopper) {
-	defer close(w.stopped)
+	defer close(w.stopped) // ← 退出时关闭stopped channel
+
 	for {
 		select {
-		case w := <-w.q:
+		case w := <-w.q: // ← 从队列读取syncBatch
+			// 步骤1：等待fsync完成（阻塞）
 			if err := w.wg.SyncWait(); err != nil {
 				log.KvExec.Fatalf(ctx, "SyncWait error: %+v", err)
 			}
+			// 步骤2：执行回调（串行，保证顺序）
 			w.cb.run()
+			// 步骤3：关闭batch，释放资源
 			w.wg.Close()
 		case <-stopper.ShouldQuiesce():
-			return
+			return // ← 收到停止信号
 		}
 	}
 }
@@ -111,10 +122,15 @@ func (w *SyncWaiterLoop) waitLoop(ctx context.Context, stopper *stop.Stopper) {
 // called.
 func (w *SyncWaiterLoop) enqueue(ctx context.Context, wg syncWaiter, cb syncWaiterCallback) {
 	b := syncBatch{wg, cb}
+	// 快速路径：尝试非阻塞发送
 	select {
 	case w.q <- b:
+		// 成功入队，立即返回
 	case <-w.stopped:
+		// 已停止，丢弃请求
 	default:
+		// Channel满了，需要阻塞等待
+		// 先记录日志（限流）
 		if w.logEveryEnqueueBlocked.ShouldLog() {
 			// NOTE: we don't expect to hit this because we size the enqueue channel
 			// with enough capacity to hold more in-progress sync operations than
@@ -122,9 +138,12 @@ func (w *SyncWaiterLoop) enqueue(ctx context.Context, wg syncWaiter, cb syncWait
 			// see this in cases where consumption from the queue is delayed.
 			log.KvExec.VWarningf(ctx, 1, "SyncWaiterLoop.enqueue blocking due to insufficient channel capacity")
 		}
+		// 慢速路径：阻塞发送
 		select {
 		case w.q <- b:
+			// 成功入队
 		case <-w.stopped:
+			// 等待期间系统停止
 		}
 	}
 }

@@ -30,35 +30,52 @@ import "time"
 // query: O(k), append: O(k), space O(k), k = |windows|.
 // The average case append is O(1), when no windows
 // require rotating; the size requirement is 32 + 8k bytes.
+// Swag 是一个基于时间分桶的滑动窗口聚合器（Sliding Window Aggregator），支持任意结合律（associative）二元操作。它的核心职责是：
+// 输入（构造时）：
+// - now：当前时间（用于初始化窗口）
+// - interval：每个窗口的时间跨度（如 1 分钟）
+// - size：窗口数量（如 5 个窗口）
+// - binOp：二元聚合函数（如 max(a, b)、sum(a, b)）
+// 输入（运行时）：
+// - Record(now, val)：记录一个新值到当前窗口
+// - Query(now)：查询所有窗口的聚合结果
+// 输出：
+// - 聚合值（如过去 5 分钟的最大值）
+// - 实际覆盖的时间跨度（如果系统运行不足 5 分钟，返回实际跨度）
+// 时间复杂度：
+// - Record()：平均 O(1)（无需轮转时），最坏 O(k)（需要轮转 k 个窗口）
+// - Query()：O(k)，k = 窗口数量
+// 空间复杂度：
+// - 32 + 8k 字节（对于 5 个窗口，约 72 字节）
 type Swag struct {
-	curIdx         int
-	windows        []*float64
-	lastRotate     time.Time
-	rotateInterval time.Duration
-	binOp          func(acc, val float64) float64
+	curIdx         int                            //占用 8 字节（64 bits）
+	windows        []*float64                     //24字节
+	lastRotate     time.Time                      //24 字节
+	rotateInterval time.Duration                  //8 字节
+	binOp          func(acc, val float64) float64 //8 字节
 }
 
 // NewSwag returns a new sliding window aggregator.
 func NewSwag(
 	now time.Time, interval time.Duration, size int, binOp func(acc, val float64) float64,
 ) *Swag {
-	windows := make([]*float64, size)
-	var first float64
+	windows := make([]*float64, size) // 分配 5 个指针位置
+	var first float64                 // 初始化第一个窗口为 0
 	windows[0] = &first
 	return &Swag{
-		curIdx:         0,
-		windows:        windows,
-		lastRotate:     now,
-		rotateInterval: interval,
-		binOp:          binOp,
+		curIdx:         0,        // 当前窗口索引 = 0
+		windows:        windows,  // [&0, nil, nil, nil, nil]
+		lastRotate:     now,      // 上次轮转时间 = now
+		rotateInterval: interval, // 1 分钟
+		binOp:          binOp,    // max 函数
 	}
 }
 
 // Record takes a value and applies the binary operation with the current
 // bucket and the value.
 func (s *Swag) Record(now time.Time, val float64) {
-	s.maybeRotate(now)
-	*s.windows[s.curIdx] = s.binOp(*s.windows[s.curIdx], val)
+	s.maybeRotate(now)                                        // 1. 检查是否需要轮转窗口
+	*s.windows[s.curIdx] = s.binOp(*s.windows[s.curIdx], val) // 2. 聚合到当前窗口
 }
 
 // maybeRotate checks the passed in time with the last rotate time. If the
@@ -104,16 +121,17 @@ func (s *Swag) Query(now time.Time) (float64, time.Duration) {
 // recent order. It will not return unpopulated windows, if total duration is
 // less than size * rotateInterval.
 func (s *Swag) Windows(now time.Time) []float64 {
-	s.maybeRotate(now)
+	s.maybeRotate(now) // 确保窗口是最新的
 	size := len(s.windows)
 	ret := make([]float64, 0, 1)
 
 	for i := 0; i < size; i++ {
+		// 从 curIdx 向后遍历（最新到最旧）
 		next := s.windows[(s.curIdx+size-i)%size]
 		if next == nil {
-			break
+			break // 遇到未初始化的窗口，停止
 		}
 		ret = append(ret, *next)
 	}
-	return ret
+	return ret // 返回 [最新窗口, 次新窗口, ..., 最旧窗口]
 }

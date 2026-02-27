@@ -20,6 +20,50 @@ import (
 // DestroyReason indicates if a replica is alive, destroyed, corrupted or pending destruction.
 type DestroyReason int
 
+// **两种销毁原因**:
+// **1. `destroyReasonRemoved`**: Replica 已从 Raft group 移除
+// ```
+// 触发场景:
+//   - Rebalancing: ChangeReplicas([Remove (n1,s1):1])
+//   - Range 合并: 右半部分被合并到左半部分
+//   - Replica 损坏: 被标记为 corrupted
+//
+// 状态设置:
+//
+//	r.shMu.destroyStatus.Set(
+//	    errors.New("removed from raft group"),
+//	    destroyReasonRemoved,
+//	)
+//
+// 后续处理:
+//   - 所有 Queue 都应该跳过 (除非 processDestroyedReplicas=true)
+//   - Replica 等待 GC 清理
+//
+// ```
+// **2. `destroyReasonMergePending`**: Range 合并待定
+// ```
+// 触发场景:
+//   - Range-99 和 Range-100 合并
+//   - Range-100 (右侧) 被标记为 destroyReasonMergePending
+//   - 等待 Range-99 (左侧) 完成 subsumption
+//
+// 状态设置:
+//
+//	r.shMu.destroyStatus.Set(
+//	    errors.New("merge pending"),
+//	    destroyReasonMergePending,
+//	)
+//
+// 问题: 如果 Range-99 的 leaseholder 故障,subsumption 可能一直不完成
+// 解决: GC Queue 可以处理 destroyReasonMergePending (如果超时)
+// ```
+// // 只有 GC Queue 设置为 true
+// gcQueue := newGCQueue(store, cfg)
+// gcQueue.queueConfig.processDestroyedReplicas = true
+//
+// // 其他 Queue 都是 false
+// replicateQueue := newReplicateQueue(store, cfg)
+// replicateQueue.queueConfig.processDestroyedReplicas = false
 const (
 	// The replica is alive.
 	destroyReasonAlive DestroyReason = iota

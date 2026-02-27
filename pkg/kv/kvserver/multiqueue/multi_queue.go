@@ -21,10 +21,10 @@ import (
 // MultiQueue.Cancel can be called to release the permit without waiting for the
 // permit.
 type Task struct {
-	priority  float64
-	queueType int
-	heapIdx   int
-	permitC   chan *Permit
+	priority  float64      // 优先级（越大越高）
+	queueType int          // 队列类型标识
+	heapIdx   int          // 在堆中的索引（-1表示已移除）
+	permitC   chan *Permit // 用于通知任务可以运行的通道（缓冲大小为1）
 }
 
 // GetWaitChan returns a permit channel which is used to wait for the permit to
@@ -38,6 +38,7 @@ func (t *Task) String() string {
 }
 
 // notifyHeap is a standard go heap over tasks.
+// 优先级堆，实现 Go 标准库
 type notifyHeap []*Task
 
 func (h notifyHeap) Len() int {
@@ -91,12 +92,12 @@ func (h *notifyHeap) tryRemove(task *Task) bool {
 // be run. Once the job is completed, MultiQueue.TaskDone must be called to
 // return the Permit to the queue so that the next Task can be started.
 type MultiQueue struct {
-	mu               syncutil.Mutex
-	concurrencyLimit int
-	remainingRuns    int
-	mapping          map[int]int
-	lastQueueIndex   int
-	outstanding      []notifyHeap
+	mu               syncutil.Mutex // 保护所有内部状态
+	concurrencyLimit int            // 最大并发数（配置）
+	remainingRuns    int            // 当前剩余可用槽位（动态）
+	mapping          map[int]int    // queueType -> outstanding数组索引
+	lastQueueIndex   int            // Round-Robin 轮询的上次位置
+	outstanding      []notifyHeap   // 每个队列类型对应一个优先级堆
 }
 
 // NewMultiQueue creates a new queue. The queue is not started, and start needs
@@ -114,7 +115,7 @@ func NewMultiQueue(maxConcurrency int) *MultiQueue {
 
 // Permit is a token which is returned from a Task.GetWaitChan call.
 type Permit struct {
-	valid bool
+	valid bool // 防止重复释放
 }
 
 // tryRunNextLocked will run the next task in order round-robin through the
@@ -151,10 +152,10 @@ func (m *MultiQueue) UpdateConcurrencyLimit(newLimit int) {
 
 func (m *MultiQueue) updateConcurrencyLimitLocked(newLimit int) {
 	diff := newLimit - m.concurrencyLimit
-	m.remainingRuns = max(m.remainingRuns+diff, 0)
+	m.remainingRuns = max(m.remainingRuns+diff, 0) // 不允许为负
 	m.concurrencyLimit = newLimit
 	// Attempt to wake the outstanding tasks after concurrency limit adjustment.
-	m.tryRunNextLocked()
+	m.tryRunNextLocked() // 如果增加了槽位，尝试调度
 }
 
 // Add returns a Task that must be closed (calling m.Release(..)) to

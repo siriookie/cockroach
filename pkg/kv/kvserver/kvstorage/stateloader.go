@@ -52,14 +52,25 @@ func (s StateLoader) Load(
 	var r kvserverpb.ReplicaState
 	// TODO(tschottdorf): figure out whether this is always synchronous with
 	// on-disk state (likely iffy during Split/ChangeReplica triggers).
+	//. 初始化描述符 (Desc)
+	//它并不是从磁盘读取描述符，而是克隆（Clone）传入的 desc 参数。
+	//逻辑背景：在 CockroachDB 中，Range 描述符通常是事务性更新的，且在内存中已有最新版本。
+	//Load
+	// 函数遵循“传入的 desc 是最新已提交版本”的约定。
 	r.Desc = protoutil.Clone(desc).(*roachpb.RangeDescriptor)
 	// Read the range lease.
+	//调用 s.LoadLease 从磁盘读取该 Range 的当前租约信息。
+	//这是决定谁是该 Range “主节点”的关键数据。
 	lease, err := s.LoadLease(ctx, stateRO)
 	if err != nil {
 		return kvserverpb.ReplicaState{}, err
 	}
 	r.Lease = &lease
-
+	//3. 加载垃圾回收相关信息 (GC)
+	//LoadGCThreshold
+	//: 加载 GC 阈值时间戳（在此时间戳之前的数据可以被清理）。
+	//LoadGCHint
+	//: 加载 GC 提示信息，用于优化清理逻辑。
 	if r.GCThreshold, err = s.LoadGCThreshold(ctx, stateRO); err != nil {
 		return kvserverpb.ReplicaState{}, err
 	}
@@ -67,11 +78,21 @@ func (s StateLoader) Load(
 	if r.GCHint, err = s.LoadGCHint(ctx, stateRO); err != nil {
 		return kvserverpb.ReplicaState{}, err
 	}
-
+	//加载强制刷新索引 (ForceFlushIndex)
+	//LoadRangeForceFlushIndex
+	//: 加载该 Range 建议/强制刷新数据的索引位置。
 	if r.ForceFlushIndex, err = s.LoadRangeForceFlushIndex(ctx, stateRO); err != nil {
 		return kvserverpb.ReplicaState{}, err
 	}
-
+	//加载应用状态 (Applied State) - 核心数据
+	//这部分从
+	//LoadRangeAppliedState
+	// 中读取，包含了关键的 Raft 进度：
+	//RaftAppliedIndex: 状态机已经执行（应用）到的 Raft 条目索引。
+	//RaftAppliedIndexTerm: 对应应用条目的任期。
+	//LeaseAppliedIndex: 与租约变更相关的应用索引。
+	//MVCC Stats: 加载该 Range 的统计信息（如：数据占用了多少字节，有多少条记录等）。
+	//RaftClosedTimestamp: 分布式事务中用于确立“已关闭时间戳”的数据。
 	as, err := s.LoadRangeAppliedState(ctx, stateRO)
 	if err != nil {
 		return kvserverpb.ReplicaState{}, err
@@ -87,6 +108,7 @@ func (s StateLoader) Load(
 	// RaftTruncatedState must be loaded separately.
 	r.TruncatedState = nil
 
+	//加载该副本的内部引擎版本号。
 	version, err := s.LoadVersion(ctx, stateRO)
 	if err != nil {
 		return kvserverpb.ReplicaState{}, err
@@ -139,8 +161,14 @@ func (s StateLoader) Save(
 // LoadLease loads the lease.
 func (s StateLoader) LoadLease(ctx context.Context, stateRO StateRO) (roachpb.Lease, error) {
 	var lease roachpb.Lease
+	//构造 Key (s.RangeLeaseKey())：
+	//它计算出该 Range 对应的租约存储 Key。租约是存储在 Range Local Key 区域的（前缀通常是 /Local/RangeID/...），这意味着它与用户数据是分开存储的。
 	_, err := storage.MVCCGetProto(ctx, stateRO, s.RangeLeaseKey(),
 		hlc.Timestamp{}, &lease, storage.MVCCGetOptions{})
+	//底层查询 (storage.MVCCGetProto)：
+	//查询 Pebble：调用 MVCCGetProto 去底层存储引擎中查找该 Key。
+	//空时间戳 (hlc.Timestamp{})：查询时传入了空时间戳。这是因为租约信息属于“单版本”系统元数据，它不使用 MVCC 的多版本控制，始终保持最新。
+	//反序列化：将查到的二进制数据反序列化为 roachpb.Lease 协议缓冲区（protobuf）对象。
 	return lease, err
 }
 
@@ -245,6 +273,44 @@ func (s StateLoader) SetClosedTimestamp(
 }
 
 // LoadGCThreshold loads the GC threshold.
+// 1. 针对什么数据？
+// 它针对的是 Pebble 存储引擎中的旧版本数据。 由于 CockroachDB 采用 MVCC 机制，每一次更新（Update）或删除（Delete）操作并不会立即覆盖旧数据，而是会写入一个带时间戳的新版本：
+//
+// 旧版本值：同一个 Key 的旧版本数据。
+// 删除标记（Tombstones）：当用户执行 DELETE 时，系统会写入一个特殊的标记。
+// 2. 哪些数据可以被清除？
+// 在这个时间轴（GCThreshold）之前的所有“非活跃”版本都可以被清除。具体规则如下：
+//
+// 过期的旧版本：如果一个 Key 有多个版本（例如时间戳 10, 20, 30），而
+// GCThreshold
+// 是 25。那么时间戳为 10 和 20 的版本即被视为“不可见”的冗余数据，可以被物理删除。
+// 过期的删除标记：如果一个 Key 在时间戳 15 被删除了（写入了 Tombstone），而
+// GCThreshold
+// 是 25。由于删除时间早于阈值，这个 Key 的所有历史记录以及删除标记本身都可以从磁盘上彻底抹去。
+// 例外情况： 如果一个 Key 最新的版本虽然早于
+// GCThreshold
+// （比如最后一次修改在时间戳 5），但它是该 Key 的当前唯一有效值，那么它不会被删除。GC 永远不会删除数据的“当前状态”，只会删除“历史状态”。
+//
+// 3. 从什么地方被清除？
+// 数据是从 底层存储引擎（Pebble）的 LSM-Tree 中物理清除的。
+//
+// 这个清除过程通常分为两步：
+//
+// 逻辑识别：gcQueue（垃圾回收队列）会定期扫描各个 Range，对比每个 Key 的时间戳与
+// GCThreshold
+// 。
+// 物理删除：通过调用 Pebble 的 Delete 或 SingleDelete 操作，或者通过 Compaction（压缩）过程，将这些旧数据从磁盘文件中彻底移除。
+// 总结：GC 是怎么落地的？
+// 逻辑触发：CockroachDB 的 gcQueue 检查到
+// GCThreshold
+// 推进了。
+// 标记工作：它会通过 Raft 协议在所有副本上更新
+// GCThreshold
+// 这一元数据（就是你代码里看到的
+// LoadGCThreshold
+// 加载的那部分）。
+// 物理收割：底层 Pebble 引擎 在磁盘后台进行 Compaction（压缩） 时，像筛子一样把早于这个阈值的旧版本数据过滤掉，不让它们进入下一层的 SSTable。
+// 所以，最准确的答案是：发生在磁盘上的 SSTable 合并（Compaction）过程中。
 func (s StateLoader) LoadGCThreshold(ctx context.Context, stateRO StateRO) (*hlc.Timestamp, error) {
 	var t hlc.Timestamp
 	_, err := storage.MVCCGetProto(ctx, stateRO, s.RangeGCThresholdKey(),
@@ -302,6 +368,18 @@ func (s StateLoader) SetVersion(
 }
 
 // LoadRangeForceFlushIndex loads the force-flush index.
+// 在 CockroachDB 中，
+// ForceFlushIndex
+// 通常用于 数据一致性和持久化检查：
+//
+// Raft 交互：有时候系统需要知道：截至 Raft Index X 的所有日志和其对应的状态机变更，是否不仅被“写入”了磁盘，而且已经通过 fsync 等原子操作刷新到了物理介质上。
+// WAL 截断：在截断 Raft 日志（WAL）之前，系统可能需要检查
+// ForceFlushIndex
+// 。只有那些已经被安全“刷新”到 SSTable 或持久化元数据中的索引，其对应的日志才能被安全删除。
+// 备份/快照：在进行一致性快照或冷备时，该索引用来追踪磁盘上数据的“鲜活程度”
+
+// LoadRangeForceFlushIndex
+// 就是去 Pebble 中查一下该副本目前承诺的、已经完全落地（刷盘）的最后一个 Raft 索引位置是多少。这为系统提供了一个安全边界，确保在发生意外宕机恢复时，数据不会因为尚在内存 Buffer 中而丢失。
 func (s StateLoader) LoadRangeForceFlushIndex(
 	ctx context.Context, stateRO StateRO,
 ) (roachpb.ForceFlushIndex, error) {

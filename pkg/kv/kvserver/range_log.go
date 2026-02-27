@@ -63,10 +63,13 @@ var _ RangeLogWriter = (*wrappedRangeLogWriter)(nil)
 func (w *wrappedRangeLogWriter) WriteRangeLogEvent(
 	ctx context.Context, runner DBOrTxn, event kvserverpb.RangeLogEvent,
 ) error {
+	// 阶段1：无条件控制台日志（如果log.V(1)启用）
 	maybeLogRangeLogEvent(ctx, event)
+	// 阶段2：无条件指标递增
 	if c := w.getCounter(event.EventType); c != nil {
 		c.Inc(1)
 	}
+	// 阶段3：条件化持久化写入
 	if w.shouldWrite() && w.underlying != nil {
 		return w.underlying.WriteRangeLogEvent(ctx, runner, event)
 	}

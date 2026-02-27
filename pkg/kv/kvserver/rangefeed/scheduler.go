@@ -37,6 +37,15 @@ import (
 // a single value.
 type processorEventType int
 
+// const (
+//
+//	Queued        processorEventType = 1 << iota  // 已在队列中
+//	Stopped                                       // 停止信号
+//	EventQueued                                   // 有新事件待处理
+//	RequestQueued                                 // 有新请求待处理
+//	PushTxnQueued                                 // 需要执行 PushTxn
+//
+// )
 const (
 	// Queued is an internal event type that indicate that there's already a
 	// pending work for processor and it is already scheduled for execution.
@@ -144,13 +153,13 @@ func shardIndex(id int64, numShards int, priority bool) int {
 // Each event is represented as a bit mask and multiple pending events could be
 // ORed together before being delivered to processor.
 type Scheduler struct {
-	nextID atomic.Int64
+	nextID atomic.Int64 // 全局递增的 Processor ID 生成器
 	// shards contains scheduler shards. Processors and workers are allocated to
 	// separate shards to reduce mutex contention. Allocation is modulo
 	// processors, with shard 0 reserved for priority processors.
-	shards      []*schedulerShard // 1 + id%(len(shards)-1)
-	priorityIDs syncutil.Set[int64]
-	wg          sync.WaitGroup
+	shards      []*schedulerShard   // 1 + id%(len(shards)-1) // 分片数组，shard[0] 为优先级分片
+	priorityIDs syncutil.Set[int64] // 优先级 Processor ID 集合
+	wg          sync.WaitGroup      // 用于等待所有 worker 退出
 }
 
 // schedulerShard is a mutex shard, which reduces contention: workers in a shard
@@ -159,19 +168,19 @@ type Scheduler struct {
 // when registered, see shardIndex().
 type schedulerShard struct {
 	syncutil.Mutex
-	numWorkers    int
-	bulkChunkSize int
-	cond          *sync.Cond
-	procs         map[int64]Callback
-	status        map[int64]processorEventType
-	queue         *idQueue
+	numWorkers    int                          // 该分片的 worker 数量
+	bulkChunkSize int                          // 批量入队时的分块大小
+	cond          *sync.Cond                   // 条件变量，用于唤醒 worker
+	procs         map[int64]Callback           // Processor ID → Callback 映射
+	status        map[int64]processorEventType // Processor ID → 待处理事件掩码
+	queue         *idQueue                     // 待处理的 Processor ID 队
 	// No more new registrations allowed. Workers are winding down.
-	quiescing bool
+	quiescing bool // 是否正在停止
 
-	metrics *ShardMetrics
+	metrics *ShardMetrics // 分片级别指标
 	// histogramFrequency determines frequency of histogram collection
-	histogramFrequency int64
-	nextLatencyCheck   int64
+	histogramFrequency int64 // 采样频率
+	nextLatencyCheck   int64 // 下次延迟采样计数器
 }
 
 // NewScheduler will instantiate an idle scheduler based on provided config.
@@ -179,11 +188,11 @@ type schedulerShard struct {
 func NewScheduler(cfg SchedulerConfig) *Scheduler {
 	bulkChunkSize := cfg.BulkChunkSize
 	if bulkChunkSize == 0 {
-		bulkChunkSize = enqueueBulkMaxChunk
+		bulkChunkSize = enqueueBulkMaxChunk // 默认值
 	}
 	histogramFrequency := cfg.HistogramFrequency
 	if histogramFrequency == 0 {
-		histogramFrequency = schedulerLatencyHistogramCollectionFrequency
+		histogramFrequency = schedulerLatencyHistogramCollectionFrequency // 质数，避免采样偏差
 	}
 
 	s := &Scheduler{}
@@ -197,13 +206,15 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		newSchedulerShard(priorityWorkers, bulkChunkSize, cfg.Metrics.SystemPriority, histogramFrequency))
 
 	// Regular shards, excluding priority shard.
+	// 2. 根据 ShardSize 计算普通分片数量
 	numShards := 1
 	if cfg.ShardSize > 0 && cfg.Workers > cfg.ShardSize {
 		numShards = (cfg.Workers-1)/cfg.ShardSize + 1 // ceiling division
 	}
+	// 3. 均匀分配 Workers 到各个分片
 	for i := 0; i < numShards; i++ {
 		shardWorkers := cfg.Workers / numShards
-		if i < cfg.Workers%numShards { // distribute remainder
+		if i < cfg.Workers%numShards { // distribute remainder// 余数分配给前面的 shard
 			shardWorkers++
 		}
 		if shardWorkers <= 0 {
@@ -236,6 +247,7 @@ func newSchedulerShard(
 // Start scheduler workers.
 func (s *Scheduler) Start(ctx context.Context, stopper *stop.Stopper) error {
 	// Start each shard.
+	// 1. 为每个 shard 启动 worker goroutine
 	for shardID, shard := range s.shards {
 		// Start the shard's workers.
 		for workerID := 0; workerID < shard.numWorkers; workerID++ {
@@ -246,7 +258,7 @@ func (s *Scheduler) Start(ctx context.Context, stopper *stop.Stopper) error {
 				func(ctx context.Context) {
 					defer s.wg.Done()
 					log.VEventf(ctx, 3, "scheduler worker %d:%d started", shardID, workerID)
-					shard.processEvents(ctx)
+					shard.processEvents(ctx) // ← 主循环
 					log.VEventf(ctx, 3, "scheduler worker %d:%d finished", shardID, workerID)
 				},
 			); err != nil {
@@ -256,7 +268,7 @@ func (s *Scheduler) Start(ctx context.Context, stopper *stop.Stopper) error {
 			}
 		}
 	}
-
+	// 2. 注册停止钩子
 	if err := stopper.RunAsyncTask(ctx, "terminate scheduler",
 		func(ctx context.Context) {
 			<-stopper.ShouldQuiesce()
@@ -305,8 +317,10 @@ func (s *Scheduler) Stop() {
 	for _, shard := range s.shards {
 		shard.quiesce()
 	}
+	// 2. 等待所有 worker 退出
 	s.wg.Wait()
 
+	// 3. 同步通知所有 Processor 停止
 	// Synchronously notify processors about stop.
 	for _, shard := range s.shards {
 		shard.stop()
@@ -347,12 +361,14 @@ func (s *Scheduler) NewEnqueueBatch() *SchedulerBatch {
 // register registers a callback with the shard. The caller must not hold
 // the shard lock.
 func (ss *schedulerShard) register(id int64, f Callback) error {
+	// 1. 先注册优先级标记（必须在 shard 注册前完成）
 	ss.Lock()
 	defer ss.Unlock()
 	if ss.quiescing {
 		// Don't accept new registrations if quiesced.
 		return errors.New("server stopping")
 	}
+	// 2. 注册到对应的 shard
 	if _, registered := ss.procs[id]; registered {
 		return errors.Newf("callback is already registered with id %d", id)
 	}
@@ -374,6 +390,7 @@ func (ss *schedulerShard) unregister(id int64) {
 func (ss *schedulerShard) enqueue(id int64, evt processorEventType) {
 	// We get time outside of lock to get more realistic delay in case there's a
 	// scheduler contention.
+	// 1. 在锁外获取时间戳（避免锁内 syscall）
 	now := ss.maybeEnqueueStartTime()
 	ss.Lock()
 	defer ss.Unlock()

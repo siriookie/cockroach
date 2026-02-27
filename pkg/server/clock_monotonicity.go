@@ -184,6 +184,29 @@ func ensureClockMonotonicity(
 // tickerFn is used to create the ticker used for persisting
 //
 // tickCallback is called whenever a tick is processed
+// periodicallyPersistHLCUpperBound 是一个死循环任务，负责执行 HLC 上限持久化的具体调度逻辑。
+//
+// 该函数通过 select 监听三个关键信号：
+// 1. 设置变更 (persistHLCUpperBoundIntervalCh)：支持动态开启、关闭或调整打卡频率。
+// 2. 定时触发 (ticker.C)：按照设定的频率定期向磁盘续写上限值。
+// 3. 停止信号 (stopCh)：确保在服务器关闭时能安全退出。
+//
+// 核心逻辑：
+// - 缓冲区设计：每次持久化计算上限时，会使用 3 倍的间隔时间作为增量（delta）。
+//   这意味着如果每 10 秒打一次卡，写入磁盘的上限值通常是“当前时间 + 30 秒”。
+//   这样即使某次打卡因为短暂的磁盘延迟稍微晚了一点，系统依然处于之前预告的 30 秒保护范围内，是安全的。
+//
+// 例子：
+// 假设 persistInterval 设为 10s：
+// 1. [T = 0s]：Loop 启动，触发第一次持久化。
+//    - 调用 clock.RefreshHLCUpperBound，计算：上限 = 现在(0s) + 3 * 10s = 30s。
+//    - 将 30s 写入磁盘。
+// 2. [T = 10s]：定时器触发第二次持久化。
+//    - 计算：上限 = 现在(10s) + 3 * 10s = 40s。
+//    - 将 40s 覆盖写入磁盘。
+// 3. [T = 15s]：服务器突然崩溃。
+// 4. [重启]：服务器读取磁盘发现上限是 40s。即使当前主板电池没电时钟跳回了 1970 年，
+//    服务器也会强行等待（或报错），直到物理时间超过 40s，保证了跨重启的绝对单调性。
 func periodicallyPersistHLCUpperBound(
 	clock *hlc.Clock,
 	persistHLCUpperBoundIntervalCh chan time.Duration,
@@ -192,19 +215,18 @@ func periodicallyPersistHLCUpperBound(
 	stopCh <-chan struct{},
 	tickCallback func(),
 ) {
-	// Create a ticker which can be used in selects.
-	// This ticker is turned on / off based on persistHLCUpperBoundIntervalCh
+	// 初始化一个定时器，默认先停用
 	ticker := tickerFn(time.Hour)
 	ticker.Stop()
 
-	// persistInterval is the interval used for persisting the
-	// an upper bound of the HLC
 	var persistInterval time.Duration
 
+	// 定义具体的持久化执行闭包
 	persistHLCUpperBound := func() {
+		// 使用 3 倍的间隔时间作为安全冗余计算上限
 		if err := clock.RefreshHLCUpperBound(
 			persistHLCUpperBoundFn,
-			int64(persistInterval*3), /* delta to compute upper bound */
+			int64(persistInterval*3),
 		); err != nil {
 			log.Ops.Fatalf(
 				context.Background(),
@@ -217,19 +239,21 @@ func periodicallyPersistHLCUpperBound(
 	for {
 		select {
 		case updatedPersistInterval := <-persistHLCUpperBoundIntervalCh:
+			// 1. 处理设置变更信号
 			if updatedPersistInterval == persistInterval {
-				// No change.
 				continue
 			}
 			persistInterval = updatedPersistInterval
 
 			ticker.Stop()
 			if persistInterval > 0 {
+				// 如果开启了该功能，则重置定时器并立即打卡一次
 				ticker = tickerFn(persistInterval)
 				persistHLCUpperBound()
 				log.Ops.Infof(context.Background(), "persisting HLC upper bound is enabled [every %.2fs]",
 					persistInterval.Seconds())
 			} else {
+				// 如果禁用了该功能，则清理磁盘上的上限标记
 				if err := clock.ResetHLCUpperBound(persistHLCUpperBoundFn); err != nil {
 					log.Ops.Fatalf(
 						context.Background(),
@@ -241,11 +265,13 @@ func periodicallyPersistHLCUpperBound(
 			}
 
 		case <-ticker.C:
+			// 2. 处理定时打卡信号
 			if persistInterval > 0 {
 				persistHLCUpperBound()
 			}
 
 		case <-stopCh:
+			// 3. 优雅退出
 			ticker.Stop()
 			return
 		}
@@ -266,27 +292,43 @@ func periodicallyPersistHLCUpperBound(
 //
 // tickCallback is called whenever persistHLCUpperBoundCh or a ticker tick is
 // processed
+// startPersistingHLCUpperBound 启动一个后台任务，定期将 HLC（混合逻辑时钟）的“物理时间上限”持久化到磁盘上。
+//
+// 该函数的核心作用是保证：即使服务器发生崩溃并重启，系统时钟依然保持“单调递增（Monotonicity）”，
+// 绝不会产生比崩溃前更旧的时间戳。
+//
+// 工作原理（Safety in the Future）：
+// 1. 预报上限：服务器会周期性（如每 10 秒）向磁盘写入一个“未来值”，例如：当前时间 + 30 秒。
+// 2. 软约束：一旦写入磁盘，本地时钟就被限制住，绝对不允许产生超过这个“上限值”的时间戳。
+// 3. 重启校验：如果服务器突然崩溃并立即重启，它会先从磁盘读出这个最后写入的“上限值”。
+// 4. 等待追赶：重启后的服务器会进入休眠，直到物理时钟真正超过这个磁盘记录的“上限值”，才会开始对外服务。
+//
+// 例子：
+// - T = 10:00:00：系统启动，往磁盘写下 UpperBound = 10:00:30。
+// - T = 10:00:05：服务器由于断电突然崩溃。
+// - T = 10:00:06：服务器立即重启。
+// - 逻辑判断：此时物理时间才 10:00:06，但磁盘记录了 10:00:30。
+// - 结果：为了绝对安全，服务器会傻等 24 秒（直到物理时间追上 10:00:30），然后再开始工作。
+//   这样就杜绝了服务器在重启后产生“10:00:07”这种可能已经在崩溃前被其他事务用过的时间戳。
 func (s *topLevelServer) startPersistingHLCUpperBound(
 	ctx context.Context, hlcUpperBoundExists bool,
 ) error {
 	tickerFn := time.NewTicker
-	persistHLCUpperBoundFn := func(t int64) error { /* function to persist upper bound of HLC to all stores */
+	// 定义持久化函数：调用 node 接口将上限值写入所有本地存储引擎。
+	persistHLCUpperBoundFn := func(t int64) error {
 		return s.node.SetHLCUpperBound(context.Background(), t)
 	}
 	persistHLCUpperBoundIntervalCh := make(chan time.Duration, 1)
-	// Seed channel with initial update, then install a callback to update it
-	// on future changes. SetOnChange does not automatically trigger the callback
-	// if the setting is initially set.
+
+	// 获取集群设置并监听其动态变化。
 	persistHLCUpperBoundIntervalCh <- persistHLCUpperBoundInterval.Get(&s.st.SV)
 	persistHLCUpperBoundInterval.SetOnChange(&s.st.SV, func(context.Context) {
 		persistHLCUpperBoundIntervalCh <- persistHLCUpperBoundInterval.Get(&s.st.SV)
 	})
 
+	// 如果磁盘上已经存在上限记录（说明上一次运行启用了此功能），
+	// 在启动后台循环前，先手动刷新一次上限值，确保持续的单调性。
 	if hlcUpperBoundExists {
-		// The feature to persist upper bounds to wall times is enabled.
-		// Persist a new upper bound to continue guaranteeing monotonicity
-		// Going forward the goroutine launched below will take over persisting
-		// the upper bound
 		if err := s.clock.RefreshHLCUpperBound(
 			persistHLCUpperBoundFn,
 			int64(5*time.Second),
@@ -295,6 +337,7 @@ func (s *topLevelServer) startPersistingHLCUpperBound(
 		}
 	}
 
+	// 启动异步后台任务执行周期性的打卡（写上限）循环。
 	_ = s.stopper.RunAsyncTask(
 		ctx,
 		"persist-hlc-upper-bound",

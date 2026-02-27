@@ -39,20 +39,25 @@ type MessageSender interface {
 
 // SupportManager orchestrates requesting and providing Store Liveness support.
 type SupportManager struct {
-	storeID               slpb.StoreIdent
-	engine                storage.Engine
-	options               Options
-	settings              *clustersettings.Settings
-	stopper               *stop.Stopper
-	clock                 *hlc.Clock
-	heartbeatTicker       *timeutil.BroadcastTicker // optional
-	sender                MessageSender
-	receiveQueue          receiveQueue
-	storesToAdd           storesToAdd
-	minWithdrawalTS       hlc.Timestamp
-	withdrawalCallback    func(map[roachpb.StoreID]struct{})
-	supporterStateHandler *supporterStateHandler
-	requesterStateHandler *requesterStateHandler
+	storeID  slpb.StoreIdent
+	engine   storage.Engine // 持久化引擎
+	options  Options
+	settings *clustersettings.Settings
+	stopper  *stop.Stopper // 停止控制器
+	clock    *hlc.Clock
+	// === 生命周期控制 ===
+	heartbeatTicker *timeutil.BroadcastTicker // optional// 心跳定时器
+	sender          MessageSender             // 消息发送器
+
+	// === 异步通信 ===
+	receiveQueue receiveQueue // 接收消息队列
+	storesToAdd  storesToAdd  // 待添加的 Store
+
+	minWithdrawalTS    hlc.Timestamp
+	withdrawalCallback func(map[roachpb.StoreID]struct{}) // 撤回支持时的回调
+	// === 双向状态 ===
+	supporterStateHandler *supporterStateHandler // "我支持别人"
+	requesterStateHandler *requesterStateHandler // "我请求别人支持我"
 	metrics               *SupportManagerMetrics
 	knobs                 *SupportManagerKnobs
 }
@@ -174,10 +179,11 @@ func (sm *SupportManager) Start(ctx context.Context) error {
 	// order to ensure the SupportManager has loaded all persisted state into
 	// memory and adjusted its clock accordingly before answering SupportFrom
 	// and SupportFor requests.
+	// 1. 同步调用 onRestart，恢复持久化状态
 	if err := sm.onRestart(ctx); err != nil {
 		return err
 	}
-
+	// 2. 启动异步事件循环
 	ctx, hdl, err := sm.stopper.GetHandle(ctx, stop.TaskOpts{
 		TaskName: "storeliveness.SupportManager: loop",
 	})
@@ -194,6 +200,7 @@ func (sm *SupportManager) Start(ctx context.Context) error {
 // onRestart initializes the SupportManager with state persisted on disk.
 func (sm *SupportManager) onRestart(ctx context.Context) error {
 	// Load the supporter and requester state from disk.
+	// 步骤 1: 从磁盘加载持久化状态
 	if err := sm.supporterStateHandler.read(ctx, sm.engine); err != nil {
 		return err
 	}
@@ -203,12 +210,14 @@ func (sm *SupportManager) onRestart(ctx context.Context) error {
 	// Update the support-for metric.
 	sm.metrics.SupportForStores.Update(int64(sm.supporterStateHandler.getNumSupportFor()))
 	// Advance the clock to the maximum withdrawal time.
+	// 步骤 2: 推进时钟到 MaxWithdrawn
 	if err := sm.clock.UpdateAndCheckMaxOffset(
 		ctx, sm.supporterStateHandler.supporterState.meta.MaxWithdrawn,
 	); err != nil {
 		return err
 	}
 	// Wait out the previous maximum requested time.
+	// 步骤 3: 等待到 MaxRequested
 	if err := sm.clock.SleepUntil(
 		ctx, sm.requesterStateHandler.requesterState.meta.MaxRequested,
 	); err != nil {
@@ -216,10 +225,12 @@ func (sm *SupportManager) onRestart(ctx context.Context) error {
 	}
 	// Set the minimum withdrawal time to give other stores a grace period
 	// before losing support.
+	// 步骤 4: 设置最小撤回时间（保护期）
 	sm.minWithdrawalTS = sm.clock.Now().AddDuration(sm.options.SupportWithdrawalGracePeriod)
 	// Increment the current epoch.
 	rsfu := sm.requesterStateHandler.checkOutUpdate()
 	defer sm.requesterStateHandler.finishUpdate(rsfu)
+	// 步骤 5: 增加 Epoch
 	rsfu.incrementMaxEpoch()
 	if err := rsfu.write(ctx, sm.engine); err != nil {
 		return err
@@ -252,6 +263,12 @@ func (sm *SupportManager) startLoop(ctx context.Context) {
 		// stores to add, heartbeats to send, or support to check. This prevents a
 		// constant flow of inbound messages from delaying the other work due to the
 		// random selection between multiple enabled channels.
+		// === 关键：动态选择是否监听 receiveQueue ===
+		//如果有待发送心跳     → 不监听 receiveQueue，优先发送心跳
+		//如果有待撤回支持     → 不监听 receiveQueue，优先撤回
+		//如果有待添加 Store   → 不监听 receiveQueue，优先添加
+		//
+		//只有在以上都空闲时  → 才处理接收队列
 		var receiveQueueSig <-chan struct{}
 		if len(heartbeatTicker.C) == 0 &&
 			len(supportExpiryTicker.C) == 0 &&
@@ -262,7 +279,7 @@ func (sm *SupportManager) startLoop(ctx context.Context) {
 		select {
 		case <-sm.storesToAdd.sig:
 			sm.maybeAddStores(ctx)
-			sm.sendHeartbeats(ctx)
+			sm.sendHeartbeats(ctx) // 立即发送心跳
 
 		case <-heartbeatTicker.C:
 			sm.sendHeartbeats(ctx)
@@ -300,19 +317,24 @@ func (sm *SupportManager) maybeAddStores(ctx context.Context) {
 // and sends the resulting messages via Transport.
 func (sm *SupportManager) sendHeartbeats(ctx context.Context) {
 	// If Store Liveness is not enabled, don't send heartbeats.
+	// 1. 检查是否启用
 	if !sm.SupportFromEnabled(ctx) {
 		return
 	}
+	// 2. 检查测试 knobs
 	if sm.knobs != nil && sm.knobs.DisableHeartbeats != nil && sm.knobs.DisableHeartbeats.Load() == sm.storeID {
 		return
 	}
 	if sm.knobs != nil && sm.knobs.DisableAllHeartbeats != nil && sm.knobs.DisableAllHeartbeats.Load() {
 		return
 	}
+	// 3. 获取可变状态（COW 模式）
 	rsfu := sm.requesterStateHandler.checkOutUpdate()
 	defer sm.requesterStateHandler.finishUpdate(rsfu)
+	// 4. 生成心跳消息
 	livenessInterval := sm.options.SupportDuration
 	heartbeats := rsfu.getHeartbeatsToSend(sm.storeID, sm.clock.Now(), livenessInterval)
+	// 5. 持久化状态
 	beforePersist := timeutil.Now()
 	if err := rsfu.write(ctx, sm.engine); err != nil {
 		log.KvExec.Warningf(ctx, "failed to write requester meta: %v", err)
@@ -321,9 +343,11 @@ func (sm *SupportManager) sendHeartbeats(ctx context.Context) {
 	}
 	persistDur := timeutil.Since(beforePersist)
 	sm.metrics.HeartbeatPersistDuration.RecordValue(persistDur.Nanoseconds())
+	// 6. 提交状态（释放写锁）
 	sm.requesterStateHandler.checkInUpdate(rsfu)
 
 	// Send heartbeats to each remote store.
+	// 7. 发送消息（不持有锁）
 	successes := 0
 	for _, msg := range heartbeats {
 		if sent := sm.sender.EnqueueMessage(ctx, msg); sent {
@@ -451,7 +475,7 @@ var receiveQueueSizeLimitReachedErr = errors.Errorf("store liveness receive queu
 type receiveQueue struct {
 	mu struct {
 		syncutil.Mutex
-		msgs []*slpb.Message
+		msgs []*slpb.Message // 接收的消息
 	}
 	sig chan struct{}
 }
@@ -493,8 +517,8 @@ func (q *receiveQueue) Drain() []*slpb.Message {
 // requesterState.supportFrom.
 type storesToAdd struct {
 	mu     syncutil.Mutex
-	sig    chan struct{}
-	stores map[slpb.StoreIdent]struct{}
+	sig    chan struct{}                // 信号通道（缓冲为 1）
+	stores map[slpb.StoreIdent]struct{} // 去重
 }
 
 func newStoresToAdd() storesToAdd {
