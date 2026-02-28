@@ -1394,16 +1394,36 @@ func (mm *diskMonitorManager) Monitor(path string) (kvserver.DiskStatsMonitor, e
 	return (*disk.MonitorManager)(mm).Monitor(path)
 }
 
+// registerEnginesForDiskStatsMap 将物理存储引擎（Engines）与磁盘统计监控器（Disk Monitors）关联起来，并建立映射关系。
+//
+// 核心作用：
+// 1. IO 统计追踪：为每个 Store 创建一个磁盘监控器，用于实时追踪该磁盘的读写字节数。
+// 2. 准入控制支持：为 IO 准入控制（Admission Control）提供底层的磁盘指标数据，以便系统能够根据磁盘负载决定是否节流。
+// 3. 规格配置关联：将 StoreSpec 中定义的预置带宽（ProvisionedRate）信息记录到映射表中。
+//
+// 例子：
+// - 假设节点有两个磁盘挂载点：/data1 和 /data2。
+// - 节点启动时，该函数会分别针对这两个路径调用磁盘管理器的 Monitor 方法。
+// - 最终返回一个 metricsProvider，当系统询问“Store 1 现在磁盘压力大吗？”时，它能通过映射表找到对应的监控器并给出数据。
 func (n *Node) registerEnginesForDiskStatsMap(
 	specs []base.StoreSpec, engines []storage.Engine, diskManager *diskMonitorManager,
 ) (admission.PebbleMetricsProvider, error) {
+	// 1. 初始化一个针对该节点的 Pebble 指标提供者。
 	pmp := &nodePebbleMetricsProvider{n: n}
+
+	// 2. 初始化磁盘统计映射表。
+	// 该步骤会读取每个 Engine 的 StoreID，并为其匹配 StoreSpec 中定义的路径和性能规格。
 	if err := pmp.diskStatsMap.initDiskStatsMap(specs, engines, diskManager); err != nil {
 		return nil, err
 	}
+
+	// 3. 将生成的磁盘监控器注册到 stores 管理器中。
+	// 这样 stores 组件在后续运行过程中，就能利用这些监控器来上报或查询磁盘状态。
 	if err := n.stores.RegisterDiskMonitors(pmp.diskStatsMap.diskMonitors); err != nil {
 		return nil, err
 	}
+
+	// 返回配置好的指标提供者。
 	return pmp, nil
 }
 
@@ -1489,27 +1509,48 @@ func (n *Node) GetTenantWeights() kvadmission.TenantWeights {
 	return weights
 }
 
+// startGraphiteStatsExporter 启动一个后台任务，负责将节点的指标数据主动推送到外部的 Graphite 监控系统。
+//
+// 核心作用：
+// 1. 外部集成：支持将 CockroachDB 的监控指标集成到使用 Graphite/Grafana 栈的企业级监控体系中。
+// 2. 主动推送（Push 模式）：与普罗米修斯的“拉取”模式不同，它会定期主动“送货上门”。
+// 3. 实时同步：通过配置的间隔，持续地将最新的节点状态同步到远程端点。
+//
+// 例子：
+// - 运维在集群设置中配置了 `server.stats.graphite.endpoint = "monitor.company.com:2003"`。
+// - 该函数启动后，会每个 10 秒（默认）从 `recorder` 抓取一次最新的指标快照。
+// - 随后它会建立网络连接，直接将这些指标数据发送到机器 monitor.company.com 的 2003 端口。
 func startGraphiteStatsExporter(
 	ctx context.Context,
 	stopper *stop.Stopper,
 	recorder *status.MetricsRecorder,
 	st *cluster.Settings,
 ) {
+	// 1. 为上下文添加日志标签，方便在排查任务执行情况时过滤日志。
 	ctx = logtags.AddTag(ctx, "graphite stats exporter", nil)
+	// 2. 初始化一个普罗米修斯导出器实例。
+	// 这里很巧妙：它利用了普罗米修斯的指标格式作为中间转换桥梁。
 	pm := metric.MakePrometheusExporter()
 
+	// 3. 启动异步后台任务。
 	_ = stopper.RunAsyncTask(ctx, "graphite-exporter", func(ctx context.Context) {
 		var timer timeutil.Timer
 		defer timer.Stop()
 		for {
+			// 4. 获取最新的推送频率设置并重置定时器。
 			timer.Reset(graphiteInterval.Get(&st.SV))
 			select {
 			case <-stopper.ShouldQuiesce():
+				// 如果服务器正在关闭，则优雅退出协程。
 				return
 			case <-timer.C:
+				// 5. 到达推送时间点，获取配置的远程端点（Endpoint）。
 				endpoint := graphiteEndpoint.Get(&st.SV)
 				if endpoint != "" {
+					// 6. 如果端点不为空，执行真正的导出操作。
+					// 它会调用 recorder 的 ExportToGraphite 方法，该方法负责连接网络并发送数据。
 					if err := recorder.ExportToGraphite(ctx, endpoint, &pm); err != nil {
+						// 如果推送失败，仅在开发日志中记录，避免刷屏干扰正常业务日志。
 						log.Dev.Infof(ctx, "error pushing metrics to graphite: %s\n", err)
 					}
 				}
@@ -1518,13 +1559,25 @@ func startGraphiteStatsExporter(
 	})
 }
 
-// startWriteNodeStatus begins periodically persisting status summaries for the
-// node and its stores.
+// startWriteNodeStatus 开启一个后台任务，定期将节点及其存储（Stores）的状态摘要持久化到数据库中。
+// 这些摘要信息主要用于 DB Console（Web 控制界面）展示节点的健康状况、负载和集群拓扑。
+//
+// 核心作用：
+// 1. 状态持久化：将内存中的实时指标（如 CPU、内存、SQL 连接数）定期写入系统表。
+// 2. 存活证明：配合 Liveness 机制，让集群的其他节点知道该节点的各项运行时性能指标。
+// 3. 避免状态复活：通过 `mustExist` 机制，确保在节点被“下线”（Decommission）后，不会因为后台采集任务而重新创建状态条目。
+//
+// 例子：
+// - 节点启动后，该函数以默认 10 秒（frequency）的间隔运行。
+// - 每次运行都会生成一个完整的 NodeStatus 消息，包含该节点的 Build 信息、资源使用量等。
+// - 数据被写入到 KV 存储中的特定系统键（NodeStatusKey）名下。
 func (n *Node) startWriteNodeStatus(frequency time.Duration) error {
+	// 1. 为上下文添加 "summaries" 标签，方便追踪日志。
 	ctx := logtags.AddTag(n.AnnotateCtx(context.Background()), "summaries", nil)
-	// Immediately record summaries once on server startup. The update loop below
-	// will only update the key if it exists, to avoid race conditions during
-	// node decommissioning, so we have to error out if we can't create it.
+
+	// 2. 在服务器启动时立即执行一次初始化写入。
+	// 这里使用 RunIdempotentWithRetry 是为了确保在分布式环境下，初始化操作能成功且只成功执行一次。
+	// 第一次写入时 mustExist 设置为 false，因为此时键值对可能还不存在。
 	if err := startup.RunIdempotentWithRetry(ctx,
 		n.stopper.ShouldQuiesce(),
 		"kv write node status", func(ctx context.Context) error {
@@ -1532,55 +1585,61 @@ func (n *Node) startWriteNodeStatus(frequency time.Duration) error {
 		}); err != nil {
 		return errors.Wrap(err, "error recording initial status summaries")
 	}
+
+	// 3. 启动后台协程执行周期性更新。
 	return n.stopper.RunAsyncTask(ctx, "write-node-status",
 		func(ctx context.Context) {
-			// Write a status summary immediately; this helps the UI remain
-			// responsive when new nodes are added.
+			// 定时器触发，间隔由参数 frequency 决定。
 			ticker := time.NewTicker(frequency)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ticker.C:
-					// The status key must already exist, to avoid race conditions
-					// during decommissioning of this node. Decommissioning may be
-					// carried out by a different node, so this avoids resurrecting
-					// the status entry after the decommissioner has removed it.
-					// See Server.Decommission().
+					// 4. 执行周期性状态写入。
+					// 注意：这里的 mustExist 被设置为 true。
+					// 这是一个重要的防御机制：如果该节点正在被“下线”，另一个节点可能已经删除了它的状态条目。
+					// 设置为 true 可以防止该后台任务在删除后又把节点状态“复活”。
 					if err := n.writeNodeStatus(ctx, true /* mustExist */); err != nil {
 						log.Dev.Warningf(ctx, "error recording status summaries: %s", err)
 					}
 				case <-n.stopper.ShouldQuiesce():
+					// 5. 收到系统优雅关闭信号，退出循环。
 					return
 				}
 			}
 		})
 }
 
-// writeNodeStatus retrieves status summaries from the supplied
-// NodeStatusRecorder and persists them to the cockroach data store.
-// If mustExist is true the status key must already exist and must
-// not change during writing -- if false, the status is always written.
+// writeNodeStatus 从 NodeStatusRecorder 获取状态摘要，并将其持久化到 Cockroach 存储中。
+// 参数 mustExist：如果为 true，表示状态键必须已经存在。这用于防止在节点下线后误创建状态条目。
 func (n *Node) writeNodeStatus(ctx context.Context, mustExist bool) error {
+	// 检查是否抑制状态写入（通常用于测试场景）
 	if n.suppressNodeStatus.Load() {
 		return nil
 	}
 	var err error
 	if runErr := n.stopper.RunTask(ctx, "node.Node: writing summary", func(ctx context.Context) {
+		// 1. 生成节点状态摘要
+		// 汇总 CPU、内存、SQL 会话、存储指标等信息。
 		nodeStatus := n.recorder.GenerateNodeStatus(ctx)
 		if nodeStatus == nil {
 			return
 		}
 
+		// 2. 执行健康检查
+		// 根据生成的节点状态，检查是否存在异常（如 CPU 过载、磁盘空间不足等）。
 		if result := n.recorder.CheckHealth(ctx, *nodeStatus); len(result.Alerts) != 0 {
 			var numNodes int
+			// 迭代 Gossip 信息以统计节点总数
 			if err := n.storeCfg.Gossip.IterateInfos(gossip.KeyNodeDescPrefix, func(k string, info gossip.Info) error {
 				numNodes++
 				return nil
 			}); err != nil {
 				log.Dev.Warningf(ctx, "%v", err)
 			}
+			// 如果是多节点集群，则记录健康警告并将其广播（Gossip）出去
 			if numNodes > 1 {
-				// Avoid this warning on single-node clusters, which require special UX.
+				// 避免在需要特殊 UX 的单节点集群上发出此警告
 				log.Dev.Warningf(ctx, "health alerts detected: %s", result)
 			}
 			if err := n.storeCfg.Gossip.AddInfoProto(
@@ -1589,11 +1648,11 @@ func (n *Node) writeNodeStatus(ctx context.Context, mustExist bool) error {
 				log.Dev.Warningf(ctx, "unable to gossip health alerts: %+v", result)
 			}
 
-			// TODO(tschottdorf): add a metric that we increment every time there are
-			// alerts. This can help understand how long the cluster has been in that
-			// state (since it'll be incremented every ~10s).
+			// TODO(tschottdorf): 添加一个每次出现告警时递增的指标，可以帮助了解集群处于该状态的时间。
 		}
 
+		// 3. 持久化状态
+		// 将最终的 NodeStatus 写入数据库。
 		err = n.recorder.WriteNodeStatus(ctx, n.storeCfg.DB, *nodeStatus, mustExist)
 	}); runErr != nil {
 		err = runErr
@@ -1601,45 +1660,53 @@ func (n *Node) writeNodeStatus(ctx context.Context, mustExist bool) error {
 	return err
 }
 
-// recordJoinEvent begins an asynchronous task which attempts to log a "node
-// join" or "node restart" event. This query will retry until it succeeds or the
-// server stops.
+// recordJoinEvent 开启一个异步任务，尝试记录“节点加入（Join）”或“节点重启（Restart）”事件。
+// 该操作会持续重试，直到成功或服务器停止。
 func (n *Node) recordJoinEvent(ctx context.Context) {
 	var event logpb.EventPayload
 	var nodeDetails *eventpb.CommonNodeEventDetails
+	// 判断是首次启动还是重启
 	if !n.initialStart {
+		// 节点重启事件
 		ev := &eventpb.NodeRestart{}
 		event = ev
 		nodeDetails = &ev.CommonNodeEventDetails
-		nodeDetails.LastUp = n.lastUp
+		nodeDetails.LastUp = n.lastUp // 记录上次运行的时间戳
 	} else {
+		// 节点首次加入集群事件
 		ev := &eventpb.NodeJoin{}
 		event = ev
 		nodeDetails = &ev.CommonNodeEventDetails
 		nodeDetails.LastUp = n.startedAt
 	}
+	// 填充事件的共同细节：时间戳、节点 ID
 	event.CommonDetails().Timestamp = timeutil.Now().UnixNano()
 	nodeDetails.StartedAt = n.startedAt
 	nodeDetails.NodeID = int32(n.Descriptor.NodeID)
 
+	// 调用内部方法记录结构化事件
 	n.logStructuredEvent(ctx, event)
 }
 
+// logStructuredEvent 负责将结构化事件输出到日志文件，并（可选地）持久化到数据库。
 func (n *Node) logStructuredEvent(ctx context.Context, event logpb.EventPayload) {
-	// Ensure that the event goes to log files even if LogRangeAndNodeEvents is
-	// disabled (which means skip the system.eventlog _table_).
+	// 1. 即使禁用了 system.eventlog 表的写入，事件也必须输出到本地 log 文件中。
+	// 这里使用 StructuredEvent 确保其格式可被解析。
 	log.StructuredEvent(ctx, severity.INFO, event)
 
+	// 2. 检查配置：是否允许将事件写入数据库的 system.eventlog 表。
 	if !n.storeCfg.LogRangeAndNodeEvents {
 		return
 	}
 
-	// InsertEventRecord processes the event asynchronously.
+	// 3. 异步执行 SQL 插入。
+	// InsertEventRecord 会将事件放入 SQL 执行队列，避免在启动关键路径上产生阻塞。
 	sql.InsertEventRecords(ctx, n.execCfg,
 		sql.LogToSystemTable|sql.LogToDevChannelIfVerbose, /* not LogExternally: we already call log.StructuredEvent above */
 		event,
 	)
 
+	// 4. 如果配置了事件勾子（主要用于测试或特定的通知逻辑），则触发它。
 	if n.onStructuredEvent != nil {
 		n.onStructuredEvent(ctx, event)
 	}

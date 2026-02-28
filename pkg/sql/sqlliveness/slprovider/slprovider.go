@@ -53,7 +53,9 @@ type provider struct {
 var _ sqlliveness.Provider = &provider{}
 
 func (p *provider) Start(ctx context.Context, regionPhysicalRep []byte) {
+	// 启动存储层，主要负责定期清理过期的会话记录。
 	p.Storage.Start(ctx)
+	// 启动实例层，负责创建和维护当前 SQL 实例的活跃会话（心跳）。
 	p.Instance.Start(ctx, regionPhysicalRep)
 }
 

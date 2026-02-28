@@ -328,21 +328,27 @@ func (c *connector) WaitForStart(ctx context.Context) error {
 	}
 }
 
-// Start launches the connector's worker thread and waits for it to successfully
-// connect to a KV node. Start returns once the connector has determined the
-// cluster's ID and set connector.rpcContext.ClusterID.
+// Start 启动 Connector 的工作线程，并等待其成功连接到 KV 节点。
+// 当 Connector 确定了集群 ID 并设置了 connector.rpcContext.ClusterID 后，Start 返回。
 func (c *connector) Start(ctx context.Context) error {
 	c.startCh = make(chan struct{})
+	// 调用内部启动逻辑。
 	c.startErr = c.internalStart(ctx)
+	// 关闭 startCh 通道，通知所有等待者 Connector 已完成启动尝试。
 	close(c.startCh)
 	return c.startErr
 }
 
+// internalStart 执行实际的连接器启动逻辑，包括启动 Gossip 订阅和租户设置订阅。
 func (c *connector) internalStart(ctx context.Context) error {
+	// 用于信号 Gossip 订阅是否已完成初始自举。
 	gossipStartupCh := make(chan struct{})
+	// 用于信号设置订阅是否已启动。
 	settingsStartupCh := make(chan error)
 	bgCtx := c.AnnotateCtx(context.Background())
 
+	// 1. [Gossip 订阅] 在后台启动 Gossip 订阅循环。
+	// 租户 SQL 服务器不需要直接加入 Gossip 网络，而是通过 Connector 订阅 KV 节点的 Gossip 信息。
 	if err := c.rpcContext.Stopper.RunAsyncTask(bgCtx, "connector-gossip", func(ctx context.Context) {
 		ctx = c.AnnotateCtx(ctx)
 		ctx, cancel := c.rpcContext.Stopper.WithCancelOnQuiesce(ctx)
@@ -352,6 +358,8 @@ func (c *connector) internalStart(ctx context.Context) error {
 		return err
 	}
 
+	// 2. [设置订阅] 在后台启动租户设置订阅循环。
+	// 从 KV 集群同步租户特有的设置覆盖（Settings Overrides）。
 	if err := c.rpcContext.Stopper.RunAsyncTask(bgCtx, "connector-settings", func(ctx context.Context) {
 		ctx = c.AnnotateCtx(ctx)
 		ctx, cancel := c.rpcContext.Stopper.WithCancelOnQuiesce(ctx)
@@ -361,8 +369,9 @@ func (c *connector) internalStart(ctx context.Context) error {
 		return err
 	}
 
-	// Block until we receive the first GossipSubscription event and the initial
-	// setting overrides.
+	// 阻塞等待：
+	// - 第一个 GossipSubscription 事件到达（至少要拿到 ClusterID）。
+	// - 初始设置覆盖加载完成。
 	for gossipStartupCh != nil || settingsStartupCh != nil {
 		select {
 		case <-gossipStartupCh:
@@ -385,15 +394,16 @@ func (c *connector) internalStart(ctx context.Context) error {
 	return nil
 }
 
-// runGossipSubscription listens for gossip subscription events. It closes the
-// given channel once the ClusterID gossip key has been handled.
-// Exits when the context is done.
+// runGossipSubscription 持续监听 Gossip 订阅事件。
+// 一旦处理了 ClusterID 这一关键 key，它就会关闭 startupCh 通道。
 func (c *connector) runGossipSubscription(ctx context.Context, startupCh chan struct{}) {
 	for ctx.Err() == nil {
+		// 获取一个可用的 RPC 客户端（指向 KV 节点）。
 		client, err := c.getClient(ctx)
 		if err != nil {
 			continue
 		}
+		// 发起 GossipSubscription RPC 请求，订阅特定的模式（Patterns）。
 		stream, err := client.GossipSubscription(ctx, &kvpb.GossipSubscriptionRequest{
 			Patterns: gossipSubsPatterns,
 		})
@@ -406,18 +416,19 @@ func (c *connector) runGossipSubscription(ctx context.Context, startupCh chan st
 			e, err := stream.Recv()
 			if err != nil {
 				if err == io.EOF {
-					break
+					break // 正常结束。
 				}
-				// Soft RPC error. Drop client and retry.
+				// 软 RPC 错误：丢弃客户端并进行重试。
 				log.Dev.Warningf(ctx, "error consuming GossipSubscription RPC: %v", err)
 				c.tryForgetClient(ctx, client)
 				break
 			}
 			if e.Error != nil {
-				// Hard logical error. We expect io.EOF next.
+				// 逻辑错误：记录日志并继续。
 				log.Dev.Errorf(ctx, "error consuming GossipSubscription RPC: %v", e.Error)
 				continue
 			}
+			// 根据匹配到的 Pattern，分发给相应的处理器（Handler）。
 			handler, ok := gossipSubsHandlers[e.PatternMatched]
 			if !ok {
 				log.Dev.Errorf(ctx, "unknown GossipSubscription pattern: %q", e.PatternMatched)
@@ -425,8 +436,7 @@ func (c *connector) runGossipSubscription(ctx context.Context, startupCh chan st
 			}
 			handler(c, ctx, e.Key, e.Content)
 
-			// Signal that startup is complete once the ClusterID gossip key has
-			// been handled.
+			// 关键点：一旦获取到 ClusterID，标志着基本的连接自举已完成。
 			if startupCh != nil && e.PatternMatched == gossip.KeyClusterID {
 				close(startupCh)
 				startupCh = nil

@@ -79,9 +79,9 @@ type DB interface {
 
 // Factory is used to construct RangeFeeds.
 type Factory struct {
-	stopper *stop.Stopper
-	client  DB
-	knobs   *TestingKnobs
+	stopper *stop.Stopper // 生命周期管理
+	client  DB            // 向下层对接的接口（可 mock）
+	knobs   *TestingKnobs // 测试注入点
 }
 
 // TestingKnobs is used to inject behavior into a rangefeed for testing.
@@ -175,21 +175,21 @@ type OnValues func(ctx context.Context, values []kv.KeyValue)
 
 // RangeFeed represents a running RangeFeed.
 type RangeFeed struct {
-	config
+	config  // 所有 Option 配置
 	name    string
 	client  DB
 	stopper *stop.Stopper
 	knobs   *TestingKnobs
 
-	initialTimestamp hlc.Timestamp
-	spans            []roachpb.Span
-	spansDebugStr    string // Debug string describing spans
+	initialTimestamp hlc.Timestamp  // 订阅起始时间（exclusive）
+	spans            []roachpb.Span // 监听范围
+	spansDebugStr    string         // Debug string describing spans
 
 	onValue OnValue
 
-	cancel  context.CancelFunc
-	running sync.WaitGroup
-	started int32 // accessed atomically
+	cancel  context.CancelFunc // 停止信号
+	running sync.WaitGroup     // 等待后台 goroutine 退出
+	started int32              // 一次性启动保护
 }
 
 // Start kicks off the rangefeed in an async task, it can only be invoked once.
@@ -224,6 +224,8 @@ func (f *RangeFeed) StartFromFrontier(ctx context.Context, frontier span.Frontie
 func (f *RangeFeed) start(
 	ctx context.Context, frontier span.Frontier, ownsFrontier bool, resumeFromFrontier bool,
 ) error {
+	//- `started` 是 `int32`，用 atomic CAS 保证只有一个调用者能从 0 改为 1。
+	//- 为什么不用 `sync.Once`？因为 `sync.Once` 不会返回错误；而这里需要通知调用方”你调用错了”。
 	if !atomic.CompareAndSwapInt32(&f.started, 0, 1) {
 		return errors.AssertionFailedf("rangefeed already started")
 	}
@@ -236,14 +238,19 @@ func (f *RangeFeed) start(
 
 	runWithFrontier := func(ctx context.Context) {
 		if ownsFrontier {
+			//ownsFrontier=true，RangeFeed 自己创建 frontier，用完自己释放（将 B-Tree 节点归还对象池）。
 			defer frontier.Release()
 		}
 		// pprof.Do function does exactly what we do here, but it also results in
 		// pprof.Do function showing up in the stack traces -- so, just set and reset
 		// labels manually.
+		//- 在所有由这个 RangeFeed 产生的 goroutine 调用栈上打上 `rangefeed=<name>` 标签。
+		//- 在 `go tool pprof` 中可以用这些标签过滤，精确定位哪个订阅者在消耗 CPU。
 		ctx, reset := pprofutil.SetProfilerLabels(
 			ctx, append(f.extraPProfLabels, "rangefeed", f.name)...,
 		)
+		//因为 Go 的 goroutine 是复用的（尤其是 net/http server、gRPC、worker pool），
+		//如果不恢复标签，后续请求/任务就会继承上一个请求的标签，导致 profile 彻底混乱（“标签污染”）。
 		defer reset()
 
 		if f.invoker != nil {
@@ -308,12 +315,25 @@ func (f *RangeFeed) run(ctx context.Context, frontier span.Frontier, resumeWithF
 	defer f.running.Done()
 	r := retry.StartWithCtx(ctx, f.retryOptions)
 	restartLogEvery := log.Every(10 * time.Second)
-
+	// ─── 阶段 1：初始扫描（仅首次，阻塞完成） ───
+	//withInitialScan=true:
+	//    runInitialScan() 完成后，frontier 中每个 span 的 ts = initialTimestamp
+	//    → 下一次 RangeFeed 从 initialTimestamp+1 开始（catchup scan 区间 = 空集）
+	//
+	//withInitialScan=false, resumeWithFrontier=false:
+	//    手动 frontier.Forward(sp, initialTimestamp)
+	//    → 和上面等价，但跳过了数据扫描
+	//
+	//resumeWithFrontier=true (StartFromFrontier 路径):
+	//    frontier 已由调用方设置好每个 span 的时间戳
+	//    → RangeFeed 从各 span 自己的时间戳开始，支持分 span 进度恢复
 	if f.withInitialScan {
+		// runInitialScan() 完成后，frontier 中每个 span 的 ts = initialTimestamp
 		if failed := f.runInitialScan(ctx, &restartLogEvery, &r, frontier); failed {
 			return
 		}
 	} else if !resumeWithFrontier {
+		// 没有初始扫描，手动将 frontier 推进到 initialTimestamp
 		for _, sp := range f.spans {
 			if _, err := frontier.Forward(sp, f.initialTimestamp); err != nil {
 				if fn := f.onUnrecoverableError; fn != nil {
@@ -331,6 +351,7 @@ func (f *RangeFeed) run(ctx context.Context, frontier span.Frontier, resumeWithF
 
 	// TODO(ajwerner): Consider adding event buffering. Doing so would require
 	// draining when the rangefeed fails.
+	// ─── 阶段 2：构建 RangeFeed 选项 ───
 	eventCh := make(chan kvcoord.RangeFeedMessage)
 
 	var rangefeedOpts []kvcoord.RangeFeedOption
@@ -338,6 +359,7 @@ func (f *RangeFeed) run(ctx context.Context, frontier span.Frontier, resumeWithF
 	// as to this client; if an onValues is configured we can also bulk-process
 	// values, but even if it isn't we know how to unwrap a bulk delivery and pass
 	// each event to the caller's individual event handlers.
+	//告诉服务端：可以将多个事件打包为一个 BulkEvents 消息发送，减少 channel 写入次数和反序列化开销。
 	rangefeedOpts = append(rangefeedOpts, kvcoord.WithBulkDelivery())
 
 	if f.scanConfig.overSystemTable {
@@ -356,7 +378,7 @@ func (f *RangeFeed) run(ctx context.Context, frontier span.Frontier, resumeWithF
 		rangefeedOpts = append(rangefeedOpts, kvcoord.WithMetadata())
 	}
 	rangefeedOpts = append(rangefeedOpts, kvcoord.WithConsumerID(f.consumerID))
-
+	// ─── 阶段 3：重试主循环 ───
 	for i := 0; r.Next(); i++ {
 		ts := frontier.Frontier()
 		if log.ExpensiveLogEnabled(ctx, 1) {
@@ -392,9 +414,14 @@ func (f *RangeFeed) run(ctx context.Context, frontier span.Frontier, resumeWithF
 			}
 			return f.processEvents(ctx, frontier, eventCh)
 		}
-
+		// ─── 阶段 4：错误分类处理 ───
+		//1. 将两个 task 在同一个子 ctx 下并发运行。
+		//2. 任意一个 task 返回非 nil 错误时，取消子 ctx，等待另一个 task 也退出。
+		//3. 返回第一个出现的非 nil 错误（或若都成功则返回 nil）。
 		err := ctxgroup.GoAndWait(ctx, rangeFeedTask, processEventsTask)
+		//MVCC 历史已被 GC 删除，无法从该时间点重建事件流
 		if errors.HasType(err, &kvpb.BatchTimestampBeforeGCError{}) ||
+			//历史被物理破坏，订阅者无法获得正确的事件序列
 			errors.HasType(err, &kvpb.MVCCHistoryMutationError{}) {
 			if errCallback := f.onUnrecoverableError; errCallback != nil {
 				errCallback(ctx, err)
@@ -412,7 +439,7 @@ func (f *RangeFeed) run(ctx context.Context, frontier span.Frontier, resumeWithF
 			log.VEventf(ctx, 1, "exiting rangefeed")
 			return
 		}
-
+		// ─── 阶段 5：退避重置判断 ───
 		ranFor := start.Elapsed()
 		log.VEventf(ctx, 1, "restarting rangefeed for %v after %v",
 			f.spansDebugStr, ranFor)
@@ -422,8 +449,10 @@ func (f *RangeFeed) run(ctx context.Context, frontier span.Frontier, resumeWithF
 
 		// If the rangefeed ran successfully for long enough, reset the retry
 		// state so that the exponential backoff begins from its minimum value.
-		if ranFor > resetThreshold {
+		if ranFor > resetThreshold { // 30秒
 			i = 1
+			//假设 RangeFeed 稳定运行了 2 小时，然后因为一次短暂的节点重启失败。如果不重置，
+			//下一次重试的等待时间会是 maxBackoff（可能 10 秒），合理；但实际上此时可能只需要等 1-2 秒节点就恢复了。
 			r.Reset()
 		}
 	}
@@ -449,18 +478,31 @@ func (f *RangeFeed) processEvent(
 	ctx context.Context, frontier span.Frontier, ev *kvpb.RangeFeedEvent, registeredSpan roachpb.Span,
 ) error {
 	switch {
-	case ev.Val != nil:
+	case ev.Val != nil: // 普通值变更
+		//回调是同步的。用户回调不能阻塞太久，否则会积压 eventCh，进而背压到服务端（channel 满了生产者会 block）。
 		f.onValue(ctx, ev.Val)
-	case ev.Checkpoint != nil:
+	case ev.Checkpoint != nil: // watermark 推进
 		ts := ev.Checkpoint.ResolvedTS
 		if f.frontierQuantize != 0 {
+			//将时间戳截断到最近的量化边界（如 1 秒）。目的：减少 B-Tree frontier 中的 span 碎片。
+			//当多个 span 的时间戳量化到同一值时，它们可以合并为一个节点，减少内存和查找开销。
 			ts.Logical = 0
 			ts.WallTime -= ts.WallTime % int64(f.frontierQuantize)
 		}
+		//`frontier.Forward()` 内部调用 `btreeFrontier.forward()`，会执行：
+		//- 在 B-Tree 中找到与 `span` 重叠的所有 `btreeFrontierEntry`。
+		//- 若某个 entry 的 ts 小于新 ts，更新它（也需要更新 minHeap 中的位置）。
+		//- 若 span 边界不对齐（如传入 span 比某个 entry 大），需要分裂 entry。
+		//- 相邻 entry 时间戳相同时合并（减少碎片）。
+		//
+		//`advanced=true` 当且仅当全局最小时间戳（`frontier.Frontier()` = minHeap 堆顶）也随之提升了。
 		advanced, err := frontier.Forward(ev.Checkpoint.Span, ts)
 		if err != nil {
 			return err
 		}
+		//onCheckpoint:         每次收到 checkpoint 都调用（可能不 advance frontier 整体）
+		//onFrontierAdvance:    只在 frontier 整体推进时调用（下游关心"最慢的 span 到哪了"）
+		//frontierVisitor:      每次 checkpoint 后都调用，传入完整的 frontier 快照
 		if f.onCheckpoint != nil {
 			f.onCheckpoint(ctx, ev.Checkpoint)
 		}
@@ -470,13 +512,13 @@ func (f *RangeFeed) processEvent(
 		if f.frontierVisitor != nil {
 			f.frontierVisitor(ctx, advanced, frontier)
 		}
-	case ev.SST != nil:
+	case ev.SST != nil: // SST 文件注入
 		if f.onSSTable == nil {
 			return errors.AssertionFailedf(
 				"received unexpected rangefeed SST event with no OnSSTable handler")
 		}
 		f.onSSTable(ctx, ev.SST, registeredSpan)
-	case ev.DeleteRange != nil:
+	case ev.DeleteRange != nil: // MVCC 范围删除
 		if f.onDeleteRange == nil {
 			if f.knobs != nil && f.knobs.IgnoreOnDeleteRangeError {
 				return nil
@@ -485,15 +527,17 @@ func (f *RangeFeed) processEvent(
 				"received unexpected rangefeed DeleteRange event with no OnDeleteRange handler: %s", ev)
 		}
 		f.onDeleteRange(ctx, ev.DeleteRange)
-	case ev.Metadata != nil:
+	case ev.Metadata != nil: // 元数据事件
 		if f.onMetadata == nil {
 			return errors.AssertionFailedf("received unexpected metadata event with no OnMetadata handler")
 		}
 		f.onMetadata(ctx, ev.Metadata)
-	case ev.Error != nil:
-		// Intentionally do nothing, we'll get an error returned from the
-		// call to RangeFeed.
-	case ev.BulkEvents != nil:
+	case ev.Error != nil: // 错误（静默，由 RangeFeed RPC 返回值携带）
+	//服务端会在关闭流之前发送一个 Error 事件，然后关闭 gRPC stream，使得 DB.RangeFeed() 的调用返回非 nil 错误。
+	//在客户端这里收到 Error 事件时什么都不做，等待 RPC 调用自然返回。这避免了重复处理错误的问题。
+	// Intentionally do nothing, we'll get an error returned from the
+	// call to RangeFeed.
+	case ev.BulkEvents != nil: // 批量事件（优化路径）
 		if f.onValues != nil {
 			// We can optimistically assume the bulk event consists of all value
 			// events, and allocate a buffer for them to be passed to onValues. In the
@@ -502,6 +546,8 @@ func (f *RangeFeed) processEvent(
 			// this buffer and any events we might have copied to it so far and just
 			// fallback to to processing each event, but this should be so uncommon it
 			// is not worth worrying about the potential wasted work.
+			//快速路径（全是 Val 事件 + 用户注册了 onValues）：
+			//一次性构建 []kv.KeyValue，调用批量回调，避免 N 次函数调用和 N 次 interface dispatch 开销。
 			allValues := true
 			buf := make([]kv.KeyValue, len(ev.BulkEvents.Events))
 			for i := range ev.BulkEvents.Events {
@@ -522,6 +568,7 @@ func (f *RangeFeed) processEvent(
 		}
 		// Either the bulk event contains non-value events or a onValues handler is
 		// not configured, so process each event individually.
+		//- 回退路径：遇到非 Val 事件（如 range tombstone），或用户没注册 onValues，逐个递归调用 processEvent。
 		for _, e := range ev.BulkEvents.Events {
 			if err := f.processEvent(ctx, frontier, e, registeredSpan); err != nil {
 				return err

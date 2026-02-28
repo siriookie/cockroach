@@ -153,15 +153,28 @@ func (ls *Stores) VisitStores(visitor func(s *Store) error) error {
 	return err
 }
 
-// GetReplicaForRangeID returns the replica and store which contains the
-// specified range. If the replica is not found on any store then
-// kvpb.RangeNotFoundError will be returned.
+// GetReplicaForRangeID 的核心作用：在本节点管理的所有 Store 中，“全城搜索”指定的 Range ID。
+//
+// 逻辑流程：
+// 1. 遍历所有 Store：由于一个节点可以挂载多个磁盘（每个磁盘对应一个 Store），
+//    且同一个 Range 的副本只可能存在于其中一个 Store 上。
+// 2. 局部查找：在每个 Store 的内存索引中查询是否存在对应的 Replica。
+// 3. 返回结果：如果找到了，返回该副本（Replica 指针）和它所属的 Store；
+//    如果跑遍了所有 Store 也没找到，则返回 RangeNotFoundError。
+//
+// 例子：
+// 假设节点有三个 Store：S1(磁盘1), S2(磁盘2), S3(磁盘3)。我们要找 Range 50。
+// - 检查 S1：没有 Range 50。
+// - 检查 S2：发现 Range 50 的副本 R_50 在这里！返回 (R_50, S2, nil)。
+// - 如果 S1, S2, S3 都没有：返回 (nil, nil, RangeNotFoundError)。
 func (ls *Stores) GetReplicaForRangeID(
 	ctx context.Context, rangeID roachpb.RangeID,
 ) (*Replica, *Store, error) {
 	var replica *Replica
 	var store *Store
+	// 遍历所有本地 Store，执行查找任务。
 	if err := ls.VisitStores(func(s *Store) error {
+		// 检查当前 Store 是否包含该 Range。
 		r := s.GetReplicaIfExists(rangeID)
 		if r != nil {
 			replica, store = r, s
@@ -170,6 +183,7 @@ func (ls *Stores) GetReplicaForRangeID(
 	}); err != nil {
 		log.KvExec.Fatalf(ctx, "unexpected error: %s", err)
 	}
+	// 如果所有 Store 都没有找到，抛出特定的未找到错误。
 	if replica == nil {
 		return nil, nil, kvpb.NewRangeNotFoundError(rangeID, 0)
 	}

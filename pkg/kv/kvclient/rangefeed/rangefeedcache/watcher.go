@@ -58,24 +58,26 @@ import (
 // Users seeking to leverage the Updates which arrive with that delay but also
 // react to the row-level events as they arrive can hijack the translateEvent
 // function to trigger some non-blocking action.
+// Watcher 是一个泛型框架，为任何需要基于
+// rangefeed 维护一致性缓存的场景提供了标准化的实现。KVSubscriber 是它最重要的使用者之一。
 type Watcher[E rangefeedbuffer.Event] struct {
-	name                   redact.SafeString
+	name                   redact.SafeString // "spanconfig-subscriber"
 	clock                  *hlc.Clock
 	rangefeedFactory       *rangefeed.Factory
-	spans                  []roachpb.Span
-	bufferSize             int
-	withPrevValue          bool
-	withRowTSInInitialScan bool
+	spans                  []roachpb.Span // 监听的 KV 范围
+	bufferSize             int            // 增量更新阶段的 buffer 上限
+	withPrevValue          bool           // 是否携带删除前的值
+	withRowTSInInitialScan bool           // 初始扫描是否携带行时间戳
 
-	started int32 // accessed atomically
+	started int32 // 原子变量，防止并发启动
 
-	translateEvent TranslateEventFunc[E]
-	onUpdate       OnUpdateFunc[E]
+	translateEvent TranslateEventFunc[E] // 事件翻译函数
+	onUpdate       OnUpdateFunc[E]       // 更新回调函数
 
-	lastFrontierTS hlc.Timestamp // used to assert monotonicity across rangefeed attempts
+	lastFrontierTS hlc.Timestamp // 跨 rangefeed 尝试的 frontier 单调性断言
 
 	// Used to force a restart during testing.
-	restartErrCh chan error
+	restartErrCh chan error // 测试用：注入重启错误
 
 	knobs TestingKnobs
 }
@@ -229,6 +231,7 @@ func Start[E rangefeedbuffer.Event](
 // or when an error occurs. For the latter, it's expected that callers will
 // re-run the watcher.
 func (s *Watcher[E]) Run(ctx context.Context) error {
+	// [1] CAS 防止并发启动
 	if !atomic.CompareAndSwapInt32(&s.started, 0, 1) {
 		log.Dev.Fatal(ctx, "currently started: only allowed once at any point in time")
 	}
@@ -249,7 +252,9 @@ func (s *Watcher[E]) Run(ctx context.Context) error {
 	// transparently query the backing table if the record requested is not found.
 	// We could also have the initial scan operate in chunks, handing off results
 	// to the caller incrementally, all within the "initial scan" phase.
+	// [2] 创建无限制 buffer（初始扫描阶段不设上限）
 	buffer := rangefeedbuffer.New[E](math.MaxInt)
+	// [3] 创建三个协调通道
 	frontierBumpedCh, initialScanDoneCh, errCh := make(chan struct{}), make(chan struct{}), make(chan error)
 	mu := struct { // serializes access between the rangefeed and the main thread here
 		syncutil.Mutex
@@ -261,7 +266,7 @@ func (s *Watcher[E]) Run(ctx context.Context) error {
 		s.lastFrontierTS.Forward(mu.frontierTS)
 		mu.Unlock()
 	}()
-
+	// [4] 事件翻译回调
 	onValue := func(ctx context.Context, ev *kvpb.RangeFeedValue) {
 		bEv, ok := s.translateEvent(ctx, ev)
 		if !ok {
@@ -274,16 +279,16 @@ func (s *Watcher[E]) Run(ctx context.Context) error {
 				// The context is canceled when the rangefeed is closed by the
 				// main handler goroutine. It's closed after we stop listening
 				// to errCh.
-			case errCh <- err:
+			case errCh <- err: // buffer 溢出，报告错误
 			}
 		}
 	}
-
+	// [5] 确定初始扫描起始时间戳
 	initialScanTS := s.clock.Now()
-	if initialScanTS.Less(s.lastFrontierTS) {
+	if initialScanTS.Less(s.lastFrontierTS) { // 时间戳回退 → fatal（不可恢复）
 		log.Dev.Fatalf(ctx, "%s: initial scan timestamp (%s) regressed from last recorded frontier (%s)", s.name, initialScanTS, s.lastFrontierTS)
 	}
-
+	// [6] 构造并启动 RangeFeed
 	rangeFeed := s.rangefeedFactory.New(string(s.name), initialScanTS,
 		onValue,
 		rangefeed.WithInitialScan(func(ctx context.Context) {
@@ -297,20 +302,21 @@ func (s *Watcher[E]) Run(ctx context.Context) error {
 		}),
 		rangefeed.WithOnFrontierAdvance(func(ctx context.Context, frontierTS hlc.Timestamp) {
 			mu.Lock()
-			mu.frontierTS = frontierTS
+			mu.frontierTS = frontierTS // 更新 frontier 时间戳
 			mu.Unlock()
 
 			select {
 			case <-ctx.Done():
-			case frontierBumpedCh <- struct{}{}:
+			case frontierBumpedCh <- struct{}{}: // frontier 推进信号
 			}
 		}),
 		// TODO(irfansharif): Consider making this configurable on the Watcher
 		// type. As of 2022-11 all uses of this type are system-internal ones
 		// where a higher admission-pri makes sense.
-		rangefeed.WithSystemTablePriority(),
-		rangefeed.WithDiff(s.withPrevValue),
+		rangefeed.WithSystemTablePriority(), // 高优先级准入
+		rangefeed.WithDiff(s.withPrevValue), // 携带 PrevValue
 		rangefeed.WithRowTimestampInInitialScan(s.withRowTSInInitialScan),
+		rangefeed.WithRowTimestampInInitialScan(s.withRowTSInInitialScan), // 认证错误 → 永久失败
 		rangefeed.WithOnInitialScanError(func(ctx context.Context, err error) (shouldFail bool) {
 			log.Dev.VInfof(ctx, 1, "initial scan error: %s", err)
 			// TODO(irfansharif): Consider if there are other errors which we
@@ -330,6 +336,7 @@ func (s *Watcher[E]) Run(ctx context.Context) error {
 			return false
 		}),
 	)
+	//启动监听rangefeed
 	if err := rangeFeed.Start(ctx, s.spans); err != nil {
 		return err
 	}
@@ -344,6 +351,7 @@ func (s *Watcher[E]) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+			// Frontier 推进 → 刷新 buffer → 发送 IncrementalUpdate
 
 		case <-frontierBumpedCh:
 			mu.Lock()
@@ -352,17 +360,20 @@ func (s *Watcher[E]) Run(ctx context.Context) error {
 			s.handleUpdate(ctx, buffer, frontierTS, IncrementalUpdate)
 
 		case <-initialScanDoneCh:
+			// 初始扫描完成 → 刷新 buffer → 发送 CompleteUpdate
+
 			s.handleUpdate(ctx, buffer, initialScanTS, CompleteUpdate)
 			// We're done with our initial scan, set a hard limit for incremental
 			// updates going forward.
+			// ★ 关键：此后设置 buffer 上限
 			buffer.SetLimit(s.bufferSize)
 
 		case err := <-errCh:
-			return err
+			return err // buffer 溢出或认证错误 → 退出 Run
 		case err := <-s.restartErrCh:
 			return err
 		case err := <-s.knobs.ErrorInjectionCh:
-			return err
+			return err // 测试注入的重启错误
 		}
 	}
 }
@@ -383,7 +394,7 @@ func (s *Watcher[E]) handleUpdate(
 	s.onUpdate(ctx, Update[E]{
 		Type:      updateType,
 		Timestamp: ts,
-		Events:    buffer.Flush(ctx, ts),
+		Events:    buffer.Flush(ctx, ts), // 取出所有 ts <= 给定时间戳的事件
 	})
 	if fn := s.knobs.OnTimestampAdvance; fn != nil {
 		fn(ts)

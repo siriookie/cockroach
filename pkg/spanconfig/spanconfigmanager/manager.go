@@ -81,9 +81,8 @@ func New(
 	}
 }
 
-// Start creates a background task that starts the auto span config
-// reconciliation job. It also periodically ensures that the job exists,
-// recreating it if it doesn't.
+// Start 创建一个后台任务，启动自动跨度配置（auto span config）对账作业。
+// 它还会定期确保该作业存在，如果不存在则重新创建。
 func (m *Manager) Start(ctx context.Context) error {
 	return m.stopper.RunAsyncTask(ctx, "span-config-mgr", func(ctx context.Context) {
 		m.run(ctx)

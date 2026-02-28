@@ -152,16 +152,11 @@ func NewWithOverrides(
 	return s
 }
 
-// Start will start the SettingsWatcher. It returns after the initial settings
-// have been retrieved. An error will be returned if the context is canceled or
-// the stopper is stopped prior to the initial data being retrieved.
+// Start 启动 SettingsWatcher。它在检索到初始设置后返回。
+// 如果在检索到初始数据之前上下文被取消或停止器停止，则返回错误。
 func (s *SettingsWatcher) Start(ctx context.Context) error {
-	// Ensure we inform the read-only default notify callback function
-	// of the build-time defaults for SystemVisible settings.
-	//
-	// Note: we cannot call this in the New() function above because
-	// this can only be called after the in-RAM values have been loaded
-	// from disk, which happens some time during server PreStart().
+	// 1. [初始默认值] 加载 SystemVisible 设置的编译时默认值。
+	// 确保在从磁盘加载值之前，内存中已有基本的默认值。
 	s.loadInitialReadOnlyDefaults(ctx)
 
 	settingsTablePrefix := s.codec.TablePrefix(keys.SettingsTableID)
@@ -177,6 +172,7 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 	}{
 		ch: make(chan struct{}),
 	}
+	// noteUpdate 处理来自 rangefeedcache 的更新事件。
 	noteUpdate := func(update rangefeedcache.Update[*kvpb.RangeFeedValue]) {
 		if update.Type != rangefeedcache.CompleteUpdate {
 			return
@@ -184,35 +180,31 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.mu.updater.ResetRemaining(ctx)
+		// 初始扫描完成后，关闭通道以解除 Start 方法的阻塞。
 		if !initialScan.done {
 			log.Dev.VInfof(ctx, 1, "initial settings scan complete")
 			initialScan.done = true
 			close(initialScan.ch)
 		}
-		// Used by TestingRestart().
+		// 用于 TestingRestart()。
 		close(s.mu.updateWait)
 		s.mu.updateWait = make(chan struct{})
 	}
 
 	s.mu.values = make(map[settings.InternalKey]settingsValue)
 
+	// 2. [配置覆盖] 如果配置了覆盖监控器，则先初始化覆盖。
 	if s.overridesMonitor != nil {
-		// Initialize the overrides. We want to do this before processing
-		// the settings table, otherwise we could see temporary
-		// transitions to the value in the table.
 		s.mu.overrides = make(map[settings.InternalKey]settings.EncodedValue)
-		// Wait for the overrides monitor to be ready, which also ensures
-		// it has received initial data from the KV layer.
+		// 等待监控器就绪。
 		if err := s.overridesMonitor.WaitForStart(ctx); err != nil {
 			return err
 		}
-		// Fetch the overrides once initially, synchronously with the
-		// `Start` call. This ensures that all the overrides have been
-		// applied by the time the `Start` call completes.
+		// 同步获取初始覆盖。
 		overridesCh := s.updateOverrides(ctx)
 		log.Dev.Infof(ctx, "applied initial setting overrides")
 
-		// Set up a worker to watch the monitor asynchronously.
+		// 启动异步 worker 监听后续覆盖变更。
 		if err := s.stopper.RunAsyncTask(ctx, "setting-overrides", func(ctx context.Context) {
 			for {
 				select {
@@ -224,21 +216,16 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 				}
 			}
 		}); err != nil {
-			// We are shutting down.
 			return err
 		}
 	}
 
-	// bufferSize configures how large of a buffer to permit for accumulated
-	// changes of settings between resolved timestamps. It's an arbitrary
-	// number thought ought to be big enough. Note that if there is no underlying
-	// storage, we'll never produce any events in s.handleKV() so we can use a
-	// bufferSize of 0.
 	var bufferSize int
 	if s.storage != nil {
 		bufferSize = settings.MaxSettings * 3
 	}
 
+	// 3. [RangeFeed 监听] 创建 Watcher 监听 system.settings 表。
 	c := rangefeedcache.NewWatcher(
 		"settings-watcher",
 		s.clock, s.f,
@@ -247,6 +234,7 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 		false, // withPrevValue
 		true,  // withRowTSInInitialScan
 		func(ctx context.Context, kv *kvpb.RangeFeedValue) (*kvpb.RangeFeedValue, bool) {
+			// 处理具体的 KV 更新事件。
 			return s.handleKV(ctx, kv)
 		},
 		func(ctx context.Context, update rangefeedcache.Update[*kvpb.RangeFeedValue]) {
@@ -258,14 +246,10 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 
 	allowedFailures := 10
 
-	// Kick off the rangefeedcache which will retry until the stopper stops.
+	// 启动 rangefeedcache。
 	if err := rangefeedcache.Start(ctx, s.stopper, c, func(err error) {
 		if !initialScan.done {
-			// TODO(dt): ideally the auth checker, which makes rejection decisions
-			// based on cached data that is updated async via rangefeed, would block
-			// for some amount of time before rejecting a request if it can determine
-			// that its information is old/maybe stale, to avoid spurious rejections
-			// while making correct rejection potentially slightly slower to return.
+			// 在租户处于 service mode "none" 时允许一定次数的失败重试。
 			if strings.Contains(err.Error(), `operation not allowed when in service mode "none"`) && allowedFailures > 0 {
 				allowedFailures--
 			} else {
@@ -277,10 +261,10 @@ func (s *SettingsWatcher) Start(ctx context.Context) error {
 			s.resetUpdater()
 		}
 	}); err != nil {
-		return err // we're shutting down
+		return err
 	}
 
-	// Wait for the initial scan before returning.
+	// 4. [阻塞等待] 等待初始扫描完成。
 	select {
 	case <-initialScan.ch:
 		return initialScan.err
@@ -334,6 +318,7 @@ func (s *SettingsWatcher) TestingRestart() {
 	}
 }
 
+// handleKV 处理来自 rangefeed 的 KV 事件。
 func (s *SettingsWatcher) handleKV(
 	ctx context.Context, kv *kvpb.RangeFeedValue,
 ) (*kvpb.RangeFeedValue, bool) {
@@ -343,20 +328,22 @@ func (s *SettingsWatcher) handleKV(
 	}
 
 	var alloc tree.DatumAlloc
+	// 解码 system.settings 表的行。
 	settingKeyS, val, tombstone, err := s.dec.DecodeRow(rkv, &alloc)
 	if err != nil {
-		// This should never happen: the rangefeed should only ever deliver valid SQL rows.
 		err = errors.NewAssertionErrorWithWrappedErrf(err, "failed to decode settings row %v", kv.Key)
 		logcrash.ReportOrPanic(ctx, &s.settings.SV, "%w", err)
 		return nil, false
 	}
 	settingKey := settings.InternalKey(settingKeyS)
 
+	// 查找对应的本地设置。
 	setting, ok := settings.LookupForLocalAccessByKey(settingKey, s.codec.ForSystemTenant())
 	if !ok {
 		log.Dev.Warningf(ctx, "unknown setting %s, skipping update", settingKey)
 		return nil, false
 	}
+	// 安全检查。
 	if !s.codec.ForSystemTenant() {
 		if setting.Class() != settings.ApplicationLevel {
 			log.Dev.Warningf(ctx, "ignoring read-only setting %s", settingKey)
@@ -366,19 +353,13 @@ func (s *SettingsWatcher) handleKV(
 
 	log.VEventf(ctx, 1, "found rangefeed event for %q = %+v (tombstone=%v)", settingKey, val, tombstone)
 
-	// Ensure that the update is persisted to the local cache before we
-	// propagate the value to the in-RAM store. This ensures the latest
-	// value will be reloaded from the cache if the service is
-	// interrupted abruptly after the new value is seen by a client.
-	//
-	// Note: it is because we really want the cache to be updated before
-	// the in-RAM store that we do this here instead of batching the
-	// updates in the onUpdate rangefeed function.
+	// 如果配置了存储，则持久化到本地缓存快照。
 	if s.storage != nil {
 		s.snapshot = rangefeedbuffer.MergeKVs(s.snapshot, []roachpb.KeyValue{rkv})
 		s.storage.SnapshotKVs(ctx, s.snapshot)
 	}
 
+	// 尝试将新值设置到内存中的 settings 结构中。
 	s.maybeSet(ctx, settingKey, settingsValue{
 		val:       val,
 		ts:        kv.Value.Timestamp,
@@ -593,12 +574,13 @@ func (s *SettingsWatcher) GetStorageClusterActiveVersion() clusterversion.Cluste
 // 'version' setting is not present in the system.settings table.
 var errVersionSettingNotFound = errors.New("got nil value for tenant cluster version row")
 
-// GetClusterVersionFromStorage reads the cluster version from the storage via
-// the given transaction.
+// GetClusterVersionFromStorage 通过给定的事务从存储（system.settings 表）中直接读取集群版本。
 func (s *SettingsWatcher) GetClusterVersionFromStorage(
 	ctx context.Context, txn *kv.Txn,
 ) (clusterversion.ClusterVersion, error) {
+	// 构造 settings 表的主键前缀。
 	indexPrefix := s.codec.IndexPrefix(keys.SettingsTableID, uint32(1))
+	// 编码 key: "version"。
 	key := encoding.EncodeUvarintAscending(encoding.EncodeStringAscending(indexPrefix, "version"), uint64(0))
 	row, err := txn.Get(ctx, key)
 	if err != nil {
@@ -607,11 +589,13 @@ func (s *SettingsWatcher) GetClusterVersionFromStorage(
 	if row.Value == nil {
 		return clusterversion.ClusterVersion{}, errVersionSettingNotFound
 	}
+	// 解码行数据。
 	_, val, _, err := s.dec.DecodeRow(roachpb.KeyValue{Key: row.Key, Value: *row.Value}, nil /* alloc */)
 	if err != nil {
 		return clusterversion.ClusterVersion{}, err
 	}
 	var version clusterversion.ClusterVersion
+	// 反序列化版本信息。
 	if err := protoutil.Unmarshal([]byte(val.Value), &version); err != nil {
 		return clusterversion.ClusterVersion{}, err
 	}

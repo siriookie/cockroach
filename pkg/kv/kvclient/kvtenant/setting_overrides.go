@@ -23,15 +23,16 @@ import (
 	"github.com/cockroachdb/errors/errorspb"
 )
 
-// runTenantSettingsSubscription listens for tenant setting override changes.
-// It closes the given channel once the initial set of overrides were obtained.
-// Exits when the context is done.
+// runTenantSettingsSubscription 持续监听租户设置覆盖（Tenant Setting Overrides）的变化。
+// 一旦成功获取到初始的一组覆盖项，它就会关闭 startupCh 通道。
 func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh chan<- error) {
 	for ctx.Err() == nil {
+		// 获取 RPC 客户端。
 		client, err := c.getClient(ctx)
 		if err != nil {
 			continue
 		}
+		// 发起 TenantSettings 订阅请求，这是一个长链接流（Stream）。
 		stream, err := client.TenantSettings(ctx, &kvpb.TenantSettingsRequest{
 			TenantID: c.tenantID,
 		})
@@ -41,8 +42,7 @@ func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh
 			continue
 		}
 
-		// Reset the sentinel checks. We start a new sequence of messages
-		// from the server every time we (re)connect.
+		// 每次重连时，重置哨兵检查标志。
 		func() {
 			c.settingsMu.Lock()
 			defer c.settingsMu.Unlock()
@@ -59,23 +59,22 @@ func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh
 			e, err := stream.Recv()
 			if err != nil {
 				if err == io.EOF {
-					break
+					break // 正常结束。
 				}
-				// Soft RPC error. Drop client and retry.
+				// 软 RPC 错误：重试。
 				log.Dev.Warningf(ctx, "error consuming TenantSettings RPC: %v", err)
 				c.tryForgetClient(ctx, client)
 				break
 			}
 			if e.Error != (errorspb.EncodedError{}) {
-				// Hard logical error.
+				// 逻辑错误或硬错误。
 				err := errors.DecodeError(ctx, e.Error)
 				log.Dev.Errorf(ctx, "error consuming TenantSettings RPC: %v", err)
+				// 如果配置了“缺少记录时尽早关闭”且确实缺少记录。
 				if startupCh != nil && errors.Is(err, &kvpb.MissingRecordError{}) && c.earlyShutdownIfMissingTenantRecord {
 					select {
 					case startupCh <- err:
 					case <-ctx.Done():
-						// Shutdown or cancellation may prevent the receiver from getting
-						// this error, so short circuit.
 						return
 					}
 
@@ -83,32 +82,23 @@ func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh
 					c.tryForgetClient(ctx, client)
 					return
 				}
-				// Other errors, or configuration tells us to continue if the
-				// tenant record in missing: in that case we continue the
-				// loop. We're expecting io.EOF from the server next, which
-				// will lead us to reconnect and retry.
-				//
-				// However, don't hammer the server with retries if there was
-				// an actual error reported: we wait a bit before the retry.
+				// 等待一秒后重试，避免重试风暴。
 				select {
 				case <-time.After(1 * time.Second):
-
 				case <-ctx.Done():
-					// Shutdown or cancellation short circuits the wait and retry.
 					return
 				}
 				continue
 			}
 
 			if c.testingEmulateOldVersionSettingsClient {
-				// The old version of the settings client does not understand anything
-				// else than setting events.
 				e.EventType = kvpb.TenantSettingsEvent_SETTING_EVENT
 			}
 
 			var reconnect bool
 			switch e.EventType {
 			case kvpb.TenantSettingsEvent_METADATA_EVENT:
+				// 处理元数据事件（租户名称、数据状态、服务模式等）。
 				err := c.processMetadataEvent(ctx, e)
 				if err != nil {
 					log.Dev.Errorf(ctx, "error processing tenant settings event: %v", err)
@@ -116,6 +106,7 @@ func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh
 				}
 
 			case kvpb.TenantSettingsEvent_SETTING_EVENT:
+				// 处理设置覆盖事件。
 				settingsReady, err := c.processSettingsEvent(ctx, e)
 				if err != nil {
 					log.Dev.Errorf(ctx, "error processing tenant settings event: %v", err)
@@ -123,16 +114,7 @@ func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh
 					break
 				}
 
-				// Signal that startup is complete once we have enough events
-				// to start. Note: we do not connect this condition to
-				// receiving the tenant metadata (via processMetadataEvent) for
-				// compatibility with pre-v23.2 servers which only send
-				// setting override events.
-				//
-				// Luckily, we are guaranteed that once we receive the setting
-				// overrides the metadata has been received as well (in v23.1+
-				// servers that send it) because when it is sent it is always
-				// sent prior to the setting overrides.
+				// 一旦“设置已就绪”（即收到初始的非增量设置覆盖），信号启动完成。
 				if settingsReady {
 					log.Dev.Infof(ctx, "received initial tenant settings")
 
@@ -140,8 +122,6 @@ func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh
 						select {
 						case startupCh <- nil:
 						case <-ctx.Done():
-							// Shutdown or cancellation may prevent the receiver from getting
-							// this completion message, so short circuit.
 							return
 						}
 						close(startupCh)
@@ -159,16 +139,15 @@ func (c *connector) runTenantSettingsSubscription(ctx context.Context, startupCh
 	}
 }
 
-// processMetadataEvent updates the tenant metadata based on the event.
+// processMetadataEvent 根据收到的事件更新租户元数据。
 func (c *connector) processMetadataEvent(ctx context.Context, e *kvpb.TenantSettingsEvent) error {
 	c.metadataMu.Lock()
 	defer c.metadataMu.Unlock()
 
 	c.metadataMu.receivedFirstMetadata = true
-	c.metadataMu.capabilities = e.Capabilities
-	c.metadataMu.tenantName = e.Name
-	// TODO(knz): Remove the cast once we have proper typing in the
-	// protobuf, which requires breaking a dependency cycle.
+	c.metadataMu.capabilities = e.Capabilities // 租户能力（Capabilities）
+	c.metadataMu.tenantName = e.Name           // 租户显示名称
+	// 将协议层定义的 int 状态转换为 mtinfopb 定义的状态。
 	c.metadataMu.dataState = mtinfopb.TenantDataState(e.DataState)
 	c.metadataMu.serviceMode = mtinfopb.TenantServiceMode(e.ServiceMode)
 	c.metadataMu.clusterInitGracePeriodTS = e.ClusterInitGracePeriodEndTS
@@ -177,7 +156,7 @@ func (c *connector) processMetadataEvent(ctx context.Context, e *kvpb.TenantSett
 		c.metadataMu.tenantName, c.metadataMu.dataState, c.metadataMu.serviceMode,
 		timeutil.Unix(c.metadataMu.clusterInitGracePeriodTS, 0), c.metadataMu.capabilities)
 
-	// Signal watchers that there was an update.
+	// 信号通知所有正在观察元数据变化的组件。
 	close(c.metadataMu.notifyCh)
 	c.metadataMu.notifyCh = make(chan struct{})
 
@@ -219,7 +198,7 @@ func (c *connector) ReadFromTenantInfo(
 	return resp.ReadFrom, resp.ReadAt, nil
 }
 
-// processSettingsEvent updates the setting overrides based on the event.
+// processSettingsEvent 根据收到的事件更新设置覆盖（Setting Overrides）。
 func (c *connector) processSettingsEvent(
 	ctx context.Context, e *kvpb.TenantSettingsEvent,
 ) (settingsReady bool, err error) {
@@ -227,6 +206,7 @@ func (c *connector) processSettingsEvent(
 	defer c.settingsMu.Unlock()
 
 	var m map[settings.InternalKey]settings.EncodedValue
+	// 区分“全租户覆盖”和“特定租户覆盖”。
 	switch e.Precedence {
 	case kvpb.TenantSettingsEvent_ALL_TENANTS_OVERRIDES:
 		if !c.settingsMu.receivedFirstAllTenantOverrides && e.Incremental {
@@ -255,31 +235,32 @@ func (c *connector) processSettingsEvent(
 
 	log.Dev.Infof(ctx, "received %d setting overrides with precedence %v (incremental=%v)", len(e.Overrides), e.Precedence, e.Incremental)
 
-	// If the event is not incremental, clear the map.
+	// 如果事件不是增量的（Incremental），则清空当前映射，全量替换。
 	if !e.Incremental {
 		for k := range m {
 			delete(m, k)
 		}
 	}
-	// Merge in the override changes.
+	// 合并覆盖项变更。
 	for _, o := range e.Overrides {
 		if o.Value == (settings.EncodedValue{}) {
-			// Empty value indicates that the override is removed.
+			// 空值表示移除该覆盖。
 			log.VEventf(ctx, 1, "removing %v override for %q", e.Precedence, o.InternalKey)
 			delete(m, o.InternalKey)
 		} else {
+			// 添加或更新覆盖。
 			log.VEventf(ctx, 1, "adding %v override for %q = %q", e.Precedence, o.InternalKey, o.Value.Value)
 			m[o.InternalKey] = o.Value
 		}
 	}
 
-	// Notify watchers if any.
+	// 信号通知观察者。
 	close(c.settingsMu.notifyCh)
-	// Define a new notification channel for subsequent watchers.
+	// 为后续观察者定义一个新的通知通道。
 	c.settingsMu.notifyCh = make(chan struct{})
 
-	// The protocol defines that the server sends one initial
-	// non-incremental message for both precedences.
+	// 协议定义：服务器必须为两种优先级都发送一个初始的非增量消息。
+	// 当两者都收到后，认为设置已就绪。
 	settingsReady = c.settingsMu.receivedFirstAllTenantOverrides && c.settingsMu.receivedFirstSpecificOverrides
 	return settingsReady, nil
 }

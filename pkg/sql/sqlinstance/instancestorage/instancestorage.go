@@ -66,13 +66,13 @@ var PreallocatedCount = settings.RegisterIntSetting(
 
 var errNoPreallocatedRows = errors.New("no preallocated rows")
 
-// Storage implements the storage layer for the sqlinstance subsystem.
+// Storage 实现了 sqlinstance 子系统的存储层。
 //
-// SQL Instance IDs must be globally unique. The SQL Instance table may be
-// partitioned by region. In order to allow for fast cold starts, SQL Instances
-// are pre-allocated into each region. If a sql_instance row does not have a
-// session id, it is available for immediate use. It is also legal to reclaim
-// instances ids if the owning session has expired.
+// SQL 实例 ID（Instance ID）必须全局唯一。
+// 为了支持快速冷启动，SQL 实例 ID 会在每个区域（Region）预先分配。
+// `system.sql_instances` 表中的每一行代表一个可能的 SQL 实例。
+// 如果某行没有 session_id，则表示该 ID 当前可用，可以立即被认领。
+// 如果原有的 Session 已过期，认领过程也可以通过“回收（Reclaim）”机制重新夺回该 ID。
 type Storage struct {
 	db            *kv.DB
 	codec         keys.SQLCodec
@@ -91,17 +91,17 @@ type Storage struct {
 	}
 }
 
-// instancerow encapsulates data for a single row within the sql_instances table.
+// instancerow 封装了 system.sql_instances 表中单行的数据结构。
 type instancerow struct {
-	region        []byte
-	instanceID    base.SQLInstanceID
-	sqlAddr       string
-	rpcAddr       string
-	sessionID     sqlliveness.SessionID
-	locality      roachpb.Locality
-	binaryVersion roachpb.Version
-	isDraining    bool
-	timestamp     hlc.Timestamp
+	region        []byte                // 实例所属的物理区域
+	instanceID    base.SQLInstanceID    // 全局唯一的 SQL 实例 ID
+	sqlAddr       string                // SQL 服务监听地址（用于客户端连接）
+	rpcAddr       string                // RPC 服务监听地址（用于节点间通信）
+	sessionID     sqlliveness.SessionID // 认领该实例的 SQL 存活 Session ID
+	locality      roachpb.Locality      // 地理性标签（Region, Zone 等）
+	binaryVersion roachpb.Version       // 运行该实例的二进制版本
+	isDraining    bool                  // 标记该实例是否处于正在下线（Draining）状态
+	timestamp     hlc.Timestamp         // 记录状态最后更新的时间戳
 }
 
 // isAvailable returns true if the instance row hasn't been claimed by a SQL pod
@@ -149,8 +149,9 @@ func NewStorage(
 	return NewTestingStorage(db, codec, systemschema.SQLInstancesTable(), slReader, settings, clock, f, settingsWatcher)
 }
 
-// CreateNodeInstance claims a unique instance identifier for the SQL pod, and
-// associates it with its SQL address and session information.
+// CreateNodeInstance 为 SQL 节点认领一个唯一的实例标识符。
+// 它会将该 ID 与节点的 SQL 地址、RPC 地址以及存活 Session 关联起来。
+// nodeID 如果不为 0，则该实例 ID 会尝试与 nodeID 保持一致。
 func (s *Storage) CreateNodeInstance(
 	ctx context.Context,
 	session sqlliveness.Session,
@@ -262,57 +263,54 @@ func (s *Storage) createInstanceRow(
 	binaryVersion roachpb.Version,
 	nodeID roachpb.NodeID,
 ) (instance sqlinstance.InstanceInfo, _ error) {
+	// 校验参数：必须提供 SQL 地址和 RPC 地址。
 	if len(sqlAddr) == 0 || len(rpcAddr) == 0 {
 		return sqlinstance.InstanceInfo{}, errors.AssertionFailedf("missing sql or rpc address information for instance")
 	}
+	// 校验参数：必须有关联的 Session（存活会话）。
 	if len(session.ID()) == 0 {
 		return sqlinstance.InstanceInfo{}, errors.AssertionFailedf("no session information for instance")
 	}
 
+	// 从 Session ID 中解析出所属区域（Region）。
 	region, _, err := slstorage.UnsafeDecodeSessionID(session.ID())
 	if err != nil {
 		return sqlinstance.InstanceInfo{}, errors.Wrap(err, "unable to determine region for sql_instance")
 	}
 
-	// TODO(jeffswenson): advance session expiration. This can get stuck in a
-	// loop if the session already expired.
+	// 设置租户成本控制豁免，确保关键的实例管理事务不会被限流。
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
+	// assignInstance 辅助函数：负责在一次 KV 事务中认领 ID。
 	assignInstance := func() (base.SQLInstanceID, error) {
 		var availableID base.SQLInstanceID
 		if err := s.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-			// Run the claim transaction as high priority to ensure that it does not
-			// contend with other transactions.
+			// 1. 提升事务优先级，确保认领过程尽量不被延迟或冲突中断。
 			err := txn.SetUserPriority(roachpb.MaxUserPriority)
 			if err != nil {
 				return err
 			}
 
-			// Set the transaction deadline to the session expiration to ensure
-			// transaction commits before the session expires.
+			// 2. 设置事务截止时间为 Session 的过期时间，防止死锁或僵尸事务。
 			err = txn.UpdateDeadline(ctx, session.Expiration())
 			if err != nil {
 				return err
 			}
 
-			// TODO(dt): do we need this at all? this keeps nodeID == instanceID when
-			// running mixed KV and SQL nodes, but bakes in the assumption that any
-			// clusters where this happens will contain _only_ mixed KV and SQL nodes
-			// and thus do not need to worry about finding an _actually_ available ID
-			// and avoiding conflicts. This is true today but may not be in more
-			// complex deployments.
+			// 3. 确定要认领的 ID：
+			// 如果提供了 nodeID（例如在单节点或特定混合模式下），则直接尝试使用它作为实例 ID。
+			// 否则，该节点属于动态租户实例，需要从系统表中寻找一个处于“空闲”状态的可认领 ID。
 			if nodeID != noNodeID {
 				availableID = base.SQLInstanceID(nodeID)
 			} else {
-				// Try to retrieve an available instance ID. This blocks until one
-				// is available.
+				// 核心逻辑：获取当前区域内一个预分配且可用的实例 ID。
 				availableID, err = s.getAvailableInstanceIDForRegion(ctx, region, txn)
 				if err != nil {
 					return err
 				}
 			}
 
+			// 4. 将认领信息写入 system.sql_instances 表。
 			b := txn.NewBatch()
-
 			value, err := s.rowCodec.encodeValue(rpcAddr, sqlAddr,
 				session.ID(), locality, binaryVersion,
 				true /* encodeIsDraining*/, false /* isDraining */)
@@ -327,8 +325,7 @@ func (s *Storage) createInstanceRow(
 		}
 		return availableID, nil
 	}
-	// It's possible that all allocated IDs are claimed, so retry with a back
-	// off.
+	// 既然预分配的 ID 可能会被多个实例竞相认领，因此需要一个退避（Back-off）重试机制。
 	opts := retry.Options{
 		InitialBackoff: 50 * time.Millisecond,
 		MaxBackoff:     200 * time.Millisecond,
@@ -337,7 +334,7 @@ func (s *Storage) createInstanceRow(
 	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
 		log.Dev.Infof(ctx, "assigning instance id to rpc addr %s and sql addr %s", rpcAddr, sqlAddr)
 		instanceID, err := assignInstance()
-		// Instance was successfully assigned an ID.
+		// 如果认领成功，直接返回实例信息。
 		if err == nil {
 			return sqlinstance.InstanceInfo{
 				Region:          region,
@@ -349,27 +346,18 @@ func (s *Storage) createInstanceRow(
 				BinaryVersion:   binaryVersion,
 			}, err
 		}
+		// 如果错误不是“没有预分配行”，则属于系统故障，直接抛错。
 		if !errors.Is(err, errNoPreallocatedRows) {
 			return sqlinstance.InstanceInfo{}, err
 		}
-		// If assignInstance failed because there are no available rows,
-		// allocate new instance IDs for the local region.
-		//
-		// There is a choice during start up:
-		//   1. Allocate for every region.
-		//   2. Allocate only for the local region.
-		//
-		// Allocating only for the local region removes one global round trip.
-		// In the uncontended case, allocating locally requires reading from
-		// every region, then writing to the local region. Allocating globally
-		// would require one round trip for reading and one round trip for
-		// writes.
+		// 如果报错是因为“没有现成的空闲 ID”，则触发一次本地区域的 ID 预分配。
+		// 策略选择：为了减少跨地域的网络往返，我们只针对当前区域补充 ID。
 		if err := s.generateAvailableInstanceRows(ctx, [][]byte{region}, session.Expiration()); err != nil {
 			log.Dev.Warningf(ctx, "failed to generate available instance rows: %v", err)
 		}
 	}
 
-	// If we exit here, it has to be the case where the context has expired.
+	// 如果循环由于 Context 超时/取消而退出，则返回 Context 错误。
 	return sqlinstance.InstanceInfo{}, ctx.Err()
 }
 
@@ -380,41 +368,38 @@ func (s *Storage) newInstanceCache(ctx context.Context) (instanceCache, error) {
 	return newRangeFeedCache(ctx, s.rowCodec, s.clock, s.f, s)
 }
 
-// getAvailableInstanceIDForRegion retrieves an available instance ID for the
-// current region associated with Storage s, and returns errNoPreallocatedRows
-// if there are no available rows.
+// getAvailableInstanceIDForRegion 在给定的事务中查找并返回一个当前区域可用的 ID。
 func (s *Storage) getAvailableInstanceIDForRegion(
 	ctx context.Context, region []byte, txn *kv.Txn,
 ) (base.SQLInstanceID, error) {
+	// 扫描当前区域在 system.sql_instances 中的所有行。
 	rows, err := s.getInstanceRows(ctx, region, txn, lock.WaitPolicy_SkipLocked)
 	if err != nil {
 		return base.SQLInstanceID(0), err
 	}
 
+	// 策略 1：首先尝试直接认领完全没被占用的行（sessionID 为空）。
 	for _, row := range rows {
 		if row.isAvailable() {
 			return row.instanceID, nil
 		}
 	}
 
+	// 策略 2：如果没现成的，检查已经分配但其 Session 已过期的行。
 	for _, row := range rows {
-		// If the row has already been used, check if the session is alive.
-		// This is beneficial since the rows already belong to the same region.
-		// We will only do this after checking all **available** instance IDs.
-		// If there are no locally available regions, the caller needs to
-		// consult all regions to determine which IDs are safe to allocate.
+		// 检查该行原来的所有者（Session）是否已经死亡（Liveness 失败）。
 		sessionAlive, _ := s.slReader.IsAlive(ctx, row.sessionID)
 		if !sessionAlive {
 			return row.instanceID, nil
 		}
 	}
 
+	// 如果所有预分配 ID 都在活跃使用中且没过期的，报错。
 	return base.SQLInstanceID(0), errNoPreallocatedRows
 }
 
-// reclaimRegion will reclaim instances belonging to expired sessions and
-// delete surplus sessions. reclaimRegion should only be called by the
-// background clean up and allocation job.
+// reclaimRegion 负责回收属于已过期会话的实例 ID，并删除多余的空闲行。
+// 此方法仅由后台清理和分配任务调用。
 func (s *Storage) reclaimRegion(ctx context.Context, region []byte) error {
 	// In a separate transaction, read all rows that exist in the region. This
 	// allows us to check for expired sessions outside of a transaction. The
@@ -516,8 +501,7 @@ func (s *Storage) getInstanceRows(
 	return instances, nil
 }
 
-// RunInstanceIDReclaimLoop runs a background task that allocates available
-// instance IDs and reclaim expired ones within the sql_instances table.
+// RunInstanceIDReclaimLoop 启动一个后台任务，负责在 sql_instances 表中分配可用的实例 ID 并回收已过期的 ID。
 func (s *Storage) RunInstanceIDReclaimLoop(
 	ctx context.Context,
 	stopper *stop.Stopper,
@@ -572,17 +556,15 @@ func (s *Storage) RunInstanceIDReclaimLoop(
 				return
 			case <-timer.Ch():
 
-				// Load the regions each time we attempt to generate rows since
-				// regions can be added/removed to/from the system DB.
+				// 每次尝试生成行时都重新加载区域信息，因为系统库中可能增加了新的 Region。
 				regions, err := loadRegions(ctx)
 				if err != nil {
 					log.Dev.Warningf(ctx, "failed to load regions from the system DB: %v", err)
 					continue
 				}
 
-				// Mark instances that belong to expired sessions as available
-				// and delete surplus IDs. Cleaning up surplus IDs is necessary
-				// to avoid ID exhaustion.
+				// [清理阶段] 遍历所有 Region，将属于已过期 Session 的实例标记为“可用”，
+				// 并删除超出预分配配额的多余 ID，防止 ID 资源耗尽。
 				for _, region := range regions {
 
 					if err := s.reclaimRegion(ctx, region); err != nil {
@@ -590,7 +572,7 @@ func (s *Storage) RunInstanceIDReclaimLoop(
 					}
 				}
 
-				// Allocate new ids regions that do not have enough pre-allocated sql instances.
+				// [补充阶段] 如果某些 Region 的预分配空闲 ID 数量不足，则为该 Region 生成新的实例 ID。
 				if err := s.generateAvailableInstanceRows(ctx, regions, sessionExpirationFn()); err != nil {
 					log.Dev.Warningf(ctx, "failed to generate available instance rows: %v", err)
 				}
@@ -703,9 +685,8 @@ func (s *Storage) generateAvailableInstanceRowsWithTxn(
 	return txn.Run(ctx, b)
 }
 
-// generateAvailableInstanceRows allocates available instance IDs, and store
-// them in the sql_instances table. When instance IDs are pre-allocated, all
-// other fields in that row will be NULL.
+// generateAvailableInstanceRows 分配可用的实例 ID，并将其存储在 sql_instances 表中。
+// 当实例 ID 被预分配时，该行中的所有其他字段（如 session_id、地址等）均为 NULL。
 func (s *Storage) generateAvailableInstanceRows(
 	ctx context.Context, regions [][]byte, sessionExpiration hlc.Timestamp,
 ) error {

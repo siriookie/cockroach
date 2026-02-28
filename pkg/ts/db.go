@@ -131,10 +131,18 @@ type poller struct {
 	childMetrics bool
 }
 
-// PollSource begins a Goroutine which periodically queries the supplied
-// DataSource for time series data, storing the returned data in the server.
-// Stored data will be sampled using the provided Resolution. The polling
-// process will continue until the provided stop.Stopper is stopped.
+// PollSource 启动一个后台协程，周期性地从给定的 DataSource 获取时序数据并存入数据库。
+//
+// 核心作用：
+// 1. 自动化采集：通过心跳式的拉取机制，定期把内存中的指标（Metrics）刷新到磁盘存储中。
+// 2. 采样精度控制：存储时会根据提供的 Resolution 对数据进行采样。
+// 3. 生命周期管理：采集过程会一直持续，直到传入的 stop.Stopper 被关闭。
+//
+// 例子：
+// - 假设我们要每 10 秒采集一次节点的 CPU 和内存指标。
+// - 我们传入一个实现了 DataSource 接口的 metricsRecorder 和 10s 的 frequency。
+// - PollSource 会启动一个无限循环的协程，每隔 10s 就会调用一次 recorder.GetTimeSeriesData()，
+//   然后把拿到的数据传给 db.StoreData 进行存储。
 func (db *DB) PollSource(
 	ambient log.AmbientContext,
 	source DataSource,
@@ -143,7 +151,9 @@ func (db *DB) PollSource(
 	stopper *stop.Stopper,
 	childMetrics bool,
 ) (firstDone <-chan struct{}) {
+	// 为上下文添加日志标签，方便在日志中追踪该采集任务。
 	ambient.AddLogTag("ts-poll", nil)
+	// 初始化 poller 结构体，封装采集所需的全部上下文。
 	p := &poller{
 		AmbientContext: ambient,
 		db:             db,
@@ -153,13 +163,14 @@ func (db *DB) PollSource(
 		stopper:        stopper,
 		childMetrics:   childMetrics,
 	}
+	// 启动后台执行过程。
 	return p.start()
 }
 
-// start begins the goroutine for this poller, which will periodically request
-// time series data from the DataSource and store it.
+// start 真正执行后台采集协程，并返回一个 channel 用于通知调用者第一次采集是否完成。
 func (p *poller) start() (firstDone <-chan struct{}) {
-	ch := make(chan struct{}) // closed on completion of first poll
+	ch := make(chan struct{}) // 在第一次轮询完成时关闭，用于同步。
+	// 从 Stopper 获取运行 Handle，确保该任务在系统关闭时能被正确优雅退出。
 	ctx, hdl, err := p.stopper.GetHandle(
 		p.AnnotateCtx(context.Background()), stop.TaskOpts{TaskName: "ts-poller"},
 	)
@@ -167,21 +178,27 @@ func (p *poller) start() (firstDone <-chan struct{}) {
 		close(ch)
 		return ch
 	}
+	// 启动核心工作协程。
 	go func(ctx context.Context, ch chan struct{}) {
+		// 在协程退出时释放任务句柄。
 		defer hdl.Activate(ctx).Release(ctx)
 		var ticker timeutil.Timer
-		ticker.Reset(0) // poll immediately
+		// 设置定时器：Reset(0) 意味着启动后立即执行第一次采集。
+		ticker.Reset(0)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
+				// 定时器触发，重置为目标频率并执行 poll。
 				ticker.Reset(p.frequency)
 				p.poll(ctx)
+				// 如果是第一次采集成功，关闭信号 channel。
 				if ch != nil {
 					close(ch)
 					ch = nil
 				}
 			case <-p.stopper.ShouldQuiesce():
+				// 系统收到停止信号，退出循环。
 				return
 			}
 		}
@@ -189,14 +206,16 @@ func (p *poller) start() (firstDone <-chan struct{}) {
 	return ch
 }
 
-// poll retrieves data from the underlying DataSource a single time, storing any
-// returned time series data on the server.
+// poll 负责单次的数据抓取和存储操作。
 func (p *poller) poll(ctx context.Context) {
+	// 检查时序数据库存储是否被禁用。
 	if !TimeseriesStorageEnabled.Get(&p.db.st.SV) {
 		return
 	}
 
+	// 在 Stopper 的监控下执行单次采集任务。
 	if err := p.stopper.RunTask(ctx, "ts.poller: poll", func(ctx context.Context) {
+		// 1. 从数据源调用接口获取原始数据。
 		data := p.source.GetTimeSeriesData(p.childMetrics)
 		if len(data) == 0 {
 			return
@@ -205,6 +224,8 @@ func (p *poller) poll(ctx context.Context) {
 		const opName = "ts-poll"
 		ctx, span := p.AnnotateCtxWithSpan(ctx, opName)
 		defer span.Finish()
+		// 2. 调用 StoreData 将数据持久化到 KV 存储。
+		// 设置超时时间（storeDataTimeout），防止因后端存储卡顿导致采集协程堆积。
 		if err := timeutil.RunWithTimeout(ctx, opName, storeDataTimeout,
 			func(ctx context.Context) error {
 				return p.db.StoreData(ctx, p.r, data)

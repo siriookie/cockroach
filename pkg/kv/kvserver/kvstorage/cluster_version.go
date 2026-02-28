@@ -17,19 +17,24 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// WriteClusterVersion writes the given cluster version to the min version file.
+// WriteClusterVersion 将给定的集群版本写入引擎的最小版本文件（min version file）。
+// 这个版本信息被持久化在磁盘上，用于下次启动时通过 MinVersion() 读取。
 func WriteClusterVersion(
 	ctx context.Context, eng storage.Engine, cv clusterversion.ClusterVersion,
 ) error {
+	// SetMinVersion 是 Engine 接口的方法，负责在磁盘上标记该存储引擎
+	// 能够兼容的最低程序版本。
 	return eng.SetMinVersion(cv.Version)
 }
 
-// WriteClusterVersionToEngines writes the given version to the given engines,
-// Returns nil on success; otherwise returns first error encountered writing to
-// the stores. It makes no attempt to validate the supplied version.
+// WriteClusterVersionToEngines 将给定的版本写入所有指定的引擎。
+// 如果任何一个引擎写入失败，则返回遇到的第一个错误。
+// 该函数不会对传入的版本进行校验（校验通常在调用方或 Synthesize 方法中完成）。
 //
-// At the time of writing this is used during bootstrap, initial server start
-// (to perhaps fill into additional stores), and during cluster version bumps.
+// 该函数的主要使用场景：
+// 1. 引导启动（Bootstrap）：创建新集群时初始化版本。
+// 2. 初始服务器启动：可能需要为新添加的存储引擎补全版本信息。
+// 3. 集群版本升级：当管理员确认升级（Version Bump）时，将新版本持久化到所有磁盘。
 func WriteClusterVersionToEngines(
 	ctx context.Context, engines []storage.Engine, cv clusterversion.ClusterVersion,
 ) error {

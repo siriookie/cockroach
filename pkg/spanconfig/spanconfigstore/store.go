@@ -46,11 +46,11 @@ var boundsEnabled = settings.RegisterBoolSetting(
 type Store struct {
 	mu struct {
 		syncutil.RWMutex
-		spanConfigStore       *spanConfigStore
-		systemSpanConfigStore *systemSpanConfigStore
+		spanConfigStore       *spanConfigStore       // 核心：存储 span → SpanConfig 的 B-Tree
+		systemSpanConfigStore *systemSpanConfigStore //  ← 存储系统级配置（如 PTS）的 HashMap
 	}
 
-	settings *cluster.Settings
+	settings *cluster.Settings //← 动态集群设置
 
 	// fallback is the span config we'll fall back on in the absence of
 	// something more specific.
@@ -64,12 +64,12 @@ type Store struct {
 	//
 	// [1]: Modulo the private spanconfig.store.fallback_config_override, which
 	//      applies globally.
-	fallback roachpb.SpanConfig
+	fallback roachpb.SpanConfig // ← 兜底配置（无显式配置时使用）
 
 	knobs *spanconfig.TestingKnobs
 
 	// boundsReader provides a handle to the global SpanConfigBounds state.
-	boundsReader BoundsReader
+	boundsReader BoundsReader //← secondary tenant 配置边界
 }
 
 var _ spanconfig.Store = &Store{}
@@ -183,7 +183,7 @@ func (s *Store) Apply(
 
 	// Log the potential span config changes.
 	for _, update := range updates {
-		err := s.maybeLogUpdate(ctx, &update)
+		err := s.maybeLogUpdate(ctx, &update) //  [记录非 PTS 的配置变更日志]
 		if err != nil {
 			log.KvDistribution.Warningf(ctx, "attempted to log a spanconfig update to "+
 				"target:%+v, but got the following error:%+v", update.GetTarget(), err)

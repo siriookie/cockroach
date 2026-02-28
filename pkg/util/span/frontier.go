@@ -125,10 +125,15 @@ type btreeFrontier struct {
 	// zero timestamp. If any entries needed to be split along a tracking
 	// boundary, this has already been done by `forward` before it entered the
 	// tree.
-	tree btree
+	//│   存放 *btreeFrontierEntry
+	//│   用途: 快速找到与某 span 重叠的 entry（范围查询）
+	tree btree // 按 span 的 start key 排序的 B-Tree
 	// minHeap contains the same `*btreeFrontierEntry` items as `tree`. Entries
 	// in the heap are sorted first by minimum timestamp and then by lesser
 	// start key.
+	//minHeap (frontierHeap)  最小堆，按 ts 排序
+	//    存放 *btreeFrontierEntry（同一批对象！）
+	//    用途: O(1) 查询全局最小时间戳（frontier.Frontier()
 	minHeap frontierHeap
 
 	idAlloc uint64

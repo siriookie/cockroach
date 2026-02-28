@@ -761,7 +761,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 	})
 	kvMemoryMonitor := mon.NewMonitorInheritWithLimit(
 		mon.MakeName("kv-mem"), 0 /* limit */, sqlMonitorAndMetrics.rootSQLMemoryMonitor,
-		true,                     /* longLiving */
+		true, /* longLiving */
 	)
 	kvMemoryMonitor.StartNoReserved(ctx, sqlMonitorAndMetrics.rootSQLMemoryMonitor)
 	rangeFeedBudgetFactory := serverrangefeed.NewBudgetFactory(
@@ -2143,6 +2143,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	)
 
 	// Begin recording runtime statistics.
+	//启动一个后台周期性循环，负责监控节点的运行环境健康状况
 	if err := startSampleEnvironment(workersCtx,
 		&s.cfg.BaseConfig,
 		s.cfg.CacheSize,
@@ -2167,6 +2168,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	)
 
 	// Export statistics to graphite, if enabled by configuration.
+	// 兼容metrics导出到graphite
 	var graphiteOnce sync.Once
 	graphiteEndpoint.SetOnChange(&s.st.SV, func(context.Context) {
 		if graphiteEndpoint.Get(&s.st.SV) != "" {
@@ -2192,11 +2194,12 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		return err
 	}
 
-	// After setting modeOperational, we can block until all stores are fully
-	// initialized.
+	// 将 RPC 服务器设置为“运营模式”（modeOperational）。
+	// 在此之前，服务器处于“初始化模式”，只允许心跳和 Gossip 等系统关键请求。
+	// 设置为 Operational 后，所有的 gRPC/DRPC 接口都将对外开放，处理正常的 SQL 或 KV 请求。
 	s.grpc.setMode(modeOperational)
 	s.drpc.setMode(modeOperational)
-
+	//  启动节点liveness检查
 	s.nodeLiveness.Start(workersCtx)
 
 	// We'll block here until all stores are fully initialized. We do this here
@@ -2215,6 +2218,8 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// wholly initialized stores (it reads the StoreIdentKeys). It also needs
 	// to come before the call into SetPebbleMetricsProvider, which internally
 	// uses the disk stats map we're initializing.
+	//磁盘统计 map 的构造必须发生在 store 完全初始化之后，
+	//但必须发生在 Pebble metrics provider 初始化之前，否则依赖链会断裂。
 	var pmp admission.PebbleMetricsProvider
 	if pmp, err = s.node.registerEnginesForDiskStatsMap(
 		s.cfg.Stores.Specs, s.engines, (*diskMonitorManager)(s.cfg.DiskMonitorManager)); err != nil {
@@ -2223,6 +2228,8 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 
 	// Set up a store metrics registry provider to register AC store-level
 	// metrics.
+	//在 Node 层构建一个“Store 专用 metrics 注册工厂”，
+	//用于后续为每个 Store 注册 Admission Control 的 store 级别指标。
 	mrp := s.node.makeStoreRegistryProvider()
 
 	// Stores have been initialized, so Node can now provide Pebble metrics.
@@ -2233,10 +2240,11 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// existing stores shouldn’t be able to acquire leases yet. Although, below
 	// Raft commands like log application and snapshot application may be able
 	// to bypass admission control.
+	//这行代码把 Pebble 的底层存储指标接入到 Admission Control（准入控制）系统，使系统开始基于真实磁盘压力进行限流。
 	s.storeGrantCoords.SetPebbleMetricsProvider(ctx, pmp, mrp, s.node)
 
-	// Once all stores are initialized, check if offline storage recovery
-	// was done prior to start and record any actions appropriately.
+	//所有存储初始化后，检查是否能实现离线存储恢复
+	//	在开始前完成，并适当记录任何作。
 	logPendingLossOfQuorumRecoveryEvents(workersCtx, s.node.stores)
 
 	// Report server listen addresses to logs.
@@ -2254,18 +2262,23 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	log.Event(ctx, "accepting connections")
 
 	// Begin recording status summaries.
+	//开启一个后台任务，定期将节点及其存储（Stores）的状态摘要持久化到数据库中。
+	// 这些摘要信息主要用于 DB Console（Web 控制界面）展示节点的健康状况、负载和集群拓扑。
 	if err := s.node.startWriteNodeStatus(base.DefaultMetricsSampleInterval); err != nil {
 		return err
 	}
 
+	// 启动 Span Configuration 订阅器 (KVSubscriber)。
+	// 该组件通过 Rangefeed 监听 `system.span_configurations` 表的变化。
+	// 它的作用是将全局的 Span 配置（如租约优先级、副本数等）实时传播到当前节点的各个 Store。
 	if subscriber, ok := s.spanConfigSubscriber.(*spanconfigkvsubscriber.KVSubscriber); ok {
 		if err := subscriber.Start(workersCtx, s.stopper); err != nil {
 			return err
 		}
 	}
 
-	// Record node start in telemetry. Get the right counter for this storage
-	// engine type as well as type of start (initial boot vs restart).
+	// 通过 Telemetry 记录节点的启动事件，包括存储引擎类型和启动类型（首次启动 vs 重启）。
+	// 这有助于 Cockroach Labs 团队分析各存储引擎的使用分布和节点稳定性。
 	nodeStartCounter := "storage.engine.pebble."
 	if s.InitialStart() {
 		nodeStartCounter += "initial-boot"
@@ -2274,12 +2287,15 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	}
 	telemetry.Count(nodeStartCounter)
 
-	// Record that this node joined the cluster in the event log. Since this
-	// executes a SQL query, this must be done after the SQL layer is ready.
+	// 记录节点加入集群的事件。
+	// 注意：由于此操作涉及写入 `system.eventlog` 表（SQL 查询），因此必须放在 SQL 层准备就绪之后。
+	// [DFS 路径] 此处会跳转到 Node.recordJoinEvent。
 	s.node.recordJoinEvent(ctx)
 
 	if !s.cfg.DisableSQLServer {
-		// Start the SQL subsystem.
+		// 启动 SQL 子系统的核心预启动逻辑。
+		// [DFS 路径] 此处会跳转到 SQLServer.preStart。
+		// 职责包括：租户连接、版本检查、SQL 存活 Session 建立、SQL 实例 ID 分配。
 		if err := s.sqlServer.preStart(
 			workersCtx,
 			s.stopper,
@@ -2303,12 +2319,9 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		apiInternalServer = gwMux
 	}
 
-	// Connect the HTTP endpoints. This also wraps the privileged HTTP
-	// endpoints served by gwMux by the HTTP cookie authentication
-	// check.
-	// NB: This must occur after sqlServer.preStart() which initializes
-	// the cluster version from storage as the http auth server relies on
-	// the cluster version being initialized.
+	// 配置 HTTP 路由。
+	// 这里将管理员 UI、状态监控、认证服务等端点挂载到 HTTP Server 上。
+	// 重要：此步骤必须在 sqlServer.preStart 之后执行，因为认证系统依赖于存储中初始化的集群版本。
 	if err := s.http.setupRoutes(ctx,
 		s.sqlServer.ExecutorConfig(), /* execCfg */
 		s.authentication,             /* authnServer */
@@ -2364,8 +2377,8 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		return err
 	}
 
-	// Start the job scheduler now that the SQL Server and
-	// external storage is initialized.
+	// 在 SQLServer 和外部存储初始化完成后，启动作业调度器 (Job Scheduler)。
+	// 该调度器负责处理备份、恢复、索引创建等耗时较长的异步作业。
 	if err := s.initJobScheduler(ctx); err != nil {
 		return err
 	}
@@ -2389,29 +2402,23 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// Register the ctc debug endpoints.
 	s.debug.RegisterClosedTimestampSideTransport(s.ctSender, s.node.storeCfg.ClosedTimestampReceiver)
 
-	// Start the closed timestamp loop.
+	// 启动 Closed Timestamp (CT) 发送循环。
+	// CT 机制允许副本确定在特定时间点之前没有更多的写入，从而实现非阻塞的读取。
 	s.ctSender.Run(workersCtx, state.nodeID)
 
-	// Start the closed timestamp policy refresher in the background. It refreshes
-	// closed timestamp policies for ranges periodically.
+	// 启动 CT 策略刷新器。
 	s.policyRefresher.Run(workersCtx)
 
-	// Start node capacity provider in the background. It refreshes node cpu usage
-	// and capacity for store descriptor.
+	// 启动节点容量（CPU）收集器。
 	s.nodeCapacityProvider.Run(workersCtx)
 
-	// Start dispatching extant flow tokens.
+	// 启动 Raft 传输层，开始处理集群内部的 Raft 消息。
 	if err := s.raftTransport.Start(workersCtx); err != nil {
 		return err
 	}
 
-	// Attempt to upgrade cluster version now that the sql server has been
-	// started. At this point we know that all startupmigrations and permanent
-	// upgrades have successfully been run so it is safe to upgrade to the
-	// binary's current version.
-	//
-	// NB: We run this under the startup ctx (not workersCtx) so as to ensure
-	// all the upgrade steps are traced, for use during troubleshooting.
+	// 尝试升级集群版本。
+	// 既然 SQL Server 已经启动，且初始迁移和永久升级已完成，现在可以安全地将集群逻辑版本提升至当前二进制版本的最高支持版本。
 	if err := s.startAttemptUpgrade(ctx); err != nil {
 		return errors.Wrap(err, "cannot start upgrade task")
 	}
@@ -2464,7 +2471,8 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		s,
 		s.stopper)
 
-	// Let the server controller start watching tenant service mode changes.
+	// 启动 Server Controller。
+	// 职责：监视租户服务模式（Service Mode）的变化，并在必要时触发服务降级或下线逻辑。
 	if err := s.serverController.start(workersCtx,
 		s.node.execCfg.InternalDB.Executor(),
 	); err != nil {
@@ -2482,22 +2490,13 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	return maybeImportTS(ctx, s)
 }
 
-// initJobScheduler starts the job scheduler. This must be called
-// after sqlServer.preStart and after our external storage providers
-// have been initialized.
-//
-// TODO(ssd): We need to clean up the ordering/ownership here. The SQL
-// server owns the job scheduler because the job scheduler needs an
-// internal executor. But, the topLevelServer owns initialization of
-// the external storage providers.
+// initJobScheduler 启动作业调度器。
+// 必须在 sqlServer.preStart 之后以及外部存储提供者初始化之后调用。
 func (s *topLevelServer) initJobScheduler(ctx context.Context) error {
 	if s.cfg.DisableSQLServer {
 		return nil
 	}
-	// The job scheduler may immediately start jobs that require
-	// external storage providers to be available. We expect the
-	// server start up ordering to ensure this. Hitting this error
-	// is a programming error somewhere in server startup.
+	// 确保外部存储初始化已完成。作业调度器启动后可能会立即运行需要访问外部存储的任务（如备份恢复）。
 	if err := s.externalStorageBuilder.assertInitComplete(); err != nil {
 		return err
 	}
@@ -2505,8 +2504,8 @@ func (s *topLevelServer) initJobScheduler(ctx context.Context) error {
 	return nil
 }
 
-// runIdempontentSQLForInitType runs one-time initialization steps via
-// SQL based on the given InitType.
+// runIdempontentSQLForInitType 根据给定的 InitType 通过 SQL 执行一次性初始化步骤。
+// 这些步骤通常涉及系统表的初始化或特定的存储租户设置。
 func (s *topLevelServer) runIdempontentSQLForInitType(
 	ctx context.Context, typ serverpb.InitType,
 ) error {
@@ -2562,9 +2561,8 @@ func (s *topLevelServer) runIdempontentSQLForInitType(
 	return errors.Errorf("cluster initialization failed; cluster may need to be manually configured")
 }
 
-// AcceptClients starts listening for incoming SQL clients over the network.
-// This mirrors the implementation of (*SQLServerWrapper).AcceptClients.
-// TODO(knz): Find a way to implement this method only once for both.
+// AcceptClients 开始在网络上监听传入的 SQL 客户端连接。
+// 它镜像了 (*SQLServerWrapper).AcceptClients 的实现。
 func (s *topLevelServer) AcceptClients(ctx context.Context) error {
 	// Don't listen on the SQL port if the SQL Server is not starting.
 	if s.cfg.DisableSQLServer {

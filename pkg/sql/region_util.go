@@ -1068,22 +1068,28 @@ func SynthesizeRegionConfig(
 	return regions.SynthesizeRegionConfigInTxn(ctx, txn, dbID, descsCol, opts...)
 }
 
-// GetLocalityRegionEnumPhysicalRepresentation returns the physical
-// representation of the given locality stored in the multi-region enum type
-// associated with dbID. If the given locality isn't found, the physical
-// representation of the primary region in dbID will be returned instead.
-// This returns an ErrNotMultiRegionDatabase error if the database isn't
-// multi-region.
+// GetLocalityRegionEnumPhysicalRepresentation 返回给定 Locality 在多区域枚举类型（与 dbID 相关联）中的物理表示。
+// 该函数在 SQL 实例启动时被调用，用于确定当前节点所属区域的二进制标识，
+// 进而用于 SQL Liveness 注册和实例认领。
+//
+// 逻辑细节：
+// 1. 从数据库描述符中获取区域枚举的所有映射关系（RegionName -> 二进制表示）。
+// 2. 从传入的 locality 中提取 "region" 标签。
+// 3. 如果找到了对应的枚举值，则返回该值；
+// 4. 如果没找（例如节点没配置 region 标签），则回退到数据库的主区域（Primary Region）。
+// 5. 如果数据库不是多区域配置，返回 ErrNotMultiRegionDatabase。
 func GetLocalityRegionEnumPhysicalRepresentation(
 	ctx context.Context, db descs.DB, dbID descpb.ID, locality roachpb.Locality,
 ) ([]byte, error) {
 	var enumReps map[catpb.RegionName][]byte
 	var primaryRegion catpb.RegionName
+	// 在一个只读事务中获取区域元数据。
 	if err := db.DescsTxn(ctx, func(
 		ctx context.Context, txn descs.Txn,
 	) error {
-		enumReps, primaryRegion = nil, "" // reset for retry
+		enumReps, primaryRegion = nil, "" // 重试时重置
 		var err error
+		// 核心辅助方法：获取枚举映射表和主区域名称。
 		enumReps, primaryRegion, err = GetRegionEnumRepresentations(
 			ctx, txn.KV(), dbID, txn.Descriptors(),
 		)
@@ -1092,27 +1098,25 @@ func GetLocalityRegionEnumPhysicalRepresentation(
 		return nil, err
 	}
 
-	// The primary region will be used if no region was provided through the
-	// locality flag.
+	// 如果节点启动命令行没有提供 --locality=region=...，则默认使用主区域。
 	currentRegion, _ := locality.Find("region")
 	if enumValue, ok := enumReps[catpb.RegionName(currentRegion)]; ok {
 		return enumValue, nil
 	}
+	// 回退逻辑：使用主区域。
 	if enumValue, ok := enumReps[primaryRegion]; ok {
 		return enumValue, nil
 	}
-	// This shouldn't be the case since if a primary region is defined for the
-	// database, there should exist a corresponding enum member value.
+	// 理论上不可能走到这里，因为如果主区域存在，它必然在枚举映射表中。
 	return nil, errors.AssertionFailedf("primary region not found")
 }
 
-// GetRegionEnumRepresentations returns representations stored in the
-// multi-region enum type associated with dbID, and the primary region of it.
-// An ErrNotMultiRegionDatabase error will be returned if the database isn't
-// multi-region.
+// GetRegionEnumRepresentations 返回多区域数据库关联的枚举类型中的所有成员表示（映射表），
+// 以及该数据库的主区域名称。
 func GetRegionEnumRepresentations(
 	ctx context.Context, txn *kv.Txn, dbID descpb.ID, descsCol *descs.Collection,
 ) (enumReps map[catpb.RegionName][]byte, primaryRegion catpb.RegionName, err error) {
+	// 获取数据库描述符和关联的区域枚举描述符。
 	dbDesc, regionEnumDesc, err := getDBAndRegionEnumDescs(
 		ctx, txn, dbID, descsCol, false /* useCache */, false /* includeOffline */)
 	if err != nil {

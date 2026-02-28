@@ -926,9 +926,8 @@ func (r *Registry) withSession(ctx context.Context, f withSessionFunc) {
 	f(ctx, s)
 }
 
-// Start polls the current node for liveness failures and cancels all registered
-// jobs if it observes a failure. Otherwise it starts all the main daemons of
-// registry that poll the jobs table and start/cancel/gc jobs.
+// Start 轮询当前节点的存活性故障，并在观察到故障时取消所有已注册的作业。
+// 否则，它将启动注册表的所有主要守护进程，这些进程负责轮询作业表并启动/取消/垃圾回收作业。
 func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
 	if r.knobs.DisableRegistryLifecycleManagement {
 		return nil

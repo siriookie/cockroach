@@ -48,9 +48,9 @@ var StorageCoalesceAdjacentSetting = settings.RegisterBoolSetting(
 // b-tree to store non-overlapping span configurations. It isn't safe for
 // concurrent use.
 type spanConfigStore struct {
-	btree       *btree
-	treeIDAlloc uint64    // used to maintain unique IDs for entries in btree
-	interner    *interner // interns configs for fast comparison
+	btree       *btree    // ← augmented interval B-Tree
+	treeIDAlloc uint64    // ← 唯一 ID 分配器
+	interner    *interner // ← SpanConfig 对象池（引用计数）
 
 	settings *cluster.Settings
 	knobs    *spanconfig.TestingKnobs
@@ -240,26 +240,27 @@ func (s *spanConfigStore) getSpanConfigForKey(
 // apply takes an incremental set of updates, updates the state of the store by
 // applying them, and returns the spans/span<->config entries deleted/added as a
 // result of applying them.
+// B-Tree 修改入口
 func (s *spanConfigStore) apply(
 	ctx context.Context, updates ...spanconfig.Update,
 ) (deleted []roachpb.Span, added []entry, err error) {
 	if err := validateApplyArgs(updates...); err != nil {
 		return nil, nil, err
 	}
-
+	// 1. 按 start key 排序
 	sorted := make([]spanconfig.Update, len(updates))
 	copy(sorted, updates)
 	sort.Slice(sorted, func(i, j int) bool {
 		return sorted[i].GetTarget().Less(sorted[j].GetTarget())
 	})
 	updates = sorted // re-use the same variable
-
+	// 2. 只读遍历，计算需要 delete 的和需要 add 的 entry
 	entriesToDelete, entriesToAdd, err := s.accumulateOpsFor(ctx, updates)
 	if err != nil {
 		return nil, nil, err
 	}
-
 	deleted = make([]roachpb.Span, len(entriesToDelete))
+	// 3. 执行实际的 B-Tree 变更
 	for i := range entriesToDelete {
 		entry := &entriesToDelete[i]
 		s.btree.Delete(entry)
@@ -270,7 +271,7 @@ func (s *spanConfigStore) apply(
 	added = make([]entry, len(entriesToAdd))
 	for i := range entriesToAdd {
 		entry := &entriesToAdd[i]
-		s.btree.Set(entry)
+		s.btree.Set(entry) // interner 在 makeEntry 中已处理
 		added[i] = *entry
 	}
 

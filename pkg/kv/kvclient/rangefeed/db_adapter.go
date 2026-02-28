@@ -72,11 +72,14 @@ func (dbc *dbAdapter) RangeFeed(
 	eventC chan<- kvcoord.RangeFeedMessage,
 	opts ...kvcoord.RangeFeedOption,
 ) error {
+	//StartAfter 是 exclusive（不包含该时间戳），即服务端只发送 ts > startFrom 的事件。
+	//这与 runInitialScan 在 initialTimestamp 处扫描数据形成互补：
+	//扫描获取 ts <= initialTimestamp 的快照，RangeFeed 获取 ts > initialTimestamp 的增量。
 	timedSpans := make([]kvcoord.SpanTimePair, 0, len(spans))
 	for _, sp := range spans {
 		timedSpans = append(timedSpans, kvcoord.SpanTimePair{
 			Span:       sp,
-			StartAfter: startFrom,
+			StartAfter: startFrom, // 注意：exclusive
 		})
 	}
 	return dbc.distSender.RangeFeed(ctx, timedSpans, eventC, opts...)
@@ -94,7 +97,9 @@ func (dbc *dbAdapter) RangeFeedFromFrontier(
 		timedSpans = append(timedSpans, kvcoord.SpanTimePair{
 			// Clone the span as the rangefeed progress tracker will manipulate the
 			// original frontier.
-			Span:       sp.Clone(),
+			//DistSender 内部会操作传入的 span（如截断、分割）。若不 clone，会直接修改 frontier 中的 span 底层字节，
+			//导致 frontier 数据结构损坏（B-Tree 的 Key 被改变，但树的排序没有更新）。
+			Span:       sp.Clone(), // 注意：必须 Clone！
 			StartAfter: ts,
 		})
 	}
@@ -121,7 +126,7 @@ func (dbc *dbAdapter) Scan(
 	} else {
 		acc = mon.NewStandaloneUnlimitedConcurrentAccount()
 	}
-
+	// 无并行：串行扫描每个 span
 	// If we don't have parallelism configured, just scan each span in turn.
 	if cfg.scanParallelism == nil {
 		for _, sp := range spans {
@@ -131,7 +136,7 @@ func (dbc *dbAdapter) Scan(
 		}
 		return nil
 	}
-
+	// 有并行：用 divideAndSendScanRequests 按 Range 边界分割并并发扫描
 	parallelismFn := cfg.scanParallelism
 	if parallelismFn == nil {
 		parallelismFn = func() int { return 1 }
@@ -192,16 +197,19 @@ func (dbc *dbAdapter) scanSpan(
 	}
 	return dbc.db.TxnWithAdmissionControl(ctx,
 		kvpb.AdmissionHeader_ROOT_KV,
-		admissionPri,
+		admissionPri, // BulkNormalPri 或 NormalPri
 		kv.SteppingDisabled,
 		func(ctx context.Context, txn *kv.Txn) error {
 			if err := txn.SetFixedTimestamp(ctx, asOf); err != nil {
 				return err
-			}
+			} // as-of 查询
 			sp := span
 			var b kv.Batch
 			for {
-				b.Header.TargetBytes = targetScanBytes
+				//`TargetBytes = 512 KiB` 告诉服务端每次 RPC 最多返回 512 KiB 数据。若数据超过这个大小，服务端返回 `ResumeSpan` 指向下一页的起始 key。客户端更新 `sp = res.ResumeSpanAsValue()` 后继续下一轮 Scan，直到 `ResumeSpan == nil`。
+				//
+				//这避免了一次扫描可能拉取 GB 级数据导致 OOM 的问题。配合 `WithMemoryMonitor` 还可以控制内存预算。
+				b.Header.TargetBytes = targetScanBytes // 512 KiB 分页
 				b.Scan(sp.Key, sp.EndKey)
 				if err := txn.Run(ctx, &b); err != nil {
 					return err
@@ -276,7 +284,7 @@ func (dbc *dbAdapter) divideAndSendScanRequests(
 				exportLim.SetLimit(newLimit)
 			}
 
-			limAlloc, err := exportLim.Begin(ctx)
+			limAlloc, err := exportLim.Begin(ctx) // 获取并发令牌
 			if err != nil {
 				return err
 			}

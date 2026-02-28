@@ -104,26 +104,44 @@ func (gd *GoroutineDumper) MaybeDump(ctx context.Context, st *cluster.Settings, 
 	}
 }
 
-// NewGoroutineDumper returns a GoroutineDumper which enables
-// doubleSinceLastDumpHeuristic.
-// dir is the directory in which dumps are stored.
+// NewGoroutineDumper 创建并初始化一个 Goroutine 导出器。
+// 这个组件的作用是监控协程（Goroutine）的数量变化，并在检测到异常增长（如协程泄漏）时自动保存现场数据。
+//
+// 核心逻辑：
+// 1. 设置启发式规则：默认启用“翻倍触发”规则（如果协程数超过阈值且比上次导出时多出一倍，则触发）。
+// 2. 配置存储引擎：利用 DumpStore 管理导出文件的生命周期，包括目录存放和自动清理磁盘空间。
+// 3. 注入导出函数：绑定 takeGoroutineDump 函数，该函数负责实际拉取所有线程栈并进行 gzip 压缩存储。
+//
+// 例子：
+// - 集群启动时调用 NewGoroutineDumper(ctx, "/data/logs/dumps", st)。
+// - 此时初始化了一个监控器，它会静静等待。
+// - 之后在 MaybeDump 中，如果检测到协程突然从 1000 涨到 2000，它就会在 "/data/logs/dumps" 下创建一个 .txt.gz 压缩包。
 func NewGoroutineDumper(
 	ctx context.Context, dir string, st *cluster.Settings,
 ) (*GoroutineDumper, error) {
+	// 参数校验：如果没有指定存储目录，则无法工作，直接返回错误。
 	if dir == "" {
 		return nil, errors.New("directory to store dumps could not be determined")
 	}
 
+	// 记录日志，告知运维人员 Goroutine Dumps 将被存放在哪个物理路径。
 	log.Dev.Infof(ctx, "writing goroutine dumps to %s", log.SafeManaged(dir))
 
+	// 初始化 GoroutineDumper 结构体并注入核心组件。
 	gd := &GoroutineDumper{
+		// 1. 注入启发式启发规则（Heuristics）。
+		// 目前默认只包含 doubleSinceLastDumpHeuristic（数量翻倍规则）。
 		heuristics: []heuristic{
 			doubleSinceLastDumpHeuristic,
 		},
 		goroutinesThreshold: 0,
 		maxGoroutinesDumped: 0,
+		// 2. 注入工具函数。
+		// currentTime 用于获取文件名的时间戳，takeGoroutineDump 则是执行真正的转储操作。
 		currentTime:         timeutil.Now,
 		takeGoroutineDump:   takeGoroutineDump,
+		// 3. 初始化文件存储控制器（DumpStore）。
+		// 它负责管理磁盘配额（totalDumpSizeLimit），如果文件总大小超过限制，它会自动清理旧文件。
 		store:               dumpstore.NewStore(dir, totalDumpSizeLimit, st),
 		st:                  st,
 	}

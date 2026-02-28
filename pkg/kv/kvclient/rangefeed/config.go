@@ -24,9 +24,9 @@ type Option interface {
 
 type config struct {
 	scanConfig
-	retryOptions       retry.Options
+	retryOptions       retry.Options // 指数退避参数
 	onInitialScanDone  OnInitialScanDone
-	withInitialScan    bool
+	withInitialScan    bool // 是否开启初始扫描
 	onInitialScanError OnInitialScanError
 	// useRowTimestampInInitialScan indicates that when rows are scanned in an
 	// initial scan, they should report their timestamp as it exists in KV as
@@ -41,13 +41,13 @@ type config struct {
 	withMatchingOriginIDs []uint32
 	consumerID            int64
 	onUnrecoverableError  OnUnrecoverableError
-	onCheckpoint          OnCheckpoint
-	frontierQuantize      time.Duration
-	onFrontierAdvance     OnFrontierAdvance
-	frontierVisitor       FrontierSpanVisitor
-	onSSTable             OnSSTable
-	onValues              OnValues
-	onDeleteRange         OnDeleteRange
+	onCheckpoint          OnCheckpoint        // checkpoint 回调
+	frontierQuantize      time.Duration       // frontier 时间戳量化（减少碎片）
+	onFrontierAdvance     OnFrontierAdvance   // frontier 推进回调
+	frontierVisitor       FrontierSpanVisitor // frontier 精细检视回调
+	onSSTable             OnSSTable           // SST 注入事件回调
+	onValues              OnValues            // 批量事件回调（初始扫描优化路径）
+	onDeleteRange         OnDeleteRange       // MVCC 范围删除事件回调
 	onMetadata            OnMetadata
 	extraPProfLabels      []string
 }

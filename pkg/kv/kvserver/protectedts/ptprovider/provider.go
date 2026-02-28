@@ -71,8 +71,10 @@ func validateConfig(cfg Config) error {
 	}
 }
 
-// Start implements the protectedts.Provider interface.
+// Start 实现了 protectedts.Provider 接口。
+// 它负责启动受保护时间戳系统的核心组件。
 func (p *Provider) Start(ctx context.Context, stopper *stop.Stopper) error {
+	// 如果内部持有的 Cache 是 ptcache.Cache 类型，则调用其 Start 方法开始周期性同步。
 	if cache, ok := p.Cache.(*ptcache.Cache); ok {
 		return cache.Start(ctx, stopper)
 	}

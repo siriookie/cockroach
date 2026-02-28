@@ -104,13 +104,11 @@ func (ds *ServerImpl) AsDRPCServer() execinfrapb.DRPCDistSQLServer {
 	return (*drpcServerImpl)(ds)
 }
 
-// Start launches workers for the server.
+// Start 为服务器启动 worker。
 //
-// Note that the initialization of the server required for performing the
-// incoming RPCs needs to go into NewServer above because once that method
-// returns, the server is registered as a gRPC service and needs to be fully
-// initialized. For example, the initialization of the flow runner has to
-// happen in NewServer.
+// 请注意，执行传入 RPC 所需的服务器初始化需要在上面的 NewServer 中进行，
+// 因为一旦该方法返回，服务器就会被注册为 gRPC 服务，并需要完全初始化。
+// 例如，flow runner 的初始化必须在 NewServer 中进行。
 func (ds *ServerImpl) Start() {
 	if err := ds.setDraining(false); err != nil {
 		panic(err)

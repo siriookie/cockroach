@@ -172,13 +172,14 @@ func (s *Storage) Metrics() *Metrics {
 	return &s.metrics
 }
 
-// Start runs the delete sessions loop.
+// Start 启动清理过期会话的后台循环。
 func (s *Storage) Start(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.mu.started {
 		return
 	}
+	// 在后台运行 deleteSessionsLoop。
 	_ = s.stopper.RunAsyncTask(ctx, "slstorage", s.deleteSessionsLoop)
 	s.mu.started = true
 }
@@ -392,7 +393,7 @@ func (s *Storage) deleteOrFetchSession(
 	return alive, expiration, nil
 }
 
-// deleteSessionsLoop is launched in start and periodically deletes sessions.
+// deleteSessionsLoop 在 Start 中启动，并周期性地删除已过期的会话。
 func (s *Storage) deleteSessionsLoop(ctx context.Context) {
 	ctx, cancel := s.stopper.WithCancelOnQuiesce(ctx)
 	defer cancel()
@@ -403,6 +404,7 @@ func (s *Storage) deleteSessionsLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.Ch():
+			// 执行过期会话的删除操作。
 			s.deleteExpiredSessions(ctx)
 			t.Reset(s.gcInterval())
 		}

@@ -597,7 +597,7 @@ func Match(rd io.Reader) bool {
 	return version == version30 || version == versionSSL || version == versionCancel || version == versionGSSENC
 }
 
-// Start makes the Server ready for serving connections.
+// Start 使服务器准备好处理连接。
 func (s *Server) Start(ctx context.Context, stopper *stop.Stopper) {
 	s.SQLServer.Start(ctx, stopper)
 }
@@ -943,17 +943,13 @@ func (s *Server) TestingEnableAuthLogging() {
 	s.testingAuthLogEnabled.Store(true)
 }
 
-// ServeConn serves a single connection, driving the handshake process and
-// delegating to the appropriate connection type.
+// ServeConn 处理单个连接，驱动握手过程并委派给适当的连接类型。
 //
-// The socketType argument is an optimization to avoid a string
-// compare on conn.LocalAddr().Network(). When the socket type is
-// unix datagram (local filesystem), SSL negotiation is disabled
-// even when the server is running securely with certificates.
-// This has the effect of forcing password auth, also in a way
-// compatible with postgres.
+// socketType 参数是一个优化，用于避免对 conn.LocalAddr().Network() 进行字符串比较。
+// 当套接字类型为 unix datagram（本地文件系统）时，即使服务器带证书安全运行，也禁用 SSL 协商。
+// 这相当于强制使用密码认证，且与 postgres 兼容。
 //
-// An error is returned if the initial handshake of the connection fails.
+// 如果连接的初始握手失败，则返回错误。
 func (s *Server) ServeConn(
 	ctx context.Context, conn net.Conn, preServeStatus PreServeStatus,
 ) (err error) {

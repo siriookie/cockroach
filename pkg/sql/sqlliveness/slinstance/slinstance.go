@@ -182,8 +182,7 @@ func (l *Instance) clearSessionLocked(ctx context.Context) (createNewSession boo
 	return l.sessionEvents.OnSessionDeleted(ctx)
 }
 
-// createSession tries until it can create a new session and returns an error
-// only if the heart beat loop should exit.
+// createSession 尝试创建一个新会话，直到成功或心跳循环应该退出。
 func (l *Instance) createSession(ctx context.Context) (*session, error) {
 	region := enum.One
 	if l.currentRegion != nil {
@@ -248,13 +247,11 @@ func (l *Instance) createSession(ctx context.Context) (*session, error) {
 	return s, nil
 }
 
-// extendSession updates the session record with a new expiration time.
+// extendSession 更新会话记录，赋予其新的过期时间。
 //
-// Returns false if the session record is not found, meaning that someone else
-// deleted it.
+// 如果找不到会话记录（即已被删除），则返回 false。
 //
-// extendSession keeps retrying on error until ctx is canceled. Thus, an error
-// is only ever returned when the ctx is canceled.
+// extendSession 会持续重试直到上下文被取消。
 func (l *Instance) extendSession(ctx context.Context, s *session) (bool, error) {
 	exp := l.clock.Now().Add(l.ttl().Nanoseconds(), 0)
 
@@ -304,8 +301,7 @@ func (l *Instance) heartbeatLoop(ctx context.Context) {
 		log.Dev.Fatal(ctx, "expected heartbeat to always terminate with an error")
 	}
 
-	// Keep track of the fact that this Instance is not usable anymore. Further
-	// Session() calls will return errors.
+	// 标记此实例不再可用。后续对 Session() 的调用将返回错误。
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -330,8 +326,7 @@ func (l *Instance) heartbeatLoopInner(ctx context.Context) error {
 	defer func() {
 		log.Dev.Warning(ctx, "exiting heartbeat loop")
 	}()
-	// Operations below retry endlessly after the stopper started quiescing if we
-	// don't cancel their ctx.
+	// 在退出任务时自动取消上下文。
 	ctx, cancel := l.stopper.WithCancelOnQuiesce(ctx)
 	defer cancel()
 	var t timeutil.Timer
@@ -350,7 +345,7 @@ func (l *Instance) heartbeatLoopInner(ctx context.Context) error {
 			s = l.mu.s
 			l.mu.Unlock()
 
-			// If we don't currently have a session, create one.
+			// 1. [创建会话] 如果当前没有会话，则创建一个。
 			if s == nil {
 				newSession, err := l.createSession(ctx)
 				if err != nil {
@@ -361,16 +356,13 @@ func (l *Instance) heartbeatLoopInner(ctx context.Context) error {
 				continue
 			}
 
-			// Extend the session.
+			// 2. [续租会话] 延长现有会话的租约（心跳）。
 			found, err := l.extendSession(ctx, s)
 			if err != nil {
-				// extendSession only ever returns an error on a canceled ctx.
 				return err
 			}
 			if !found {
-				// Someone deleted our session record. Let's clear our state and proceed
-				// to create a new session, unless the event handler wants to shut down
-				// instead.
+				// 会话记录可能被他人删除。尝试重建，除非事件处理程序要求关闭。
 				if !l.clearSession(ctx) {
 					return errors.New("session record deleted")
 				}
@@ -426,12 +418,12 @@ func NewSQLInstance(
 	return l
 }
 
-// Start runs the hearbeat loop.
+// Start 运行心跳循环。
 func (l *Instance) Start(ctx context.Context, regionPhysicalRep []byte) {
 	l.currentRegion = regionPhysicalRep
 
 	log.Dev.Infof(ctx, "starting SQL liveness instance")
-	// Detach from ctx's cancelation.
+	// 从输入上下文中分离，但在任务上下文中保留标签。
 	taskCtx := l.AnnotateCtx(context.Background())
 	taskCtx = logtags.WithTags(taskCtx, logtags.FromContext(ctx))
 

@@ -115,16 +115,21 @@ func (stats *Reporter) reportInterval() (time.Duration, <-chan struct{}) {
 //
 // 核心作用：
 // 1. 集群协调：该任务在所有节点上运行，但只有持有 Meta 1 Range 租约（Leaseholder）的节点才会实际执行报告生成逻辑。
-//    这保证了整个集群只有一个节点在做这份工作，避免了资源浪费和写冲突。
+// User Data（普通数据层）：存储你实际的表数据。
+// Meta 2 Range（索引中间层）：存储 User Data 的分布信息（即：哪个范围的数据在哪个节点上）。
+// Meta 1 Range（索引根中心）：这是整个集群的**“根”**。它存储了所有 Meta 2 Range 的分布信息。
+//
+//	这保证了整个集群只有一个节点在做这份工作，避免了资源浪费和写冲突。
+//
 // 2. 动态调节：支持通过集群设置 `kv.replication_reports.interval` 动态调整报告生成的频率（支持即时生效）。
 // 3. 多样化报告：一次运行会生成三种关键报告：复制约束统计、复制状态汇总、以及关键局部性分析。
 //
 // 例子：
-// - 默认情况下，每分钟运行一次。
-// - 节点 A 是 Meta 1 的租约持有者。当定时器触发时，节点 A 会扫描集群中所有的 Range，
-//   检查它们的副本健康状况、是否违反了 Zone Config 约束。
-// - 如果节点 A 突然关机，Meta 1 的租约会转移到节点 B。随后节点 B 的 `Start` 循环
-//   会检测到自己成为了 Leaseholder，并接替节点 A 继续按周期生成报告。
+//   - 默认情况下，每分钟运行一次。
+//   - 节点 A 是 Meta 1 的租约持有者。当定时器触发时，节点 A 会扫描集群中所有的 Range，
+//     检查它们的副本健康状况、是否违反了 Zone Config 约束。
+//   - 如果节点 A 突然关机，Meta 1 的租约会转移到节点 B。随后节点 B 的 `Start` 循环
+//     会检测到自己成为了 Leaseholder，并接替节点 A 继续按周期生成报告。
 func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 	// 监听集群设置的变更。
 	ReporterInterval.SetOnChange(&stats.settings.SV, func(ctx context.Context) {
@@ -185,7 +190,24 @@ func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 	})
 }
 
-// update regenerates all the reports and saves them using the provided savers.
+// update 函数是生成复制报告的核心流水线。它负责协调扫描过程、聚合数据并将结果保存到数据库。
+//
+// 核心逻辑流程（Pipeline）：
+// 1. 准备配置：加载最新的 Zone Config（分区配置），这是判断副本是否“合规”的标准。
+// 2. 准备视图：从集群 Gossip 信息中获取所有节点/存储的最新描述符和存活状态（Liveness）。
+// 3. 多重访问器（Visitors）：创建三个独立的访问器，分别关注：
+//    - 约束访问器：检查副本放置是否符合 Zone Config（如：必须在 DC1 区域）。
+//    - 局部性访问器：分析副本分布是否具备容灾能力（如：是否跨机架）。
+//    - 复制统计访问器：统计副本的数量（如：是 3 副本还是已丢失副本）。
+// 4. 全集群扫描：通过 `visitRanges` 遍历 Meta2（元数据层），将每一条 Range 信息喂给上述三个访问器。
+// 5. 持久化：扫描完成后，如果访问器没有报错，则将汇总好的统计报表保存到系统表中。
+//
+// 例子：
+// 假设集群定义了一个规则：表 A 的数据必须在“北京”和“上海”各有副本。
+// - `update` 启动后，获取该规则。
+// - 扫描到表 A 的某个 Range 时，发现它的 3 个副本都在“北京”。
+// - `constraintConfVisitor` 会记录下这个 Range 处于“违规”状态。
+// - 扫描结束后，`Save` 操作会将“违规 Range 数量：1”写入系统表，供管理员在 Dashboard 查看。
 func (stats *Reporter) update(
 	ctx context.Context,
 	constraintsSaver *replicationConstraintStatsReportSaver,
@@ -198,36 +220,33 @@ func (stats *Reporter) update(
 		log.VEventf(ctx, 2, "updating replication reports... done. Generation took: %s.",
 			timeutil.Since(start))
 	}()
+	// 加载最新的分区配置（Zone Config）。
 	stats.updateLatestConfig()
 	if stats.latestConfig == nil {
 		return nil
 	}
 
+	// 从 StorePool（基于 Gossip）获取全集群所有存储节点的视图。
 	allStores := stats.storePool.GetStores()
 	var storesFromGossip StoreResolver = func(
 		id roachpb.StoreID,
 	) roachpb.StoreDescriptor {
-		// We'll return empty descriptors for stores that gossip doesn't have a
-		// descriptor for. These stores will be considered to satisfy all
-		// constraints.
-		// TODO(andrei): note down that some descriptors were missing from gossip
-		// somewhere in the report.
 		return allStores[id]
 	}
 
+	// 获取节点存活状态的快速检查函数。
 	isNodeLive := func(nodeID roachpb.NodeID) bool {
 		return stats.liveness.GetNodeVitalityFromCache(nodeID).IsLive(livenesspb.Metrics)
 	}
 
+	// 映射节点到其地理位置（Locality）。
 	nodeLocalities := make(map[roachpb.NodeID]roachpb.Locality, len(allStores))
 	for _, storeDesc := range allStores {
 		nodeDesc := storeDesc.Node
-		// Note: We might overwrite the node's localities here. We assume that all
-		// the stores for a node have the same node descriptor.
 		nodeLocalities[nodeDesc.NodeID] = nodeDesc.Locality
 	}
 
-	// Create the visitors that we're going to pass to visitRanges() below.
+	// 初始化三个访问器，准备开始全量扫描。
 	constraintConfVisitor := makeConstraintConformanceVisitor(
 		ctx, stats.latestConfig, storesFromGossip)
 	localityStatsVisitor := makeCriticalLocalitiesVisitor(
@@ -235,7 +254,7 @@ func (stats *Reporter) update(
 		storesFromGossip, isNodeLive)
 	replicationStatsVisitor := makeReplicationStatsVisitor(ctx, stats.latestConfig, isNodeLive)
 
-	// Iterate through all the ranges.
+	// 迭代全集群所有 Range（扫描 Meta2 索引）。
 	const descriptorReadBatchSize = 10000
 	rangeIter := makeMeta2RangeIter(stats.db, descriptorReadBatchSize)
 	if err := visitRanges(
@@ -249,6 +268,7 @@ func (stats *Reporter) update(
 		}
 	}
 
+	// 将扫描聚合后的结果，分别持久化到对应的系统表中。
 	if !constraintConfVisitor.failed() {
 		if err := constraintsSaver.Save(
 			ctx, constraintConfVisitor.report, timeutil.Now() /* reportTS */, stats.db, stats.executor,
@@ -274,17 +294,31 @@ func (stats *Reporter) update(
 	return nil
 }
 
-// meta1LeaseHolderStore returns the node store that is the leaseholder of Meta1
-// range or nil if none of the node's stores are holding the Meta1 lease.
+// meta1LeaseHolderStore 返回当前节点上持有 Meta1（Range ID 1）租约的 Store。
+// 如果当前节点的所有 Store 都没有持有 Meta1 租约，则返回 nil。
+//
+// 该函数是实现“分布式任务单点执行”的核心：
+// 1. 定位副本：它首先在本地节点的所有 Store 中搜索 Range ID 为 1 的副本（Replica）。
+// 2. 验证租约：如果找到了副本，它会进一步检查该副本是否拥有“当前有效”的租约（OwnsValidLease）。
+//
+// 例子：
+// - 假设集群有 3 个节点：N1, N2, N3。Meta1 的副本分布在它们上面。
+// - 只有 N1 的副本目前是 Leaseholder。
+// - 在 N1 上调用此函数：会返回 N1 对应的 Store 指针。
+// - 在 N2 或 N3 上调用此函数：会返回 nil。
+// - 这样，Reporter 就能据此判断：“噢，我是 N1，我是现在的负责人，我得去干活（更新报告）”。
 func (stats *Reporter) meta1LeaseHolderStore(ctx context.Context) *kvserver.Store {
 	const meta1RangeID = roachpb.RangeID(1)
+	// 在本节点内存中查找 Range 1 的副本。
 	repl, store, err := stats.localStores.GetReplicaForRangeID(ctx, meta1RangeID)
 	if kvpb.IsRangeNotFoundError(err) {
+		// 如果本节点根本没有 Range 1 的副本，直接返回 nil。
 		return nil
 	}
 	if err != nil {
 		log.KvDistribution.Fatalf(ctx, "unexpected error when visiting stores: %s", err)
 	}
+	// 关键检查：该副本当前是否拥有合法的读写租约？
 	if repl.OwnsValidLease(ctx, store.Clock().NowAsClockTimestamp()) {
 		return store
 	}

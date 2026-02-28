@@ -119,60 +119,73 @@ type IOThresholdConsumer interface {
 
 // SetPebbleMetricsProvider sets a PebbleMetricsProvider and causes the load
 // on the various storage engines to be used for admission control.
+// SetPebbleMetricsProvider 设置 Pebble 指标提供者，并启动基于存储引擎负载的准入控制逻辑。
+//
+// 核心作用：
+// 1. 数据桥梁：它将底层的存储健康数据（磁盘 I/O、L0 层堆积情况）引入准入控制系统。
+// 2. 动态调节引擎：启动一个后台“节拍器”协程，根据磁盘当前压力，动态决定给每个 Store 发放多少“通行证”（Tokens）。
+// 3. 平滑流量：通过高频（如 1ms）的 Token 发放，确保 I/O 流量平稳，避免突发流量冲击磁盘。
+//
+// 例子：
+// - 假设系统发现磁盘 A 响应变慢（延迟增加），Pebble 监控器会捕获这个信号。
+// - 这一步启动的后台循环会捕获该信号，并在下一个周期减少发放给磁盘 A 写入请求的 Token 数量。
+// - 结果：发送到磁盘 A 的写请求会自动排队等待，给磁盘喘息的机会，从而保护系统稳定性。
 func (sgc *StoreGrantCoordinators) SetPebbleMetricsProvider(
 	startupCtx context.Context,
 	pmp PebbleMetricsProvider,
 	mrp MetricsRegistryProvider,
 	iotc IOThresholdConsumer,
 ) {
+	// 1. 确保该初始化过程只被调用一次（单例保护）。
 	if sgc.setPebbleMetricsProviderCalled {
 		panic(errors.AssertionFailedf("SetPebbleMetricsProvider called more than once"))
 	}
 	sgc.setPebbleMetricsProviderCalled = true
 	pebbleMetricsProvider := pmp
 	sgc.closeCh = make(chan struct{})
+
+	// 2. 获取初始时刻所有 Store 的指标，并为每个 Store 初始化对应的协调器。
 	metrics := pebbleMetricsProvider.GetPebbleMetrics()
 	for _, m := range metrics {
+		// 为每个物理 Store 创建一个独立的控制器（包含队列和 Token 管理）。
 		gc := sgc.initGrantCoordinator(m.StoreID, mrp.GetMetricsRegistry(m.StoreID))
-		// Defensive call to LoadAndStore even though Store ought to be sufficient
-		// since SetPebbleMetricsProvider can only be called once. This code
-		// guards against duplication of stores returned by GetPebbleMetrics.
+		
+		// 将其存入线程安全的映射表 gcMap 中。
 		_, loaded := sgc.gcMap.LoadOrStore(m.StoreID, gc)
 		if !loaded {
 			sgc.numStores++
 		}
+		
+		// 执行第一次“心跳”，计算初始的 Token 配额。
 		gc.pebbleMetricsTick(startupCtx, m)
 		gc.allocateIOTokensTick(unloadedDuration.ticksInAdjustmentInterval())
 	}
+
+	// 如果是测试模式且禁用了节拍器，则提前退出，不需要启动后台协程。
 	if sgc.disableTickerForTesting {
 		return
 	}
-	// Attach tracer and log tags.
+	
+	// 准备后台协程的上下文环境。
 	ctx := sgc.ambientCtx.AnnotateCtx(context.Background())
 
+	// 3. 启动后台核心循环：负责动态 Token 分配和误差修正。
 	go func() {
 		t := tokenAllocationTicker{}
 		done := false
-		// The first adjustment interval is unloaded. We start as unloaded mainly
-		// for tests, and do a one-way transition to do 1ms ticks once we encounter
-		// load in the system.
 		var systemLoaded bool
+		
+		// 初始化节拍器（Ticker），开始第一个调整周期。
 		t.adjustmentStart(false /* loaded */)
 		var remainingTicks uint64
 		for !done {
 			select {
 			case <-t.ticker.C:
 				remainingTicks = t.remainingTicks()
-				// We do error accounting for disk reads and writes. This is important
-				// since disk token accounting is based on estimates over adjustment
-				// intervals. Like any model, these linear models have error terms, and
-				// need to be adjusted for greater accuracy. We adjust for these errors
-				// at a higher frequency than the adjustment interval. The error
-				// adjustment interval is defined by errorAdjustmentInterval.
-				//
-				// NB: We always do error calculation prior to making adjustments to
-				// make sure we account for errors prior to starting a new adjustment
-				// interval.
+
+				// A. 误差修正（Error Adjustment）：
+				// 实际磁盘消耗往往和模型预测有偏差。这个逻辑会根据真实的读写字节数，
+				// 频繁（通常比调整周期更频繁）地修正 Token 余额。
 				if t.shouldAdjustForError(remainingTicks, systemLoaded) {
 					metrics = pebbleMetricsProvider.GetPebbleMetrics()
 					for _, m := range metrics {
@@ -185,7 +198,8 @@ func (sgc *StoreGrantCoordinators) SetPebbleMetricsProvider(
 					}
 				}
 
-				// Start a new adjustment interval.
+				// B. 开启新的调整周期（New Adjustment Interval）：
+				// 当一个完整的调整周期（如 100ms）结束时，重新评估磁盘性能。
 				if remainingTicks == 0 {
 					metrics = pebbleMetricsProvider.GetPebbleMetrics()
 					if len(metrics) != sgc.numStores {
@@ -194,30 +208,31 @@ func (sgc *StoreGrantCoordinators) SetPebbleMetricsProvider(
 					}
 					for _, m := range metrics {
 						if gc, ok := sgc.gcMap.Load(m.StoreID); ok {
-							// We say that the system has load if at least one store is loaded.
+							// 调用 pebbleMetricsTick，根据最新的 L0 层健康度或磁盘负载制定下一阶段的 Token 发放计划。
 							storeLoaded := gc.pebbleMetricsTick(ctx, m)
 							systemLoaded = systemLoaded || storeLoaded
+							// 更新 IO 阈值，供其他系统（如调度器）参考。
 							iotc.UpdateIOThreshold(m.StoreID, gc.ioLoadListener.ioThreshold)
 						} else {
 							log.Dev.Warningf(ctx,
 								"seeing metrics for unknown storeID %d", m.StoreID)
 						}
 					}
-					// Start a new adjustment interval since there are no ticks remaining
-					// in the current adjustment interval. Note that the next call to
-					// allocateIOTokensTick will belong to the new adjustment interval.
+					// 启动计时器进入下一个 100ms（或设定的时长）周期。
 					t.adjustmentStart(systemLoaded)
 					remainingTicks = t.remainingTicks()
 				}
 
-				// Allocate tokens to the store grant coordinator.
+				// C. 每毫秒的 Token 发放（Per-tick Allocation）：
+				// 这步最关键：它把本周期计划内的总 Token，按毫秒分片发放下去。
+				// 这样写请求在这一毫秒内如果没有 Token 了就会等待，下一毫秒又能拿到新的 Token。
 				sgc.gcMap.Range(func(_ roachpb.StoreID, gc *storeGrantCoordinator) bool {
 					gc.allocateIOTokensTick(int64(remainingTicks))
-					// true indicates that iteration should continue after the
-					// current entry has been processed.
 					return true
 				})
+
 			case <-sgc.closeCh:
+				// 系统关闭，清理资源。
 				done = true
 				pebbleMetricsProvider.Close()
 			}
