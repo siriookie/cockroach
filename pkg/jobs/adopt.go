@@ -95,23 +95,36 @@ func (r *Registry) maybeDumpTrace(resumerCtx context.Context, resumer Resumer, j
 // claimJobs places a claim with the given SessionID to job rows that are
 // available.
 func (r *Registry) claimJobs(ctx context.Context, s sqlliveness.Session) error {
+	// 在一个 SQL transaction 中 claim jobs，保证 claim 操作原子提交。
 	return r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		// Run the claim transaction at low priority to ensure that it does not
 		// contend with foreground reads.
+		// job adoption 是后台任务，设置低优先级，避免和前台 SQL 读写争用。
 		if err := txn.KV().SetUserPriority(roachpb.MinUserPriority); err != nil {
+			// 设置优先级失败属于不符合预期的内部错误，包装成 assertion failure。
 			return errors.WithAssertionFailure(err)
 		}
+		// 执行 claimQuery，从 system.jobs 中挑选可 claim 的 jobs 并写入 claim 信息。
+		// claimQuery 会把 claim_session_id 设置成当前 sqlliveness session ID，
+		// 把 claim_instance_id 设置成当前 SQL instance ID。
 		numRows, err := txn.Exec(
 			ctx, "claim-jobs", txn.KV(), claimQuery,
+			// $1：当前 live sqlliveness session ID，表示这个 claim 绑定到当前活跃 session。
+			// $2：当前 SQL instance ID，表示这个 job 由哪个 SQL instance 执行。
+			// $3：本轮最多 claim 的 job 数量，避免一次 adoption loop 抢太多 jobs。
 			s.ID().UnsafeBytes(), r.ID(), maxAdoptionsPerLoop.Get(&r.settings.SV),
 		)
+		// 如果查询/更新 system.jobs 失败，返回给外层 adoption loop 记录日志并等待下轮重试。
 		if err != nil {
 			return errors.Wrap(err, "could not query jobs table")
 		}
+		// 统计本轮成功 claim 的 job 数量。
 		r.metrics.ClaimedJobs.Inc(int64(numRows))
+		// verbose 日志打开时总是记录；否则只有实际 claim 到 job 时才记录。
 		if log.ExpensiveLogEnabled(ctx, 1) || numRows > 0 {
 			log.Dev.Infof(ctx, "claimed %d jobs", numRows)
 		}
+		// transaction 成功提交。
 		return nil
 	})
 }

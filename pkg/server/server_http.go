@@ -145,43 +145,69 @@ var virtualClustersHandler = http.HandlerFunc(func(w http.ResponseWriter, req *h
 
 // setupRoutes configures HTTP routes for the server.
 func (s *httpServer) setupRoutes(
+	// ctx 是启动阶段传进来的上下文，用来记录事件日志和初始化依赖。
 	ctx context.Context,
+	// execCfg 是 SQL executor 的配置，OIDC 等模块会用它执行 SQL 或访问 settings。
 	execCfg *sql.ExecutorConfig,
+	// authnServer 负责 HTTP 登录、登出、session 校验等认证逻辑。
 	authnServer authserver.Server,
+	// adminServer 提供 Admin API 里一些特殊 handler，例如 statement/txn bundle 下载。
 	adminServer *adminServer,
+	// adminAuthzCheck 用来检查 debug/inspectz 请求是否有 admin 或 VIEWDEBUG 权限。
 	adminAuthzCheck privchecker.CheckerForRPCHandlers,
+	// metricSource 是 metrics 数据来源，/vars、/metrics、/_status/load 会用到。
 	metricSource metricMarshaler,
+	// runtimeStatSampler 提供 runtime 采样数据，load endpoint 会用到。
 	runtimeStatSampler *status.RuntimeStatSampler,
+	// unauthenticatedAPIInternalServer 是不包认证的内部 API handler。
 	unauthenticatedAPIInternalServer http.Handler,
+	// handleDebugUnauthenticated 是原始 debug handler，后面会按配置决定是否包认证授权。
 	handleDebugUnauthenticated http.Handler,
+	// handleInspectzUnauthenticated 是原始 inspectz handler，后面会按配置决定是否包认证授权。
 	handleInspectzUnauthenticated http.Handler,
+	// apiServer 是 v2 HTTP API handler；为空时不注册 v2 API 路由。
 	apiServer http.Handler,
+	// flags 是传给 DB Console 前端的 feature flags。
 	flags serverpb.FeatureFlags,
+	// drpcEnabled 决定 login/logout 使用直接 HTTP handler 还是旧 grpc-gateway 路径。
 	drpcEnabled bool,
 ) error {
 	// OIDC Configuration must happen prior to the UI Handler being defined below so that we have
 	// the system settings initialized for it to pick up from the oidcAuthenticationServer.
+	// 初始化 OIDC 模块，并让它先注册自己的 /oidc/v1/* 路由。
 	oidc, err := authserver.ConfigureOIDC(
+		// 传入 settings、locality、HTTP route 注册函数、SSO 登录回调、日志上下文、cluster ID 和 SQL executor 配置。
 		ctx, s.cfg.Settings, s.cfg.Locality,
 		s.mux.Handle, authnServer.UserLoginFromSSO, s.cfg.AmbientCtx, s.cfg.ClusterIDContainer.Get(), execCfg,
 	)
+	// OIDC 初始化失败时，HTTP 路由整体启动失败。
 	if err != nil {
 		return err
 	}
 
 	// Define the http.Handler for UI assets.
+	// 创建 DB Console 静态资源和 index.html 的 handler。
 	assetHandler := ui.Handler(ui.Config{
+		// 告诉 UI 当前是否绕过 web 认证。
 		Insecure: s.cfg.InsecureWebAccess(),
-		NodeID:   s.cfg.IDContainer,
-		OIDC:     oidc,
+		// 给 UI 注入当前 node id。
+		NodeID: s.cfg.IDContainer,
+		// 给 UI 注入 OIDC 配置读取接口，例如是否展示 OIDC 登录按钮。
+		OIDC: oidc,
+		// GetUser 从请求上下文里取当前登录用户，供 UI 模板显示用户名。
 		GetUser: func(ctx context.Context) *string {
+			// auth mux 如果验证出用户，会把用户信息放进 context。
 			if user, ok := authserver.MaybeUserFromHTTPAuthInfoContext(ctx); ok {
+				// UI 只需要 normalized string，不需要 SQLUsername 对象。
 				ustring := user.Normalized()
 				return &ustring
 			}
+			// 没有登录用户时返回 nil，UI 看到的就是匿名状态。
 			return nil
 		},
-		Flags:    flags,
+		// 注入前端 feature flags。
+		Flags: flags,
+		// 注入 settings，UI handler 会读取 license 等运行时信息。
 		Settings: s.cfg.Settings,
 	})
 
@@ -189,21 +215,29 @@ func (s *httpServer) setupRoutes(
 	// assets are served up whether or not there is a session. If there is a session, the mux
 	// adds it to the context, and it is templated into index.html so that the UI can show
 	// the username of the currently-logged-in user.
+	// 给 UI handler 包一层认证 mux，但允许匿名访问。
 	authenticatedUIHandler := authserver.NewMux(
 		authnServer, assetHandler, true /* allowAnonymous */)
+	// 根路径挂 DB Console。静态资源和 index.html 都会从这里进入。
 	s.mux.Handle("/", authenticatedUIHandler)
 
+	// 默认先使用不带认证包装的内部 API handler。
 	authenticatedAPIInternalServer := unauthenticatedAPIInternalServer
+	// 如果没有开启 insecure web access，就给内部 API 包一层 session 认证。
 	if !s.cfg.InsecureWebAccess() {
 		authenticatedAPIInternalServer = authserver.NewMux(
 			authnServer, authenticatedAPIInternalServer, false /* allowAnonymous */)
 	}
+	// 注册 /_status 前缀，DB Console 的很多状态 API 会走这里。
 	s.mux.Handle(apiconstants.StatusPrefix, authenticatedAPIInternalServer)
 
 	// Add HTTP authentication to the gRPC-gateway endpoints used by the UI,
 	// if not disabled by configuration.
+	// statement bundle 下载 handler，默认直接指向 adminServer 的方法。
 	var stmtBundleHandlerFunc = http.HandlerFunc(adminServer.StmtBundleHandler)
+	// transaction bundle 下载 handler，默认直接指向 adminServer 的方法。
 	var txnBundleHandlerFunc = http.HandlerFunc(adminServer.TxnBundleHandler)
+	// 安全模式下，bundle 下载也需要登录认证。
 	if !s.cfg.InsecureWebAccess() {
 		stmtBundleHandlerFunc = authserver.NewMux(authnServer, stmtBundleHandlerFunc, false).ServeHTTP
 		txnBundleHandlerFunc = authserver.NewMux(authnServer, txnBundleHandlerFunc, false).ServeHTTP
@@ -216,69 +250,100 @@ func (s *httpServer) setupRoutes(
 	// cookies via http.ResponseWriter. When DRPC is disabled, we use the old
 	// grpc-gateway path which sets cookies via gRPC metadata headers for backward
 	// compatibility.
+	// DRPC 开启时，登录登出直接用 HTTP handler，因为它们需要直接读写 cookie。
 	if drpcEnabled {
+		// 注册 /login，登录成功时 LoginHandler 会直接设置 session cookie。
 		s.mux.Handle(authserver.LoginPath, http.HandlerFunc(authnServer.LoginHandler))
+		// logout 默认使用直接 HTTP handler。
 		logoutHandlerfunc := http.HandlerFunc(authnServer.LogoutHandler)
+		// 安全模式下，logout 也需要先验证当前 session。
 		if !s.cfg.InsecureWebAccess() {
 			logoutHandlerfunc = authserver.NewMux(authnServer, logoutHandlerfunc, false /* allowAnonymous */).ServeHTTP
 		}
+		// 注册 /logout。
 		s.mux.Handle(authserver.LogoutPath, logoutHandlerfunc)
 	} else {
+		// DRPC 未开启时，/login 走旧的 grpc-gateway handler。
 		s.mux.Handle(authserver.LoginPath, unauthenticatedAPIInternalServer)
+		// DRPC 未开启时，/logout 走经过认证包装的内部 API handler。
 		s.mux.Handle(authserver.LogoutPath, authenticatedAPIInternalServer)
 	}
 
+	// 注册 virtual clusters 信息接口。
 	s.mux.Handle(virtualClustersPath, virtualClustersHandler)
 	// The login path for 'cockroach demo', if we're currently running
 	// that.
+	// cockroach demo 场景下，额外开放 demo 自动登录入口。
 	if s.cfg.EnableDemoLoginEndpoint {
 		s.mux.Handle(authserver.DemoLoginPath, http.HandlerFunc(authnServer.DemoLogin))
 	}
 
+	// 注册 /_admin 前缀，Admin API 走这里。
 	s.mux.Handle(apiconstants.AdminPrefix, authenticatedAPIInternalServer)
 
 	// Handlers for statement diagnostic bundle download. These are special
 	// because they return zip files, not protobufs or JSON.
+	// 注册 statement diagnostic bundle 下载接口，返回 zip 文件。
 	s.mux.Handle(apiconstants.AdminStmtBundle, stmtBundleHandlerFunc)
+	// 注册 transaction diagnostic bundle 下载接口，返回 zip 文件。
 	s.mux.Handle(apiconstants.AdminTxnBundle, txnBundleHandlerFunc)
 
 	// The timeseries endpoint, used to produce graphs.
+	// 注册 time series 查询接口，DB Console 图表会用它。
 	s.mux.Handle(ts.URLPrefix, authenticatedAPIInternalServer)
 
 	// Exempt the 2nd health check endpoint from authentication.
 	// (This simply mirrors /health and exists for backward compatibility.)
+	// 注册不需要认证的 health endpoint，主要给探活和兼容旧路径用。
 	s.mux.Handle(apiconstants.AdminHealth, unauthenticatedAPIInternalServer)
 	// The /_status/vars and /metrics endpoint is not authenticated either. Useful for monitoring.
+	// 注册 /_status/vars，暴露变量和 metrics 文本，供监控系统抓取。
 	s.mux.Handle(apiconstants.StatusVars, http.HandlerFunc(varsHandler{metricSource, s.cfg.Settings, false /* useStaticLabels */}.handleVars))
+	// 注册 /metrics，和 /_status/vars 类似，但使用 static labels。
 	s.mux.Handle(apiconstants.MetricsPath, http.HandlerFunc(varsHandler{metricSource, s.cfg.Settings, true /* useStaticLabels */}.handleVars))
 	// Same for /_status/load.
+	// 构造 /_status/load handler，用来暴露 runtime/load 相关状态。
 	le, err := newLoadEndpoint(runtimeStatSampler, metricSource)
+	// load endpoint 构造失败时，路由初始化失败。
 	if err != nil {
 		return err
 	}
+	// 注册 /_status/load，同样不包认证，便于监控读取。
 	s.mux.Handle(apiconstants.LoadStatusVars, le)
 
+	// apiServer 非空说明启用了新的 v2 HTTP API tree。
 	if apiServer != nil {
 		// The new "v2" HTTP API tree.
+		// 注册 /api/v2 前缀。
 		s.mux.Handle(apiconstants.APIV2Path, apiServer)
 	}
 
 	// Register debugging endpoints.
+	// debug/inspectz 先使用未认证版本，后面根据安全配置决定是否包装。
 	handleDebugAuthenticated := handleDebugUnauthenticated
 	handleInspectzAuthenticated := handleInspectzUnauthenticated
+	// 安全模式下，debug/inspectz 不仅要认证，还要做 admin/VIEWDEBUG 授权检查。
 	if !s.cfg.InsecureWebAccess() {
 		// Mandate both authentication and admin authorization.
+		// 先给 debug handler 包 admin/VIEWDEBUG 授权检查。
 		handleDebugAuthenticated = makeAdminAuthzCheckHandler(adminAuthzCheck, handleDebugAuthenticated)
+		// 再给 debug handler 包登录认证。
 		handleDebugAuthenticated = authserver.NewMux(authnServer, handleDebugAuthenticated, false /* allowAnonymous */)
 
+		// inspectz 和 debug 一样，也需要 admin/VIEWDEBUG 授权。
 		handleInspectzAuthenticated = makeAdminAuthzCheckHandler(adminAuthzCheck, handleInspectzAuthenticated)
+		// 再给 inspectz handler 包登录认证。
 		handleInspectzAuthenticated = authserver.NewMux(authnServer, handleInspectzAuthenticated, false /* allowAnonymous */)
 	}
+	// 注册 debug endpoint。
 	s.mux.Handle(debug.Endpoint, handleDebugAuthenticated)
+	// 注册 inspectz endpoint。
 	s.mux.Handle(inspectz.URLPrefix, handleInspectzAuthenticated)
 
+	// 记录一条启动事件，表示 HTTP endpoints 已经完成注册。
 	log.Event(ctx, "added http endpoints")
 
+	// 路由全部注册成功。
 	return nil
 }
 

@@ -146,21 +146,32 @@ func (m *runtimeLoadMonitor) GetCPUStats() (cpuUsageNanoPerSec int64, cpuCapacit
 
 // recordCPUUsage samples and records the current cpu usage of the node.
 func (m *runtimeLoadMonitor) recordCPUUsage(ctx context.Context) error {
+	// 加锁保护 lastTotalUsageNanos 和 usageEWMA，避免后台采样和 GetCPUStats 并发读写。
 	m.mu.Lock()
+	// 函数返回前释放锁。
 	defer m.mu.Unlock()
+	// 读取当前进程累计消耗的 user CPU 时间和 system CPU 时间，单位是毫秒。
 	userTimeMillis, sysTimeMillis, err := status.GetProcCPUTime(ctx)
+	// 如果底层读取失败，包装成 assertion error 返回给调用方。
 	if err != nil {
 		return errors.NewAssertionErrorWithWrappedErrf(err, "failed to get cpu usage")
 	}
 	// Convert milliseconds to nanoseconds.
+	// 把 user + system 的累计 CPU 时间从毫秒换算成纳秒。
 	totalUsageNanos := float64(userTimeMillis*1e6 + sysTimeMillis*1e6)
+	// 正常情况下，进程累计 CPU 时间应该单调递增；如果变小，说明采样数据异常或计数被重置。
 	if totalUsageNanos < m.mu.lastTotalUsageNanos {
+		// 记录 warning，方便排查异常的 CPU 统计来源。
 		log.KvDistribution.Warningf(ctx, "last cpu usage is larger than current: %v > %v",
 			m.mu.lastTotalUsageNanos, totalUsageNanos)
+		// 防止出现负 delta，把当前累计值钳制到上一次值。
 		totalUsageNanos = m.mu.lastTotalUsageNanos
 	}
+	// 把两次采样之间的 CPU 时间增量加入 EWMA，用移动平均平滑瞬时波动。
 	m.mu.usageEWMA.Add(totalUsageNanos - m.mu.lastTotalUsageNanos)
+	// 保存本次累计 CPU 时间，供下一次采样计算 delta。
 	m.mu.lastTotalUsageNanos = totalUsageNanos
+	// 本次采样成功。
 	return nil
 }
 

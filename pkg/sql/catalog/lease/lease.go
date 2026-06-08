@@ -2460,22 +2460,37 @@ func (m *Manager) markDescriptorUpdatesAsComplete() hlc.Timestamp {
 // advanceCloseTimestamp advances the close timestamp atomically, if the current
 // close timestamp is smaller.
 func (m *Manager) advanceCloseTimestamp(ctx context.Context, timestamp hlc.Timestamp) {
+	// 为目标 timestamp 创建一个新的 close timestamp handle。
+	// handle 不只是保存时间戳，还会跟踪这个时间戳下需要延迟释放的 descriptor lease。
 	timestampHandle := newCloseTimeStampHandle(timestamp)
+	// 用 CAS 循环推进 close timestamp，处理多个 goroutine 同时尝试推进的情况。
 	for {
+		// 读取当前全局可见的 close timestamp handle。
+		// closeTimestamp 是 atomic.Value，所以这里不需要持有 m.mu。
 		oldTimestamp := m.closeTimestamp.Load().(*closeTimeStampHandle)
 		// Timestamp has already been advanced.
+		// 如果当前 close timestamp 已经大于等于目标 timestamp，说明已经被推进过了。
+		// 这种情况下没有必要回退或重复插入 handle，直接返回。
 		if !oldTimestamp.timestamp.Less(timestamp) {
 			return
 		}
 		// Otherwise, attempt to swap the timestamp, if successful, we
 		// will return.
+		// 尝试把 closeTimestamp 从 oldTimestamp 原子替换成 timestampHandle。
+		// 只有在 oldTimestamp 仍然是当前值时才会成功；如果被并发 goroutine 改过，就继续循环重试。
 		if m.closeTimestamp.CompareAndSwap(oldTimestamp, timestampHandle) {
 			// Insert the new timestamp handle.
+			// CAS 成功后，把新的 handle 插入 activeCloseTimestamps 列表。
+			// 后续获取 safe replication timestamp 时，可以拿到这个新时间点对应的 handle。
 			m.insertNewTimestampHandle(timestampHandle)
 			// Now that the new timestamp is set, we can mark the old one as ready
 			// for removal.
+			// 新 handle 已经成为当前 close timestamp，旧 handle 不再接收新的引用。
+			// 这里把旧 handle 标记为“引用释放后可以清理”。
 			oldTimestamp.freeOnRelease.Swap(true)
 			// Purge any old timestamp handles.
+			// 尝试清理已经标记 freeOnRelease 且 refCount 为 0 的旧 handle。
+			// 如果旧 handle 仍被其他 goroutine 使用，这里不会强行释放，会等后续再清理。
 			m.maybeFreeOldTimestampHandles(ctx)
 		}
 	}
@@ -2521,23 +2536,43 @@ func (m *Manager) shouldRetainPriorVersions(
 // maybeFreeOldTimestampHandles cleans up any old close timestamps that
 // have hit a refcount of zero.
 func (m *Manager) maybeFreeOldTimestampHandles(ctx context.Context) {
+	// 加锁保护 activeCloseTimestamps 列表。
+	// 这个函数会遍历并改写该 slice，所以必须持有 m.mu。
 	m.mu.Lock()
+	// 函数退出时释放锁。
 	defer m.mu.Unlock()
+	// 记录当前 activeCloseTimestamps 的有效长度。
+	// 后面删除元素时不会立刻重新分配 slice，而是逐步缩短这个有效长度。
 	numTimestamps := len(m.mu.activeCloseTimestamps)
+	// 遍历当前有效范围内的 close timestamp handles。
 	for i := 0; i < numTimestamps; i++ {
+		// 取出当前要检查的 timestamp handle。
 		t := m.mu.activeCloseTimestamps[i]
+		// 只有满足两个条件时才可以清理：
+		// 1. freeOnRelease 为 true，表示它已经不是当前需要长期保留的 handle；
+		// 2. refCount 为 0，表示没有 goroutine 正在使用这个 handle。
 		if !t.freeOnRelease.Load() || t.refCount.Load() != 0 {
+			// 还不能清理就跳过，继续检查下一个 handle。
 			continue
 		}
+		// 清理这个 handle 上挂着的旧 descriptor leases。
+		// 这是业务资源释放，不是直接触发 Go GC。
 		t.cleanupHandle(ctx)
 		// Move complete elements to the end.
+		// 把要删除的元素交换到当前有效区间的末尾。
+		// 这样可以 O(1) 删除元素，但不会保持 activeCloseTimestamps 的原始顺序。
 		if numTimestamps > 1 {
 			m.mu.activeCloseTimestamps[numTimestamps-1], m.mu.activeCloseTimestamps[i] =
 				m.mu.activeCloseTimestamps[i], m.mu.activeCloseTimestamps[numTimestamps-1]
 		}
+		// 有效长度减 1，表示末尾那个已清理 handle 不再属于有效列表。
 		numTimestamps--
+		// 当前下标 i 位置被换进来了一个新的元素。
+		// i-- 让下一轮循环继续检查这个位置，避免漏掉刚换进来的 handle。
 		i--
 	}
+	// 截断 activeCloseTimestamps，只保留仍然有效的 handles。
+	// 被截掉的旧 handle 如果没有其他引用，之后才可能被 Go GC 回收。
 	m.mu.activeCloseTimestamps = m.mu.activeCloseTimestamps[:numTimestamps]
 }
 
@@ -2546,13 +2581,22 @@ func (m *Manager) maybeFreeOldTimestampHandles(ctx context.Context) {
 // rangefeeds. This function must be passed a non-nil gossip if
 // RangefeedLeases is not active.
 func (m *Manager) StartRefreshLeasesTask(ctx context.Context, s *stop.Stopper, db *kv.DB) {
+	// descriptor lease refresh 是系统后台维护任务，不应该计入 tenant cost control。
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
+	// 加锁保护 lease manager 的初始化状态和 rangefeed 启动状态。
 	m.mu.Lock()
+	// 函数退出时释放锁。
 	defer m.mu.Unlock()
+	// 通知等待 lease manager 初始化的 goroutine：初始化流程已经走完。
 	defer close(m.waitForInit)
+	// 标记 lease manager 初始化完成。
 	defer m.initComplete.Swap(true)
+	// 启动对 system.descriptor 表的 rangefeed。
+	// 后续 descriptor 新版本、删除、descriptor update metadata 都会通过 channel 送到下面的 loop。
 	m.watchForUpdates(ctx)
+	// 启动后台任务，持续消费 descriptor 变更事件并刷新/清理 leases。
 	_ = s.RunAsyncTask(ctx, "refresh-leases", func(ctx context.Context) {
+		// 捕获 panic 后先写日志，再继续 panic，让问题不会被静默吞掉。
 		defer func() {
 			if err := recover(); err != nil {
 				log.Dev.Warningf(ctx, "panic in refresh-leases: %v", err)
@@ -2560,12 +2604,16 @@ func (m *Manager) StartRefreshLeasesTask(ctx context.Context, s *stop.Stopper, d
 			}
 		}()
 
+		// 后台循环一直运行到 stopper quiesce。
 		for {
 			select {
+			// descDelCh 收到的是被删除 descriptor 的 ID。
 			case id := <-m.descDelCh:
 				// Descriptor is marked as deleted, so mark it for deletion or
 				// remove it if it's no longer in use.
+				// 删除 descriptor 的清理可能需要访问 KV 和释放旧 lease，放到单独 async task 中执行。
 				_ = s.RunAsyncTask(ctx, "purgeOldVersionsOrAcquireInitialVersion deleted descriptor", func(ctx context.Context) {
+					// 捕获子任务 panic，避免静默失败。
 					defer func() {
 						if err := recover(); err != nil {
 							log.Dev.Warningf(ctx, "panic in purgeOldVersionsOrAcquireInitialVersion deleted descriptor: %v", err)
@@ -2573,22 +2621,29 @@ func (m *Manager) StartRefreshLeasesTask(ctx context.Context, s *stop.Stopper, d
 						}
 					}()
 					// Once the descriptor is purged notify that some change has occurred.
+					// 清理完成后递增 leaseGeneration，通知依赖 descriptor lease 的缓存失效。
 					defer m.leaseGeneration.Add(1)
+					// 找到本机当前缓存的这个 descriptor 最新 lease state。
 					state := m.findNewest(id)
+					// 如果本机没有缓存这个 descriptor，就没有旧 lease 需要清理。
 					if state != nil {
+						// descriptor 已删除，清理旧版本 lease；仍在使用的 lease 会等引用释放后再真正移除。
 						if err := m.purgeOldVersions(ctx, db, id, true /* dropped */, state.GetVersion()); err != nil {
 							log.Dev.Warningf(ctx, "error purging leases for deleted descriptor %d",
 								id)
 						}
 					}
 				})
+			// descUpdateCh 收到的是 system.descriptor 中的新 descriptor 版本。
 			case desc := <-m.descUpdateCh:
 				// NB: We allow nil descriptors to be sent to synchronize the updating of
 				// descriptors.
+				// nil descriptor 只作为同步信号，不需要刷新 lease。
 				if desc == nil {
 					continue
 				}
 
+				// 测试 hook：允许测试拦截 descriptor update，甚至跳过这次刷新。
 				if evFunc := m.testingKnobs.TestingDescriptorUpdateEvent; evFunc != nil {
 					if err := evFunc(desc.DescriptorProto()); err != nil {
 						log.Dev.Infof(ctx, "skipping update of %v due to knob: %v",
@@ -2597,6 +2652,7 @@ func (m *Manager) StartRefreshLeasesTask(ctx context.Context, s *stop.Stopper, d
 					}
 				}
 
+				// 记录新 descriptor 是否已经处于 dropped 状态。
 				dropped := desc.Dropped()
 				// Try to refresh the lease to one >= this version.
 				log.VEventf(ctx, 2, "purging old version of descriptor %d@%d (dropped %v)",
@@ -2605,13 +2661,18 @@ func (m *Manager) StartRefreshLeasesTask(ctx context.Context, s *stop.Stopper, d
 				// descriptors. Or if a new descriptor shows up then the initial version
 				// will be acquired if the schema is already leased to invalidate metadata
 				// caches (like optimizer memos).
+				// 这个闭包负责对单个 descriptor 的新版本执行核心处理：
+				// 必要时先获取初始 lease，然后清理比新版本更旧的 leases。
 				purgeOldVersionsOrAcquireInitialVersion := func(ctx context.Context) {
+					// 测试 hook：通知测试发现了 descriptor 新版本。
 					if m.testingKnobs.TestingOnNewVersion != nil {
 						m.testingKnobs.TestingOnNewVersion(desc.GetID())
 					}
 					// Notify of any new / modified descriptors below once a new lease is
 					// acquired.
+					// 无论是获取新 lease 还是清理旧 lease，完成后都递增 leaseGeneration。
 					defer m.leaseGeneration.Add(1)
+					// 测试 hook：通知测试 leaseGeneration 将因为新版本而递增。
 					if m.testingKnobs.TestingOnLeaseGenerationBumpForNewVersion != nil {
 						defer m.testingKnobs.TestingOnLeaseGenerationBumpForNewVersion(desc.GetID())
 					}
@@ -2627,6 +2688,8 @@ func (m *Manager) StartRefreshLeasesTask(ctx context.Context, s *stop.Stopper, d
 						desc.GetParentSchemaID() != descpb.InvalidID &&
 						(m.isDescriptorStateEmpty(desc.GetID())) &&
 						m.findDescriptorState(desc.GetParentSchemaID(), false) != nil {
+						// 对已经 leased 的 schema 下新建的 relation/type，立即获取该 descriptor 的初始 lease。
+						// 这样创建事务返回前，本节点已经能感知新 descriptor，相关缓存也会被正确失效。
 						err := ensureVersion(ctx, desc.GetID(), desc.GetVersion(), m)
 						if err != nil {
 							log.Dev.Warningf(ctx, "error fetching lease for descriptor %s", err)
@@ -2636,6 +2699,7 @@ func (m *Manager) StartRefreshLeasesTask(ctx context.Context, s *stop.Stopper, d
 					// descriptor versions, which could have been acquired concurrently.
 					// For example the range feed sees version 2 and a query concurrently
 					// acquires version 1.
+					// 清理旧版本 leases，保证本机不会长期持有过期 descriptor 版本。
 					if err := m.purgeOldVersions(ctx, db, desc.GetID(), dropped, desc.GetVersion()); err != nil {
 						log.Dev.Warningf(ctx, "error purging leases for descriptor %d(%s): %s",
 							desc.GetID(), desc.GetName(), err)
@@ -2651,50 +2715,70 @@ func (m *Manager) StartRefreshLeasesTask(ctx context.Context, s *stop.Stopper, d
 				// may release the lease on the current version before we can start
 				// acquiring the lease on the new version. This could lead to periods
 				// of increased latency right as the descriptor has been committed.
+				// 如果 descriptor 的 modification time 在当前时钟之后，说明这个新版本对本节点来说还“来自未来”。
+				// 这时先等到 modification time，再清理旧版本/获取新版本，避免在时间边界上过早释放当前 lease。
 				if now := db.Clock().Now(); now.Less(desc.GetModificationTime()) {
 					_ = s.RunAsyncTask(ctx, "wait to purgeOldVersionsOrAcquireInitialVersion", func(ctx context.Context) {
+						// 捕获延迟清理任务的 panic。
 						defer func() {
 							if err := recover(); err != nil {
 								log.Dev.Warningf(ctx, "panic in wait to purgeOldVersionsOrAcquireInitialVersion: %v", err)
 								panic(err)
 							}
 						}()
+						// 计算需要等多久，等到 descriptor modification time 到达。
 						toWait := time.Duration(desc.GetModificationTime().WallTime - now.WallTime)
 						select {
+						// 到时间后再处理新版本 lease 和旧版本清理。
 						case <-time.After(toWait):
 							purgeOldVersionsOrAcquireInitialVersion(ctx)
+						// 上下文取消或 stopper quiesce 时放弃处理。
 						case <-ctx.Done():
 						case <-s.ShouldQuiesce():
 						}
 					})
 				} else {
+					// modification time 已经到达，立即处理新版本 lease 和旧版本清理。
 					purgeOldVersionsOrAcquireInitialVersion(ctx)
 				}
 
+				// 测试 hook：通知测试 descriptor 已经被 refresh。
 				if evFunc := m.testingKnobs.TestingDescriptorRefreshedEvent; evFunc != nil {
 					evFunc(desc.DescriptorProto())
 				}
+			// descMetaDataUpdateCh 收到的是 descriptor transaction update metadata。
+			// 这些 metadata 用来判断某个 descriptor update transaction 是否已经被本节点处理完。
 			case descUpdate := <-m.descMetaDataUpdateCh:
 				// Check if the update has been applied.
+				// 检查这批 descriptor updates 中哪些已经应用，哪些还没应用。
 				allApplied, remaining := m.hasDescUpdateBeenApplied(descUpdate.mu.DescriptorUpdates)
+				// 保留尚未应用的 descriptor updates，后续还需要继续等待。
 				descUpdate.mu.DescriptorUpdates = remaining
+				// 决定是否可以推进 close timestamp。
+				// close timestamp 表示 lease manager 已经安全处理到某个时间点的 descriptor updates。
 				advanceTimestamp := func() bool {
 					m.mu.Lock()
 					defer m.mu.Unlock()
+					// 标记存在可以清理的 descriptor update metadata。
 					m.mu.hasUpdatesToDelete = true
 					// If there are no other earlier pending updates, advance the timestamp.
+					// 找到当前还未处理完的最早 descriptor update。
 					minUpdate, hasMin := m.mu.descriptorTxnUpdatesToProcess.Min()
+					// 只有当前 update 已全部应用，并且没有更早的 pending update 时，才能推进 close timestamp。
 					if allApplied && (!hasMin ||
 						!minUpdate.timestamp.Less(descUpdate.timestamp)) {
 						return true
 					}
 					// Otherwise, insert this into the queue of pending updates
+					// 否则把这批 update 放回 pending 队列，等待后续再检查。
 					m.mu.descriptorTxnUpdatesToProcess.ReplaceOrInsert(descUpdate)
 					return false
 				}()
+				// 如果条件满足，推进 close timestamp。
 				if advanceTimestamp {
 					m.advanceCloseTimestamp(ctx, descUpdate.timestamp)
 				}
+			// stopper 开始 quiesce，退出 refresh-leases 后台循环。
 			case <-s.ShouldQuiesce():
 				return
 			}
@@ -2748,108 +2832,200 @@ func (m *Manager) closeRangeFeedLocked() {
 // watchForUpdates will watch a rangefeed on the system.descriptor table for
 // updates.
 func (m *Manager) watchForUpdates(ctx context.Context) {
+	// 在 verbose 日志级别下记录：lease manager 使用 rangefeed 监听 descriptor 更新。
 	if log.V(1) {
 		log.Dev.Infof(ctx, "using rangefeeds for lease manager updates")
 	}
+	//举个抽象例子：
+
+	// ```text
+	// descriptorTableStart = "/Table/29"
+	// descriptorTableStart.PrefixEnd() = "/Table/30"
+	// ```
+
+	// 那么 span 是：
+
+	// ```text
+	// ["/Table/29", "/Table/30")
+	// ```
+
+	// 这是一个左闭右开的范围，表示包含：
+
+	// ```text
+	// /Table/29/1
+	// /Table/29/2
+	// /Table/29/abc
+	// /Table/29/index/...
+	// ```
+
+	// 不包含：
+
+	// ```text
+	// /Table/30
+	// /Table/30/1
+	// ```
+
+	// 对应到 `system.descriptor`，它里面存的是各种 descriptor，比如：
+
+	// ```text
+	// database descriptor
+	// schema descriptor
+	// table descriptor
+	// type descriptor
+	// ```
+
+	// 所以这个 rangefeed 监听的就是：
+
+	// ```text
+	// system.descriptor 表里所有 descriptor KV 的变化
+	// 计算 system.descriptor 表在 KV keyspace 中的起始 key 前缀。
 	descriptorTableStart := m.Codec().TablePrefix(keys.DescriptorTableID)
+	// 构造 system.descriptor 表对应的完整 KV span。
 	descriptorTableSpan := roachpb.Span{
-		Key:    descriptorTableStart,
+		// span 起点是 descriptor 表前缀。
+		Key: descriptorTableStart,
+		// span 终点是这个前缀的 PrefixEnd，表示覆盖整张 descriptor 表。
 		EndKey: descriptorTableStart.PrefixEnd(),
 	}
+	// handleEvent 是 rangefeed 收到每条 KV 更新时调用的回调。
 	handleEvent := func(
 		ctx context.Context, ev *kvpb.RangeFeedValue,
 	) {
 		// Skip updates if rangefeeds are disabled.
+		// 测试开关：如果禁用了 rangefeed checkpoint/update 处理，直接忽略事件。
 		if m.TestingDisableRangeFeedCheckpoint.Load() {
 			return
 		}
 		// Check first if it is the special descriptor metadata key used to track
 		// descriptors modified by transactions.
+		// 先判断这个 key 是否是 descriptor update metadata key。
+		// 这种 key 不是普通 descriptor，而是记录某个事务修改了哪些 descriptors。
 		if isUpdateKey, err := m.Codec().DecodeDescUpdateKey(ev.Key); err != nil || isUpdateKey {
+			// 如果 key 解码失败，记录 warning 并忽略这条事件。
 			if err != nil {
 				log.Dev.Warningf(ctx, "unable to decode update metadata key %v", ev.Key)
 				return
 			}
 			// Ignore deletes on this key space.
+			// 对 descriptor update metadata key 的删除事件不需要处理。
 			if len(ev.Value.RawBytes) == 0 {
 				return
 			}
 			// Otherwise, this is a descriptor update key.
+			// 反序列化 descriptor update metadata 中记录的 DescriptorUpdates。
 			var descUpdates descpb.DescriptorUpdates
 			err := ev.Value.GetProto(&descUpdates)
+			// 如果 value 解码失败，记录 warning 并忽略。
 			if err != nil {
 				log.Dev.Warningf(ctx, "unable to decode descriptor update value %v", err)
 				return
 			}
+			// 构造一个 descriptorTxnUpdate，用来后续判断这批 descriptor updates 是否已经应用完成。
 			update := &descriptorTxnUpdate{
-				key:       ev.Key,
+				// 保存原始 metadata key，后续清理 update key space 时可能用到。
+				key: ev.Key,
+				// 保存 rangefeed 事件时间戳，用于推进 close timestamp。
 				timestamp: ev.Timestamp(),
 			}
+			// 保存这次事务写入的 descriptor update 列表。
 			update.mu.DescriptorUpdates = descUpdates
+			// 把 descriptor transaction update 送给 StartRefreshLeasesTask 中的消费 loop。
 			select {
+			// stopper quiesce 时不再发送。
 			case <-m.stopper.ShouldQuiesce():
+			// context 取消时不再发送。
 			case <-ctx.Done():
+			// 正常路径：发送到 descMetaDataUpdateCh。
 			case m.descMetaDataUpdateCh <- update:
 			}
 			return
+			// 如果不是 descriptor update metadata key，并且 value 是空，说明这是普通 descriptor 的删除事件。
 		} else if len(ev.Value.RawBytes) == 0 {
+			// 从 descriptor metadata key 中解出 descriptor ID。
 			id, err := m.Codec().DecodeDescMetadataID(ev.Key)
+			// 解码失败时记录 info 并忽略。
 			if err != nil {
 				log.Dev.Infof(ctx, "unable to decode metadata key %v", ev.Key)
 				return
 			}
+			// 把删除的 descriptor ID 送给 StartRefreshLeasesTask 中的消费 loop。
 			select {
+			// stopper quiesce 时不再发送。
 			case <-m.stopper.ShouldQuiesce():
+			// context 取消时不再发送。
 			case <-ctx.Done():
+			// 正常路径：发送到 descDelCh。
 			case m.descDelCh <- descpb.ID(id):
 			}
 			return
 		}
+		// 普通非删除事件：value 中应该是一个序列化后的 descriptor。
 		b, err := descbuilder.FromSerializedValue(&ev.Value)
+		// 如果无法反序列化 descriptor，按配置报告或 panic。
 		if err != nil {
 			logcrash.ReportOrPanic(ctx, &m.storage.settings.SV,
 				"%s: unable to unmarshal descriptor %v", ev.Key, ev.Value)
 		}
+		// b 为 nil 表示 value 中没有有效 descriptor，直接忽略。
 		if b == nil {
 			return
 		}
+		// 构造 mutable descriptor，后续刷新 lease 时需要 descriptor ID、version、状态等信息。
 		mut := b.BuildCreatedMutable()
+		// verbose 日志：记录将要刷新哪个 descriptor 的 lease。
 		if log.V(2) {
 			log.Dev.Infof(ctx, "%s: refreshing lease on descriptor: %d (%s), version: %d",
 				ev.Key, mut.GetID(), mut.GetName(), mut.GetVersion())
 		}
+		// 把 descriptor 新版本送给 StartRefreshLeasesTask 中的消费 loop。
 		select {
+		// stopper quiesce 时不再发送。
 		case <-m.stopper.ShouldQuiesce():
+		// context 取消时不再发送。
 		case <-ctx.Done():
+		// 正常路径：发送到 descUpdateCh。
 		case m.descUpdateCh <- mut:
 		}
 	}
 
+	// handleCheckpoint 是 rangefeed resolved timestamp 前进时调用的回调。
 	handleCheckpoint := func(ctx context.Context, checkpoint *kvpb.RangeFeedCheckpoint) {
+		// 测试开关：如果禁用了 checkpoint 处理，直接忽略。
 		if m.TestingDisableRangeFeedCheckpoint.Load() {
 			return
 		}
 		// Track checkpoints that occur from the rangefeed to make sure progress
 		// is always made.
+		// checkpoint 表示 rangefeed 已经处理到 ResolvedTS。
+		// 推进 close timestamp，表示这个时间点之前的 descriptor 更新已经安全观察到。
 		m.advanceCloseTimestamp(ctx, checkpoint.ResolvedTS)
+		// 加锁更新 rangefeed 进度统计和 pending update 队列。
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		// 记录收到一次 checkpoint，用于后台 watchdog 判断 rangefeed 是否还在前进。
 		m.mu.rangeFeedCheckpoints += 1
 		// Clean up all entries before the resolve timestamp.
+		// 清理已经早于 checkpoint resolved timestamp 的 pending descriptor transaction updates。
 		for {
+			// 取出最早的 pending descriptor transaction update。
 			minTS, hasMin := m.mu.descriptorTxnUpdatesToProcess.Min()
+			// 如果没有 pending update，或者最早的 update 时间戳还没有早于 checkpoint，就停止清理。
 			if !hasMin || !minTS.timestamp.Less(checkpoint.ResolvedTS) {
 				break
 			}
+			// 删除已经被 checkpoint 覆盖的 pending update。
 			m.mu.descriptorTxnUpdatesToProcess.Delete(minTS)
 		}
 	}
 
 	// Assert that the range feed is already terminated.
+	// 启动新的 rangefeed 前，确认旧 rangefeed 已经关闭。
 	if m.mu.rangeFeed != nil {
+		// 测试构建下直接 panic，暴露重复启动 rangefeed 的问题。
 		if buildutil.CrdbTestBuild {
 			panic(errors.AssertionFailedf("range feed was not closed before a restart attempt"))
 		}
+		// 非测试构建下记录 warning，继续尝试启动。
 		log.Dev.Warningf(ctx, "range feed was not closed before a restart attempt")
 	}
 	// Always populate a timestamp on the range feed, otherwise we run the risk
@@ -2857,19 +3033,30 @@ func (m *Manager) watchForUpdates(ctx context.Context) {
 	// when we start handing out leases (i.e. close waitForInit) The startup below
 	// is asynchronous in nature, so the timestamp could be after close the waitForInit
 	// channel.
+	// 使用当前 HLC 时间作为 rangefeed 起点，避免异步启动时起点晚于 waitForInit 关闭时间。
 	now := m.storage.db.KV().Clock().Now()
+	// 记录 rangefeed 启动时间戳。
 	log.Dev.Infof(ctx, "starting lease manager rangefeed at timestamp %s", now)
 	// Ignore errors here because they indicate that the server is shutting down.
 	// Also note that the range feed automatically shuts down when the server
 	// shuts down, so we don't need to call Close() ourselves.
+	// 启动 system.descriptor 表上的 rangefeed，并保存 rangefeed handle。
 	m.mu.rangeFeed, _ = m.rangeFeedFactory.RangeFeed(
+		// rangefeed 上下文。
 		ctx, "lease", []roachpb.Span{descriptorTableSpan}, now, handleEvent,
+		// system table priority，避免 descriptor lease 更新被普通工作负载过度影响。
 		rangefeed.WithSystemTablePriority(),
+		// 注册 checkpoint 回调，用于推进 close timestamp 和检测 rangefeed 进度。
 		rangefeed.WithOnCheckpoint(handleCheckpoint),
+		// 注册内部错误回调，错误会发给后台 leasing task 触发 rangefeed 重启。
 		rangefeed.WithOnInternalError(func(ctx context.Context, err error) {
+			// 把 rangefeed 内部错误发送到 rangefeedErrCh。
 			select {
+			// 正常路径：通知后台任务 rangefeed 出错。
 			case m.rangefeedErrCh <- err:
+			// context 取消时不再发送。
 			case <-ctx.Done():
+			// stopper quiesce 时不再发送。
 			case <-m.stopper.ShouldQuiesce():
 			}
 		}),
@@ -2929,66 +3116,104 @@ func (m *Manager) checkRangeFeedStatus(ctx context.Context) (forceRefresh bool) 
 // range feed progress / recovery, and supporting legacy expiry
 // based leases.
 func (m *Manager) RunBackgroundLeasingTask(ctx context.Context) {
+	// descriptor lease 后台维护是系统内部任务，不应该计入 tenant cost control。
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 	// The refresh loop is used to clean up leases that have expired (because of
 	// a new version), and track range feed availability. This will run based on
 	// the lease duration, but will still periodically run if the duration is zero.
+	// 计算 lease-refresher 每次 wake up 的间隔。
 	getRefreshTimerDuration := func() time.Duration {
+		// LeaseDuration <= 0 通常表示不使用传统过期 lease 时长。
+		// 即便如此，后台循环仍需要周期性运行，用一个较短的默认间隔。
 		if LeaseDuration.Get(&m.storage.settings.SV) <= 0 {
 			return 200 * time.Millisecond
 		} else {
+			// 正常情况下使用带 jitter 的 lease duration，避免多个节点同时集中刷新 lease。
 			return m.storage.jitteredLeaseDuration()
 		}
 	}
+	// 启动 lease-refresher 后台任务。
+	// 这个任务负责 rangefeed 健康检查、旧 lease 清理、descriptor update metadata 清理。
 	_ = m.stopper.RunAsyncTask(ctx, "lease-refresher", func(ctx context.Context) {
+		// 计算第一次 refresh timer 使用的间隔。
 		refreshTimerDuration := getRefreshTimerDuration()
+		// refreshTimer 驱动周期性维护：
+		// 检查 rangefeed 可用性，并清理过期的 session based leases。
 		var refreshTimer timeutil.Timer
+		// 后台任务退出时停止 refreshTimer，释放 timer 资源。
 		defer refreshTimer.Stop()
+		// 第一次 wake up 使用半个 refresh 间隔，让维护任务更早启动。
 		refreshTimer.Reset(refreshTimerDuration / 2)
 		// Used to make sure that the system.descriptor lease is active.
+		// rangeFeedProgressWatchDog 用来监控 system.descriptor rangefeed 是否持续前进。
 		var rangeFeedProgressWatchDog timeutil.Timer
+		// 读取 rangefeed watchdog 的超时时间，以及当前是否启用 watchdog。
 		rangeFeedProgressWatchDogTimeout,
 			rangeFeedProgressWatchDogEnabled := m.getRangeFeedMonitorSettings()
+		// 启动 rangefeed progress watchdog timer。
 		rangeFeedProgressWatchDog.Reset(rangeFeedProgressWatchDogTimeout)
 		// Descriptor update clean-up timer
+		// descriptorUpdateCleanupTimer 用来周期性清理 descriptor update metadata key space。
 		var descriptorUpdateCleanupTimer timeutil.Timer
+		// descriptor update metadata 清理间隔固定为 30 分钟。
 		descriptorUpdateCleanupTimerDuration := 30 * time.Minute
+		// 启动 descriptor update cleanup timer。
 		descriptorUpdateCleanupTimer.Reset(descriptorUpdateCleanupTimerDuration)
+		// 后台维护主循环，一直运行到 stopper quiesce。
 		for {
 			select {
+			// 节点或 tenant 准备停止时，退出后台维护任务。
 			case <-m.stopper.ShouldQuiesce():
 				return
 
+			// rangefeed watchdog 到期，检查 system.descriptor rangefeed 是否还在前进。
 			case <-rangeFeedProgressWatchDog.C:
 				// Detect if the range feed has stopped making
 				// progress.
+				// 如果 watchdog 当前启用，就执行 rangefeed 状态检查。
 				if rangeFeedProgressWatchDogEnabled {
+					// checkRangeFeedStatus 会判断 rangefeed 是否卡住、是否恢复。
+					// 返回 true 表示需要全量刷新已缓存 descriptors。
 					refreshAllDescriptors := m.checkRangeFeedStatus(ctx)
 					// If the range feed recovers after a failure, re-read all
 					// descriptors.
+					// rangefeed 从异常中恢复后，重新刷新所有 descriptor leases，避免漏掉更新。
 					if refreshAllDescriptors {
 						m.refreshSomeLeases(ctx, true /*refreshAndPurgeAllDescriptors*/)
 					}
 				}
+				// 每次检查后重新读取 watchdog 配置，因为 cluster setting 可能已经变化。
 				rangeFeedProgressWatchDogTimeout,
 					rangeFeedProgressWatchDogEnabled = m.getRangeFeedMonitorSettings()
+				// 重置 watchdog timer，等待下一轮 rangefeed 进度检查。
 				rangeFeedProgressWatchDog.Reset(rangeFeedProgressWatchDogTimeout)
+			// rangefeed 内部错误会通过 rangefeedErrCh 送到这里。
 			case err := <-m.rangefeedErrCh:
+				// 记录 rangefeed 失败原因。
 				log.Dev.Warningf(ctx, "lease rangefeed failed with error: %s", err.Error())
+				// 处理 rangefeed 错误，通常会关闭并重启 descriptor rangefeed。
 				m.handleRangeFeedError(ctx)
+				// rangefeed 出错可能导致增量事件缺失，所以全量刷新并清理 descriptors。
 				m.refreshSomeLeases(ctx, true /*refreshAndPurgeAllDescriptors*/)
+			// refreshTimer 到期，执行常规 lease 维护。
 			case <-refreshTimer.C:
+				// 重置 refresh timer，进入下一轮周期维护。
 				refreshTimer.Reset(getRefreshTimerDuration() / 2)
 
 				// Check for any react to any range feed availability problems, and
 				// if needed refresh the full set of descriptors.
+				// 检查 rangefeed 是否长时间不可用；如果不可用时间过长，会尝试重启。
 				m.handleRangeFeedAvailability(ctx)
 
 				// Clean up session based leases that have expired.
+				// 清理已经过期的 session based descriptor leases。
 				m.cleanupExpiredSessionLeases(ctx)
+			// descriptor update metadata 清理 timer 到期。
 			case <-descriptorUpdateCleanupTimer.C:
 				// Clean up the update key space.
+				// 清理用于跟踪 descriptor transaction updates 的特殊 key space。
 				m.cleanupUpdateKeys(ctx)
+				// 重置清理 timer，等待下一次 30 分钟周期。
 				descriptorUpdateCleanupTimer.Reset(descriptorUpdateCleanupTimerDuration)
 			}
 		}

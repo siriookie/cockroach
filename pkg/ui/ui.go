@@ -138,85 +138,130 @@ var uiConfigPath = regexp.MustCompile("^/uiconfig$")
 func Handler(cfg Config) http.Handler {
 	// etags is used to provide a unique per-file checksum for each served file,
 	// which enables client-side caching using Cache-Control and ETag headers.
+	// 创建一个 map，用来保存每个 UI 静态资源文件对应的 ETag。
 	etags := make(map[string]string)
+	// 只有当前二进制包含 UI 资源，并且 Assets 不为空时，才需要计算静态资源的 ETag。
 	if HaveUI && Assets != nil {
 		// Only compute hashes for UI-enabled builds
+		// 遍历 Assets 中的静态文件，为每个文件计算 checksum，并写入 etags。
 		err := httputil.ComputeEtags(Assets, etags)
+		// ETag 计算失败不阻断 UI 服务，只记录日志。
 		if err != nil {
 			log.Dev.Errorf(context.Background(), "Unable to compute asset hashes: %+v", err)
 		}
 	}
 
+	// 构造静态文件 handler，并在外层包一层 EtagHandler。
 	fileHandlerChain := httputil.EtagHandler(
+		// 把前面计算出来的 etags 传进去，响应静态资源时可以带 ETag。
 		etags,
+		// http.FileServer 负责从文件系统抽象里读取并返回静态文件。
 		http.FileServer(
+			// Assets 是 embed 出来的前端资源，这里转成 http.FileSystem 可识别的形式。
 			http.FS(Assets),
 		),
 	)
+	// 读取当前二进制的 build 信息，后面要用于 index.html 的缓存时间和模板变量。
 	buildInfo := build.GetInfo()
 
+	// 返回一个真正处理 DB Console HTTP 请求的 handler。
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 查询当前 license 类型，用来注入给 UI 展示和逻辑判断。
 		licenseType, err := base.LicenseType(cfg.Settings)
+		// license 类型获取失败不阻断 UI 返回，只记录日志。
 		if err != nil {
 			log.Dev.Errorf(context.Background(), "unable to get license type: %+v", err)
 		}
+		// 计算 license 距离过期还有多少秒，也会作为 UI 配置返回给前端。
 		licenseTTL := base.GetLicenseTTL(r.Context(), cfg.Settings, timeutil.DefaultTimeSource{})
+		// 从 OIDC 模块读取给 UI 用的运行时配置，例如是否启用、按钮文案、是否 autologin。
 		oidcConf := cfg.OIDC.GetOIDCConf()
+		// 读取当前 build 对应的 release series，用来生成 UI 里的版本字符串。
 		major, minor := build.BranchReleaseSeries()
+		// 组装注入 index.html 或 /uiconfig 的配置数据。
 		args := indexHTMLArgs{
-			Insecure:         cfg.Insecure,
-			LoggedInUser:     cfg.GetUser(r.Context()),
-			Tag:              buildInfo.Tag,
-			Version:          fmt.Sprintf("v%d.%d", major, minor),
-			OIDCAutoLogin:    oidcConf.AutoLogin,
+			// 是否是 insecure web access；如果是，UI 可以知道当前认证被关闭。
+			Insecure: cfg.Insecure,
+			// 当前已登录用户；匿名访问或 session 不存在时是 nil。
+			LoggedInUser: cfg.GetUser(r.Context()),
+			// 当前 build tag，例如正式版本号或 dev tag。
+			Tag: buildInfo.Tag,
+			// UI 展示用的主版本号字符串。
+			Version: fmt.Sprintf("v%d.%d", major, minor),
+			// OIDC 是否开启自动跳转登录。
+			OIDCAutoLogin: oidcConf.AutoLogin,
+			// OIDC 登录按钮是否应该展示。
 			OIDCLoginEnabled: oidcConf.Enabled,
-			OIDCButtonText:   oidcConf.ButtonText,
-			FeatureFlags:     cfg.Flags,
+			// OIDC 登录按钮上显示的文字。
+			OIDCButtonText: oidcConf.ButtonText,
+			// 后端下发给 UI 的 feature flags。
+			FeatureFlags: cfg.Flags,
 
+			// 是否展示“生成 JWT auth token for cluster SSO”的 UI 入口。
 			OIDCGenerateJWTAuthTokenEnabled: oidcConf.GenerateJWTAuthTokenEnabled,
 
-			LicenseType:               licenseType,
+			// 当前 license 类型。
+			LicenseType: licenseType,
+			// license 剩余有效时间，单位是秒。
 			SecondsUntilLicenseExpiry: licenseTTL,
 			// log.RedactionPolicyManaged is set to true only when cluster is running under
 			// managed service control.
+			// 标记当前集群是否运行在 managed service control 下。
 			IsManaged: log.RedactionPolicyManaged,
 		}
+		// NodeID 可能为空；只有非空时才把它写入 UI 配置。
 		if cfg.NodeID != nil {
+			// 把 NodeID 转成字符串，方便模板和前端 JSON 使用。
 			args.NodeID = cfg.NodeID.String()
 		}
+		// /uiconfig 是一个专门给前端读取运行时配置的 JSON endpoint。
 		if uiConfigPath.MatchString(r.URL.Path) {
+			// 把上面组装好的 args 序列化成 JSON。
 			argBytes, err := json.Marshal(args)
+			// JSON 序列化失败时，返回 500。
 			if err != nil {
 				log.Dev.Errorf(r.Context(), "unable to deserialize ui config args: %v", err)
 				http.Error(w, err.Error(), 500)
 				return
 			}
+			// 把 JSON 配置写回给前端。
 			_, err = w.Write(argBytes)
+			// 写响应失败时，记录日志并返回 500。
 			if err != nil {
 				log.Dev.Errorf(r.Context(), "unable to write ui config args: %v", err)
 				http.Error(w, err.Error(), 500)
 				return
 			}
+			// /uiconfig 请求已经处理完，直接返回。
 			return
 		}
 
+		// 开发模式请求会带 Crdb-Development header，用来直接返回 indexHTML。
 		if r.Header.Get("Crdb-Development") != "" {
+			// 给 index.html 设置 Content-Security-Policy。
 			w.Header().Set("Content-Security-Policy", cspHeader)
+			// 返回内存里的 index.html，并使用 build 时间作为修改时间。
 			http.ServeContent(w, r, "index.html", buildInfo.GoTime(), bytes.NewReader(indexHTML))
 			return
 		}
 
+		// 如果当前二进制没有打包 UI，就返回一个极简的提示页面。
 		if !HaveUI {
+			// bareIndexHTML 告诉用户这个二进制没有 web UI。
 			http.ServeContent(w, r, "index.html", buildInfo.GoTime(), bytes.NewReader(bareIndexHTML))
 			return
 		}
 
+		// 非根路径请求一般是静态资源，例如 bundle.js、css、图片等。
 		if r.URL.Path != "/" {
+			// 交给静态文件 handler 处理，并自动带上 ETag 相关逻辑。
 			fileHandlerChain.ServeHTTP(w, r)
 			return
 		}
 
+		// 根路径 "/" 返回 DB Console 的 index.html。
 		w.Header().Set("Content-Security-Policy", cspHeader)
+		// ServeContent 会处理缓存相关 header，并把 indexHTML 写给浏览器。
 		http.ServeContent(w, r, "index.html", buildInfo.GoTime(), bytes.NewReader(indexHTML))
 	})
 }

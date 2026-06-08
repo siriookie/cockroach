@@ -42,40 +42,60 @@ func RunningJobExists(
 	txn isql.Txn,
 	jobTypes ...jobspb.Type,
 ) (exists bool, retErr error) {
+	// 把传入的 jobspb.Type 列表转换成 SQL 中可用的字符串 tuple。
+	// 例如转换成：('BACKUP', 'RESTORE') 这种形式。
 	typeStrs, err := getJobTypeStrs(jobTypes)
+	// 如果 job type 转换失败，直接返回错误。
 	if err != nil {
 		return false, err
 	}
 
+	// 默认按 created 排序。
+	// 当需要 ignoreJobID 时，后面会依赖这个排序判断“第一个匹配 job 是否就是被忽略的 job”。
 	orderBy := "ORDER BY created"
+	// 如果没有指定要忽略的 job，就不需要排序。
+	// LIMIT 1 只要找到任意一个匹配 job 即可。
 	if ignoreJobID == jobspb.InvalidJobID {
 		// There is no need to order by the created column if there is no job to
 		// ignore.
 		orderBy = ""
 	}
 
+	// 默认使用 jobs_status_created_idx 索引。
 	hint := "jobs_status_created_idx"
+	// 如果 cluster setting 开启了避免全表扫描，就加 FORCE_INDEX 和 AVOID_FULL_SCAN hint。
+	// 这样查询 system.jobs 时会尽量走 status/created 相关索引，避免后台查询扫全表。
 	if avoidFullScans.Get(&cs.SV) {
 		hint = "{FORCE_INDEX=jobs_status_created_idx,AVOID_FULL_SCAN}"
 	}
 
+	// 构造查询模板：
+	// 从 system.jobs 中查找指定 job_type 且状态为非终止状态的 job，最多返回 1 行。
 	q := `SELECT id FROM system.jobs@%s WHERE job_type IN %s AND status IN %s %s LIMIT 1`
+	// 把 index hint、job type tuple、非终止状态 tuple、ORDER BY 拼入 SQL。
 	stmt := fmt.Sprintf(q, hint, typeStrs, NonTerminalStateTupleString, orderBy)
 
+	// 在调用方传入的内部 SQL transaction 中执行查询。
 	it, err := txn.QueryIterator(
 		ctx,
 		"find-running-jobs-of-type",
 		txn.KV(),
 		stmt,
 	)
+	// 查询启动失败时直接返回错误。
 	if err != nil {
 		return false, err
 	}
 	// We have to make sure to close the iterator since we might return from the
 	// for loop early (before Next() returns false).
+	// 确保函数退出时关闭 iterator。
+	// errors.CombineErrors 保证如果查询过程和 Close 都有错误，不会丢掉其中一个。
 	defer func() { retErr = errors.CombineErrors(retErr, it.Close()) }()
 
+	// 读取第一行结果。
+	// 因为 SQL 里 LIMIT 1，这里最多只会有一行。
 	ok, err := it.Next(ctx)
+	// 读取 iterator 出错时返回错误。
 	if err != nil {
 		return false, err
 	}
@@ -83,6 +103,10 @@ func RunningJobExists(
 	// any additional rows that would match the passed types must be created after
 	// the ignored ID and are also supposed to be ignored, meaning we only return
 	// true when the there are non-zero results and the first does not match.
+	// 如果没有查到任何行，ok=false，说明不存在匹配的非终止 job。
+	// 如果查到的第一行就是 ignoreJobID，也返回 false；
+	// 因为按 created 排序时，后续匹配行都比 ignoreJobID 更新，也按调用语义一起忽略。
+	// 只有查到了行，并且第一行不是 ignoreJobID，才表示确实存在一个需要关注的 running/non-terminal job。
 	return ok && jobspb.JobID(*it.Cur()[0].(*tree.DInt)) != ignoreJobID, nil
 }
 

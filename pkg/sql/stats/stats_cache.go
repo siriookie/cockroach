@@ -161,42 +161,63 @@ func (sc *TableStatisticsCache) Start(
 ) error {
 	// We need to retry unavailable replicas here. This is only meant to be called
 	// at server startup.
+	// 启动时先解析 system.table_statistics_locks 的 table ID。
+	// 这里用 startup retry，是因为 server startup 阶段可能暂时读不到某些 range/replica。
 	tableStatisticsLocksTableID, err := startup.RunIdempotentWithRetryEx(
 		ctx, sc.stopper.ShouldQuiesce(), "get-table-statistics-locks-table-ID",
 		func(ctx context.Context) (descpb.ID, error) {
+			// 通过 system table resolver 按表名查 table ID。
 			return systemTableIDResolver.LookupSystemTableID(ctx, systemschema.TableStatisticsLocksTable.GetName())
 		})
+	// 如果启动阶段解析 table ID 失败，就返回错误，让调用方处理启动失败。
 	if err != nil {
 		return err
 	}
+	// 保存 system.table_statistics_locks 的 table ID，后续判断特殊系统表时会用到。
 	sc.tableStatisticsLocksTableID.Store(uint32(tableStatisticsLocksTableID))
 
 	// Set up a range feed to watch for updates to system.table_statistics.
 
+	// 计算 system.table_statistics 在 KV keyspace 中的 table prefix。
 	statsTablePrefix := codec.TablePrefix(keys.TableStatisticsTableID)
+	// 构造覆盖整张 system.table_statistics 表的 KV span。
 	statsTableSpan := roachpb.Span{
-		Key:    statsTablePrefix,
+		// span 起点是 table_statistics 表前缀。
+		Key: statsTablePrefix,
+		// span 终点是该前缀的 PrefixEnd，表示覆盖这个表的所有 KV key。
 		EndKey: statsTablePrefix.PrefixEnd(),
 	}
 
+	// 记录上一次处理的 tableID。
 	var lastTableID descpb.ID
+	// 记录上一次处理的 rangefeed value timestamp。
 	var lastTS hlc.Timestamp
 
+	// handleEvent 是 rangefeed 收到 system.table_statistics 行变化时调用的回调。
 	handleEvent := func(ctx context.Context, kv *kvpb.RangeFeedValue) {
+		// 从 table_statistics 的 KV key 中解出 tableID。
+		// system.table_statistics 的 primary key 是 (tableID, statisticID)。
 		tableID, err := decodeTableStatisticsKV(codec, kv, &sc.datumAlloc)
+		// 如果无法解码 key，记录 warning 并忽略这条 rangefeed event。
 		if err != nil {
 			log.Dev.Warningf(ctx, "failed to decode table statistics row %v: %v", kv.Key, err)
 			return
 		}
+		// 取出这条 rangefeed value 的 MVCC timestamp。
 		ts := kv.Value.Timestamp
 		// A statistics collection inserts multiple rows in one transaction. We
 		// don't want to call refreshTableStats for each row since it has
 		// non-trivial overhead.
+		// 一次统计收集通常会在同一个事务中为同一张表写入多行 stats。
+		// 如果 tableID 和 timestamp 都与上一条相同，说明大概率是同一批 stats 写入，避免重复刷新缓存。
 		if tableID == lastTableID && ts == lastTS {
 			return
 		}
+		// 记录当前处理过的 tableID。
 		lastTableID = tableID
+		// 记录当前处理过的 timestamp。
 		lastTS = ts
+		// 刷新该 tableID 对应的统计信息缓存。
 		sc.refreshTableStats(ctx, tableID, ts)
 	}
 
@@ -205,14 +226,23 @@ func (sc *TableStatisticsCache) Start(
 	//    call Close() ourselves.
 	//  - an error here only happens if the server is already shutting down; we
 	//    can safely ignore it.
+	// 启动监听 system.table_statistics 的 rangefeed。
 	_, err = rangeFeedFactory.RangeFeed(
+		// rangefeed 使用的 context。
 		ctx,
+		// rangefeed 名称，用于日志/debug。
 		"table-stats-cache",
+		// 监听的 KV span，这里只监听 system.table_statistics 整张表。
 		[]roachpb.Span{statsTableSpan},
+		// rangefeed 起始时间戳，从当前 HLC 时间开始看后续变化。
 		sc.db.KV().Clock().Now(),
+		// 每条 value event 到达时的回调。
 		handleEvent,
+		// 使用 system table priority，避免系统表监听被普通 workload 过度影响。
 		rangefeed.WithSystemTablePriority(),
 	)
+	// 返回 rangefeed 启动错误。
+	// 正常情况下成功启动后 rangefeed 会后台运行，直到 server shutdown。
 	return err
 }
 

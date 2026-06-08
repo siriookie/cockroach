@@ -194,29 +194,47 @@ func NewWatcher[E rangefeedbuffer.Event](
 func Start[E rangefeedbuffer.Event](
 	ctx context.Context, stopper *stop.Stopper, c *Watcher[E], onError func(error),
 ) error {
+	// 把 watcher 的运行逻辑提交给 stopper，作为一个异步后台任务运行。
+	// task 名字使用 watcher name，便于日志和 stopper diagnostics 里识别。
 	return stopper.RunAsyncTask(ctx, string(c.name), func(ctx context.Context) {
+		// 创建一个会在 stopper quiesce 时自动取消的 context。
+		// 这样节点关闭时，正在运行的 watcher/rangefeed 会收到取消信号。
 		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		// 后台任务退出时释放 cancel，避免 context 资源泄漏。
 		defer cancel()
 
+		// 如果 watcher 成功连续运行超过这个时间后才失败，认为系统已经稳定运行过一段时间。
+		// 这种情况下后面会重置 retry backoff，避免偶发长时间后失败还沿用很大的退避时间。
 		const aWhile = 5 * time.Minute // arbitrary but much longer than a retry
+		// 使用默认指数退避循环反复运行 Watcher.Run。
+		// r.Next() 会在每次失败后按 retry 策略等待，直到 ctx 被取消。
 		for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
+			// 记录本轮 Run 的开始时间，用来判断这次运行是否持续了足够久。
 			started := crtime.NowMono()
+			// 阻塞运行 watcher：内部会先做 initial scan，然后启动 rangefeed 并持续发布更新。
 			if err := c.Run(ctx); err != nil {
+				// context.Canceled 通常表示 stopper quiesce 或调用方取消，不是需要重试的业务错误。
 				if errors.Is(err, context.Canceled) {
 					return // we're done here
 				}
+				// 如果调用方提供了错误回调，就把本轮 Run 的错误交给调用方处理。
 				if onError != nil {
 					onError(err)
 				}
 
+				// 如果 watcher 已经成功运行了比较久，失败后重置退避状态。
+				// 这样下一次重试会从较小的 backoff 开始，而不是使用之前累积到很大的 backoff。
 				if started.Elapsed() > aWhile {
 					r.Reset()
 				}
 
+				// 记录本轮失败，并继续进入下一次 retry。
 				log.Dev.Warningf(ctx, "%s: failed with %v, retrying...", c.name, err)
 				continue
 			}
 
+			// c.Run 正常返回表示 watcher 已经干净退出。
+			// 常见原因是 stopper 停止导致 rangefeed 退出；这种情况下不需要重试。
 			return // we're done here (the stopper was stopped, Run exited cleanly)
 		}
 	})

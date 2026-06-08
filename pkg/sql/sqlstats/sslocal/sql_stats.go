@@ -190,30 +190,43 @@ func (s *SQLStats) ObserveTransaction(
 	transaction *sqlstats.RecordedTxnStats,
 	statements []*sqlstats.RecordedStmtStats,
 ) {
+	// 如果既没有 transaction，也没有 statements，就没有任何统计需要写入。
 	if transaction == nil && len(statements) == 0 {
 		// This shouldn't ever happen, but it's cleaner below to work
 		// under the assumption that we either have a valid transaction
 		// or some statements to work with.
+		// 正常情况下不应该发生；这里提前返回，避免后面访问空数据。
 		return
 	}
 
 	// Retrieve application container.
+	// application 用来表示这批统计所属的 application_name。
 	var application string
+	// 如果有 transaction，就优先使用 transaction 上记录的 application。
 	if transaction != nil {
 		application = transaction.Application
 	} else {
+		// 如果没有 transaction，说明这次只 flush statements。
+		// 此时用第一条 statement 的 App 作为初始 application。
 		application = statements[0].App
 	}
+	// 根据 application 找到对应的 SQL stats container。
 	appStats := s.getStatsForApplication(application)
 
 	// Record statements.
+	// discardedCount 统计有多少条 statement/transaction 因为内存等原因写入失败。
 	var discardedCount int64
+	// 逐条记录 statement 统计。
 	for _, stmt := range statements {
+		// 如果当前 statement 的 App 和当前 container 不一致，
+		// 就切换到这个 statement 对应 application 的 container。
 		if stmt.App != application {
 			application = stmt.App
 			appStats = s.getStatsForApplication(application)
 		}
+		// 把当前 statement 统计写入对应 application 的 stats container。
 		err := appStats.RecordStatement(ctx, stmt)
+		// 如果写入失败，记录一次丢弃。
 		if err != nil {
 			discardedCount++
 		}
@@ -222,19 +235,26 @@ func (s *SQLStats) ObserveTransaction(
 	// Record transaction, if it exists. Currently, statements
 	// executed in connections with an outer transaction are not
 	// recorded with their transaction.
+	// 如果这次 flush 带了 transaction，就继续记录 transaction 统计。
 	if transaction != nil {
 		// Write statements.
+		// 把 transaction 统计写入当前 application 的 stats container。
 		err := appStats.RecordTransaction(ctx, transaction)
+		// 如果 transaction 写入失败，也计入丢弃数量。
 		if err != nil {
 			discardedCount++
 		}
 	}
 
 	// Update the counter for discarded stats.
+	// 如果有统计写入失败，需要更新全局丢弃计数并尝试打印日志。
 	if discardedCount > 0 {
+		// discardedStatsCount 可能为空，所以先判空。
 		if s.discardedStatsCount != nil {
+			// 增加被丢弃的统计数量。
 			s.discardedStatsCount.Inc(discardedCount)
 		}
+		// 在需要时输出丢弃统计的提示日志，避免静默丢数据。
 		appStats.MaybeLogDiscardMessage(ctx)
 	}
 }

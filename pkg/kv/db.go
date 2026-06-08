@@ -1058,10 +1058,15 @@ func (db *DB) Txn(ctx context.Context, retryable func(context.Context, *Txn) err
 // TxnWithAdmissionControl is like Txn, but uses a configurable admission
 // control source and priority.
 func (db *DB) TxnWithAdmissionControl(
+	// ctx 是这次事务执行的上下文，用于取消、超时、trace/log tag 等控制。
 	ctx context.Context,
+	// source 标记这批 KV 请求来自哪里；后续 KV admission control 会根据它判断是否排队限流。
 	source kvpb.AdmissionHeader_Source,
+	// priority 是 admission control 使用的工作优先级，不是事务冲突处理里的 user priority。
 	priority admissionpb.WorkPriority,
+	// steppingMode 控制事务是否启用 stepping；SQL 层通常会用 stepping 来显式推进读时间戳。
 	steppingMode SteppingMode,
+	// retryable 是调用者真正要在事务里执行的逻辑；遇到可重试事务错误时可能被再次调用。
 	retryable func(context.Context, *Txn) error,
 ) error {
 	// TODO(radu): we should open a tracing Span here (we need to figure out how
@@ -1070,10 +1075,16 @@ func (db *DB) TxnWithAdmissionControl(
 	// Observed timestamps don't work with multi-tenancy. See:
 	//
 	// https://github.com/cockroachdb/cockroach/issues/48008
+	// 取当前 DB 所在节点的 NodeID；如果拿不到就用 0，后续发送请求时 DistSender 会再补当前节点信息。
 	nodeID, _ := db.ctx.NodeID.OptionalNodeID() // zero if not available
+	// 创建一个根 KV 事务，并把 source/priority 写进 txn.admissionHeader。
+	// 后面 txn.Send 构造 BatchRequest 时会把这个 admissionHeader 带到 KV 层。
 	txn := NewTxnWithAdmissionControl(ctx, db, nodeID, source, priority)
+	// 给事务设置一个默认调试名；调用方也可以之后改成更具体的名字。
 	txn.SetDebugName("unnamed")
+	// 根据调用方指定的模式开启或关闭 stepping。
 	txn.ConfigureStepping(ctx, steppingMode)
+	// 进入事务执行器：这里会调用 retryable，并处理提交、回滚和可重试事务错误。
 	return runTxn(ctx, txn, retryable)
 }
 

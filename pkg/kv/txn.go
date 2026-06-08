@@ -1235,27 +1235,40 @@ func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) 
 func (txn *Txn) PrepareForRetry(ctx context.Context) error {
 	// Reset commit triggers. These must be reconfigured by the client during the
 	// next retry.
+	// commit trigger 是“提交成功后要执行的本地回调”；重试会重新跑用户 fn，所以旧回调不能沿用。
 	txn.commitTriggers = nil
 
+	// 下面要读取和修改 txn.mu.sender 中的 retry 状态，所以先拿 txn 自己的锁。
 	txn.mu.Lock()
+	// 函数退出时释放锁，保证 retry 状态检查和清理过程是串行的。
 	defer txn.mu.Unlock()
 
+	// 从 TxnCoordSender 中取出当前保存的可重试错误。
+	// 这个错误通常是在前一次 Send/Commit 遇到冲突或刷新失败时存进去的。
 	retryErr := txn.mu.sender.GetRetryableErr(ctx)
+	// 如果 sender 里已经没有 retryable error，说明没有什么需要准备，直接返回。
 	if retryErr == nil {
 		return nil
 	}
+	// 自动重试只能由 root txn 做，因为 root txn 才掌握完整的事务状态和刷新 span。
+	// leaf txn 通常出现在 DistSQL 分布式执行里，需要把错误交回 root txn 处理。
 	if txn.typ != RootTxn {
 		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
 			retryErr, "PrepareForRetry() called on leaf txn"), ctx)
 	}
+	// 确认这个 retry error 属于当前 txn，避免把内部嵌套事务的 retry error 当成本事务来处理。
 	if err := txn.checkRetryErrorTxnIDLocked(ctx, retryErr); err != nil {
 		return err
 	}
 
+	// 打 verbose 日志，说明这次事务因为哪个 retryable error 准备重试。
 	log.VEventf(ctx, 2, "retrying transaction: %s because of a retryable error: %s",
 		txn.debugNameLocked(), retryErr)
+	// 重试后事务时间戳/epoch 可能变化，旧的 commit deadline 不再适用，需要清掉重新设置。
 	txn.resetDeadlineLocked()
 
+	// 有些 retryable error 只是 partial retry：调用方理论上可以从某个 savepoint 之后继续。
+	// DB.Txn 的自动重试模型更简单：重新执行整个用户 fn，所以这里需要把 partial retry 提升成 full retry。
 	if !retryErr.TxnMustRestartFromBeginning() {
 		// If the retry error does not require the transaction to restart from
 		// beginning, it will have also not caused the transaction to advance its
@@ -1263,16 +1276,22 @@ func (txn *Txn) PrepareForRetry(ctx context.Context) error {
 		// beginning, se we "promote" the partial retry error to a full retry by
 		// manually restarting the transaction.
 		const msg = "promoting partial retryable error to full transaction retry"
+		// 记录这次“手动升级”为完整事务重试的原因。
 		log.VEventf(ctx, 2, msg)
+		// 强制 sender 生成一个 mustRestart=true 的 retryable error。
+		// 这一步会推动事务进入完整重启所需的新状态，比如推进 epoch / 写时间戳。
 		manualErr := txn.mu.sender.GenerateForcedRetryableErr(
 			ctx, retryErr.NextTransaction.WriteTimestamp, true /* mustRestart */, msg)
 		// Now replace retryErr with the error returned by ManualRestart.
+		// 确认强制生成出来的错误确实还是 TransactionRetryWithProtoRefreshError，并替换 retryErr。
 		if !errors.As(manualErr, &retryErr) {
 			return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
 				manualErr, "unexpected non-retry error during manual restart"), ctx)
 		}
 	}
 
+	// 如果上一轮事务没有被标记为 ABORTED，说明可以沿用当前 txn proto 的 refreshed 状态。
+	// 这时只需要清掉 sender 里保存的 retryable error，让下一轮 fn 可以继续发送请求。
 	if !retryErr.PrevTxnAborted() {
 		// If the retryable error doesn't correspond to an aborted transaction,
 		// there's no need to switch out the transaction. We simply clear the
@@ -1280,6 +1299,8 @@ func (txn *Txn) PrepareForRetry(ctx context.Context) error {
 		return txn.mu.sender.ClearRetryableErr(ctx)
 	}
 
+	// 如果上一轮事务已经 ABORTED，需要用 retryErr.NextTransaction 换出新的 txn proto，
+	// 清理旧状态后再进入下一轮完整重试。
 	return txn.handleTransactionAbortedErrorLocked(ctx, retryErr)
 }
 
@@ -1349,11 +1370,36 @@ func (txn *Txn) Send(
 	// opposed to the point where the requests are being created, but
 	// unfortunately requests are being created in many ways and this was the best
 	// place I found to set this field.
+	// 如果这个事务知道 SQL/KV gateway 节点，就把它写进 BatchRequest header。
+	// 后续 DistSender/远端节点可以用这个信息判断请求最初从哪个节点发起。
 	if txn.gatewayNodeID != 0 {
 		ba.Header.GatewayNodeID = txn.gatewayNodeID
 	}
 
 	// Requests with a bounded staleness header should use NegotiateAndSend.
+	// 带 bounded staleness 的读需要先协商读时间戳，不能直接走普通 Send。
+	// BoundedStaleness` 可以理解成：
+	
+	// ```text
+	// 有界陈旧读
+	// ```
+	
+	// 也就是：
+	
+	// ```text
+	// 我不一定要读最新数据；
+	// 但你不能给我太旧的数据；
+	// 在这个“可接受的新鲜度范围”内，帮我选一个尽量方便、尽量快的时间戳来读。
+	// ```
+	
+	// 它主要用于 SQL 的：
+	
+	// ```sql
+	// AS OF SYSTEM TIME with_max_staleness(...)
+	// AS OF SYSTEM TIME with_min_timestamp(...)
+	// ```
+	
+	// 这类历史读 / follower read 场景。
 	if ba.BoundedStaleness != nil {
 		return nil, kvpb.NewError(errors.AssertionFailedf(
 			"bounded staleness header passed to Txn.Send: %s", ba.String()))
@@ -1361,21 +1407,32 @@ func (txn *Txn) Send(
 
 	// Some callers have not initialized ba using a Batch constructed using
 	// Txn.NewBatch. So we fallback to partially overwriting here.
+	// 如果调用方没有用 Txn.NewBatch 创建 batch，AdmissionHeader 可能没初始化。
+	// 这里用 txn 自己的 AdmissionHeader 补上，保证请求进入 KV admission 时有来源和优先级信息。
 	if ba.AdmissionHeader.CreateTime == 0 {
+		// 保留调用方已经设置的 NoMemoryReservedAtSource 标记，只覆盖其它 admission 字段。
 		noMem := ba.AdmissionHeader.NoMemoryReservedAtSource
 		ba.AdmissionHeader = txn.AdmissionHeader()
 		ba.AdmissionHeader.NoMemoryReservedAtSource = noMem
 	}
 
+	// 只在锁内读取当前事务 ID 和 sender，然后立即释放锁。
+	// 真正发送请求不能持有 txn.mu，否则容易和 sender/interceptor 内部锁形成长时间阻塞或死锁风险。
 	txn.mu.Lock()
+	// 记录发送前的事务 ID，后面用来校验 retry error 是否属于这次请求的事务。
 	requestTxnID := txn.mu.ID
+	// 取出当前 sender；如果事务后续因为 retry/abort 换 sender，本次请求仍使用这里捕获的 sender。
 	sender := txn.mu.sender
 	txn.mu.Unlock()
+	// 通过 DB 的 sender 栈发送 BatchRequest。
+	// 对事务请求来说，这通常会进入 TxnCoordSender，再进入 DistSender，最后到目标 range leaseholder。
 	br, pErr := txn.db.sendUsingSender(ctx, ba, sender)
 
+	// 没有错误时，先处理本地 commit triggers，再把 response 返回给调用方。
 	if pErr == nil {
 		// Invoking the commit triggers here ensures they run even in the case when a
 		// commit request is issued manually (not via Commit).
+		// 如果这个 batch 里有 Commit=true 的 EndTxn，说明事务成功提交，需要执行本地提交回调。
 		if et, ok := ba.GetArg(kvpb.EndTxn); ok && et.(*kvpb.EndTxnRequest).Commit {
 			for _, t := range txn.commitTriggers {
 				t(ctx)
@@ -1384,6 +1441,8 @@ func (txn *Txn) Send(
 		return br, nil
 	}
 
+	// 如果返回的是事务 retry error，需要确认这个 retry error 确实属于刚才发送的事务。
+	// 这能防止内部嵌套事务或错误路由把别的事务的 retry error 冒泡到当前事务。
 	if retryErr, ok := pErr.GetDetail().(*kvpb.TransactionRetryWithProtoRefreshError); ok {
 		if requestTxnID != retryErr.PrevTxnID {
 			// KV should not return errors for transactions other than the one that sent
@@ -1393,6 +1452,7 @@ func (txn *Txn) Send(
 				requestTxnID, retryErr.PrevTxnID, retryErr)
 		}
 	}
+	// 非 nil pErr 直接返回；上层 exec/PrepareForRetry 会决定是否自动重试。
 	return br, pErr
 }
 
@@ -1649,6 +1709,8 @@ func (txn *Txn) UpdateStateOnRemoteRetryableErr(ctx context.Context, pErr *kvpb.
 func (txn *Txn) handleTransactionAbortedErrorLocked(
 	ctx context.Context, retryErr *kvpb.TransactionRetryWithProtoRefreshError,
 ) error {
+	// 这个 helper 只处理“上一轮事务已经 ABORTED”的 retry error。
+	// 如果不是 aborted 场景，说明调用方走错了分支，不能在这里替换 root sender。
 	if !retryErr.PrevTxnAborted() {
 		// Sanity check we're dealing with a TransactionAbortedError.
 		return errors.WithContextTags(errors.NewAssertionErrorWithWrappedErrf(
@@ -1657,12 +1719,20 @@ func (txn *Txn) handleTransactionAbortedErrorLocked(
 
 	// The transaction we had been using thus far has been aborted. The proto
 	// inside the error has been prepared for use by the next transaction attempt.
+	// retryErr.NextTransaction 是 KV 层为下一轮尝试准备好的新事务 proto。
+	// 因为旧事务已经 ABORTED，不能只清掉 retry error 后继续复用旧 sender。
 	newTxn := &retryErr.NextTransaction
+	// 更新 Txn 外层记录的事务 ID，让后续 txn.ID() 等方法看到的是新事务。
 	txn.mu.ID = newTxn.ID
 	// Create a new txn sender. We need to preserve the stepping mode, if any.
+	// 保存旧 sender 的 stepping mode；新 sender 创建出来以后要继续沿用这个事务执行模式。
 	prevSteppingMode := txn.mu.sender.GetSteppingMode(ctx)
+	// 用新的事务 proto 创建一个新的 root transactional sender。
+	// 这相当于给下一轮重试换一个干净的 TxnCoordSender。
 	txn.mu.sender = txn.db.factory.RootTransactionalSender(newTxn, txn.mu.userPriority)
+	// 把旧 sender 的 stepping mode 配到新 sender 上，避免重试后 SQL/KV 的读时间戳推进语义变化。
 	txn.mu.sender.ConfigureStepping(ctx, prevSteppingMode)
+	// 新事务和新 sender 已经安装完成，下一轮 exec loop 可以重新执行用户 fn。
 	return nil
 }
 

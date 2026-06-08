@@ -943,51 +943,73 @@ func (t *RaftTransport) startProcessNewQueue(
 // them, to prevent an unbounded accumulation of memory. This "connected
 // nodes" is a client-side view of the world.
 func (t *RaftTransport) startDroppingFlowTokensForDisconnectedNodes(ctx context.Context) error {
+	// 向 stopper 申请一个后台任务 handle；如果 server 正在关闭，这里会返回错误。
 	ctx, hdl, err := t.stopper.GetHandle(ctx, stop.TaskOpts{
+		// 后台任务名，用于日志、pprof、stopper 跟踪。
 		TaskName: "kvserver.RaftTransport: drop flow tokens for disconnected nodes",
 	})
+	// 申请后台任务失败，说明不能再启动新 goroutine，直接把错误返回给调用方。
 	if err != nil {
 		return err
 	}
+	// 启动后台 goroutine，周期性检查已经断开的节点是否还有待发送的 flow token 返还消息。
 	go func(ctx context.Context) {
+		// 激活 stopper handle，并在 goroutine 退出时释放，通知 stopper 该任务已经结束。
 		defer hdl.Activate(ctx).Release(ctx)
+		// settingChangeCh 用来接收 FlowTokenDropInterval 配置变化通知，容量为 1 表示合并重复通知。
 		settingChangeCh := make(chan struct{}, 1)
+		// 注册 FlowTokenDropInterval 的 setting 变更回调。
 		kvadmission.FlowTokenDropInterval.SetOnChange(
 			&t.st.SV, func(ctx context.Context) {
+				// 非阻塞发送配置变更通知，避免 setting 回调被后台 goroutine 卡住。
 				select {
 				case settingChangeCh <- struct{}{}:
 				default:
 				}
 			})
 
+		// timer 控制多久扫描一次断连节点上的 pending flow token dispatches。
 		var timer timeutil.Timer
+		// goroutine 退出时停止 timer。
 		defer timer.Stop()
 
+		// 持续运行，直到 context 取消或 stopper 进入 quiesce。
 		for {
+			// 每轮读取最新配置，支持运行时调整扫描周期。
 			interval := kvadmission.FlowTokenDropInterval.Get(&t.st.SV)
+			// interval > 0 表示启用断连节点 flow token 丢弃机制。
 			if interval > 0 {
+				// 设置下一次扫描时间。
 				timer.Reset(interval)
 			} else {
 				// Disable the mechanism.
+				// interval <= 0 表示禁用该机制，停止 timer，只等待配置变化或退出。
 				timer.Stop()
 			}
+			// 等待扫描周期到期、配置变化，或者退出信号。
 			select {
 			case <-timer.C:
+				// 周期到期：扫描断连节点，并丢弃发往这些节点的 pending flow token 消息。
 				t.dropFlowTokensForDisconnectedNodes()
+				// 回到循环开头，重新读取 interval 并重置 timer。
 				continue
 
 			case <-settingChangeCh:
 				// Loop around to use the updated timer.
+				// 配置发生变化：回到循环开头按最新 interval 重置 timer。
 				continue
 
 			case <-ctx.Done():
+				// 调用方 context 取消，退出后台任务。
 				return
 
 			case <-t.stopper.ShouldQuiesce():
+				// server 正在关闭，退出后台任务。
 				return
 			}
 		}
 	}(ctx)
+	// 后台任务启动成功。
 	return nil
 }
 
@@ -1006,17 +1028,26 @@ func (t *RaftTransport) TestingPrintFlowControlConnectionTracker() string {
 }
 
 func (t *RaftTransport) dropFlowTokensForDisconnectedNodes() {
+	// 加读锁，保护 connectionTracker 和连接状态视图。
 	t.connectionMu.RLock()
+	// 函数返回前释放读锁。
 	defer t.connectionMu.RUnlock()
+	// 取当前时间，用于 piggybackReader 判断哪些待处理消息已经到期/可见。
 	now := timeutil.Now()
+	// 遍历当前 piggybackReader 中有 pending flow token 消息的目标节点。
 	for _, nodeID := range t.kvflowcontrol2.piggybackReader.NodesWithMsgs(now) {
+		// 如果从本节点视角看目标节点仍然连接着，就保留消息，等正常 Raft 连接发送。
 		if t.connectionMu.connectionTracker.isNodeConnected(nodeID) {
 			continue
 		}
+		// 目标节点已断开：把发往该节点的所有 pending flow token 消息弹出并丢弃。
 		msgs, remainingMsgs :=
 			t.kvflowcontrol2.piggybackReader.PopMsgsForNode(now, nodeID, math.MaxInt64)
+		// 记录被丢弃的 flow token dispatch 数量。
 		t.metrics.FlowTokenDispatchesDropped.Inc(int64(len(msgs)))
+		// math.MaxInt64 表示本次应该弹出该节点所有消息，因此不应该还有剩余。
 		if remainingMsgs > 0 {
+			// 如果仍有剩余，说明 piggybackReader 行为不符合预期，触发 assertion。
 			panic(errors.AssertionFailedf("expected zero remaining msgs, and found %d", remainingMsgs))
 		}
 	}

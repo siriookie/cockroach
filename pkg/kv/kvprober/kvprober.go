@@ -307,47 +307,69 @@ func (p *Prober) Metrics() Metrics {
 // Start causes kvprober to start probing KV. Start returns immediately. Start
 // returns an error only if stopper.RunAsyncTask returns an error.
 func (p *Prober) Start(ctx context.Context, stopper *stop.Stopper) error {
+	// 给上下文打上 kvprober log tag，后续日志和 trace 中能看出来源是 kvprober。
 	ctx = logtags.AddTag(ctx, "kvprober", nil /* value */)
+	// startLoop 是启动单个 probe 后台循环的通用 helper。
+	// read probe、write probe、quarantine write probe 都复用这套定时执行逻辑。
 	startLoop := func(ctx context.Context, opName string, probe func(context.Context, planner), pl planner, interval *settings.DurationSetting) error {
+		// 通过 stopper 启动后台任务；Start 本身不会阻塞等待循环结束。
 		return stopper.RunAsyncTaskEx(ctx, stop.TaskOpts{TaskName: opName, SpanOpt: stop.SterileRootSpan}, func(ctx context.Context) {
+			// 如果 probe loop 内部 panic，恢复并上报为 nonfatal panic，避免直接杀死进程。
 			defer logcrash.RecoverAndReportNonfatalPanic(ctx, &p.settings.SV)
 
+			// 每个 loop 创建自己的伪随机数，用于给 probe interval 加 jitter。
 			rnd, _ /* seed */ := randutil.NewPseudoRand()
+			// d 返回带 jitter 的下一次等待时间。
 			d := func() time.Duration {
 				return withJitter(interval.Get(&p.settings.SV), rnd)
 			}
+			// timer 控制下一次 probe 何时执行。
 			var t timeutil.Timer
+			// loop 退出时停止 timer，释放 timer 资源。
 			defer t.Stop()
+			// 设置第一次 probe 的等待时间。
 			t.Reset(d())
 
+			// 创建一个会在 stopper quiesce 时自动取消的 context。
 			ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+			// loop 退出时释放 context 资源。
 			defer cancel()
 
+			// 持续按 interval 执行 probe，直到 server quiesce。
 			for {
+				// 等待 timer 到期或 stopper 关闭。
 				select {
 				case <-t.C:
 					// Jitter added to de-synchronize different nodes' probe loops.
+					// timer 到期，先重置下一次 probe 时间；jitter 用来避免所有节点同时发探测请求。
 					t.Reset(d())
 				case <-stopper.ShouldQuiesce():
+					// server 正在关闭，退出该 probe loop。
 					return
 				}
 
+				// 为本次 probe 创建 tracing span，便于诊断慢探测或失败探测。
 				probeCtx, sp := tracing.EnsureChildSpan(ctx, p.tracer, opName+" - probe")
+				// 执行具体 probe；不同 loop 传入 readProbe、writeProbe 或 quarantineProbe。
 				probe(probeCtx, pl)
+				// 结束本次 probe span。
 				sp.Finish()
 			}
 		})
 	}
 
+	// 启动读探测循环：周期性选择一个 range，执行 KV read probe。
 	if err := startLoop(ctx, "read probe loop", p.readProbe, p.readPlanner, readInterval); err != nil {
 		return err
 	}
+	// 启动写探测循环：周期性选择一个 range，执行 KV write probe。
 	if err := startLoop(ctx, "write probe loop", p.writeProbe, p.writePlanner, writeInterval); err != nil {
 		return err
 	}
 	// The purpose of the quarantine pool is to detect outages affecting a small number
 	// of ranges but at a high confidence. The quarantine pool does this by repeatedly
 	// probing ranges that are in the pool.
+	// 启动隔离池写探测循环：对之前写探测失败的 ranges 进行更高频/重复探测。
 	return startLoop(ctx, "quarantine write probe loop", p.quarantineProbe, p.quarantineWritePool, quarantineWriteInterval)
 }
 

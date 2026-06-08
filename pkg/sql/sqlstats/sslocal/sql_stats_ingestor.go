@@ -240,28 +240,53 @@ func (i *SQLStatsIngester) Clear() {
 }
 
 func (i *SQLStatsIngester) ingest(ctx context.Context, events *eventBuffer) {
+	// 遍历这一批 eventBuffer 里的事件。
 	for idx, e := range events {
-		// Because an eventBuffer is a fixed-size array, rather than a slice,
-		// we do not know how full it is until we hit a nil entry.
+		// eventBuffer 是固定长度数组，不是 slice。
+		// 没写满的位置会是零值 event{}。
+		// 遇到第一个空 event，说明后面没有有效事件了，停止处理。
 		if e == (event{}) {
 			break
 		}
+
+		// 如果这个事件是 statement 统计事件。
 		if e.statement != nil {
+			// 把 statement 按 SessionID 缓存起来。
+			// 注意：这里还没有写入下游，因为它要等 transaction 一起到来。
 			i.processStatement(e.statement)
+
+			// 已处理事件数 +1。
 			i.metrics.NumProcessed.Inc(1)
+
+			// 队列大小 -1，因为这个事件已经被消费了。
 			i.metrics.QueueSize.Dec(1)
-			// When under an outer transaction, we don't have a txn to associate
-			// the stmts with and the statement's txn id will be nil. In that case
-			// we can send immediately to the sinks.
+
+			// 如果这个 statement 是在 outer transaction 下执行的，
+			// 它不会有普通 transaction event 可以关联。
+			// 所以这里直接把这个 session 的 statement 刷给下游，
+			// transaction 参数传 nil。
 			if e.statement.UnderOuterTxn {
 				i.flushBuffer(ctx, e.statement.SessionID, nil)
 			}
+
+			// 如果这个事件是 transaction 统计事件。
 		} else if e.transaction != nil {
+			// transaction 到了，说明这个 session 的事务完整了。
+			// 把之前缓存的 statements 取出来，和这个 transaction 一起发给 sinks。
 			i.flushBuffer(ctx, e.transaction.SessionID, e.transaction)
+
+			// 已处理事件数 +1。
 			i.metrics.NumProcessed.Inc(1)
+
+			// 队列大小 -1。
 			i.metrics.QueueSize.Dec(1)
+
+			// 既不是 statement，也不是 transaction。
+			// 这种 event 用来表示控制信号：force flush 或 clear session。
 		} else {
+			// 如果是强制 flush 信号。
 			if e.forceFlush {
+				// 只把这个 session 已缓存的 statements 刷出去。
 				i.flushStatementsOnly(ctx, e.sessionID)
 			} else {
 				i.clearSession(e.sessionID)
@@ -419,43 +444,81 @@ func (i *SQLStatsIngester) processStatement(statement *sqlstats.RecordedStmtStat
 func (i *SQLStatsIngester) flushBuffer(
 	ctx context.Context, sessionID clusterunique.ID, transaction *sqlstats.RecordedTxnStats,
 ) {
+	// 从 statementsBySessionID 中取出当前 sessionID 对应的 statement 缓冲。
 	statements, ok := func() (*statementBuf, bool) {
+		// 查找这个 session 当前累计的 statement 统计。
 		statements, ok := i.statementsBySessionID[sessionID]
+		// 如果没有找到，说明这个 session 没有待 flush 的 statement。
 		if !ok {
+			// 返回 nil 和 false，告诉外层不需要继续处理。
 			return nil, false
 		}
+		// 找到后先从 map 中删除，避免同一批 statements 被重复 flush。
 		delete(i.statementsBySessionID, sessionID)
+		// 返回取出的 statement 缓冲和 true。
 		return statements, true
 	}()
+	// 如果当前 session 没有 statement 缓冲，直接返回。
 	if !ok {
 		return
 	}
+	// 函数结束时把 statement 缓冲释放回对象池，减少内存分配。
 	defer statements.release()
 
+	// 如果缓冲存在但里面没有 statement，也没有任何内容需要写给 sink。
 	if len(*statements) == 0 {
 		return
 	}
 
+	// 如果传入了 transaction，说明这次 flush 是由事务统计触发的。
 	if transaction != nil {
 		// Here we'll set the transaction fingerprint ID for each statement if the
 		// below cluster setting is enabled.
+		// 读取集群设置，判断是否要把 statement 关联到 transaction fingerprint。
 		shouldAssociateWithTxn := AssociateStmtWithTxnFingerprint.Get(&i.settings.SV)
 		// These values are only known at the time of the transaction.
+		// 遍历当前 session 中这次要 flush 的所有 statements。
 		for _, s := range *statements {
+			// 如果设置开启，就把 transaction 的 fingerprint ID 写到 statement 上。
 			if shouldAssociateWithTxn {
 				s.TransactionFingerprintID = transaction.FingerprintID
 			}
+			// 如果 statement 和 transaction 的 ImplicitTxn 状态一致，就不需要改 statement fingerprint。
 			if s.ImplicitTxn == transaction.ImplicitTxn {
 				continue
 			}
 			// We need to recompute the fingerprint ID.
+			// 如果 ImplicitTxn 不一致，先把 statement 的 ImplicitTxn 修正为 transaction 的值。
 			s.ImplicitTxn = transaction.ImplicitTxn
+			// ImplicitTxn 会参与 statement fingerprint 计算，所以这里必须重新构造 fingerprint ID。
 			s.FingerprintID = appstatspb.ConstructStatementFingerprintID(
 				s.Query, s.ImplicitTxn, s.Database)
 		}
 	}
 
-	for _, sink := range i.sinks {
+	// 把 transaction 和这批 statements 发送给所有注册的 sink。
+// 	真实实现主要有两个：
+// 1. `sslocal.SQLStats`
+
+// [sql_stats.go](D:/opensource/cockroach/pkg/sql/sqlstats/sslocal/sql_stats.go:188)
+
+// ```go
+// func (s *SQLStats) ObserveTransaction(...)
+// ```
+
+// 它负责把 statement / transaction 统计写进 SQL stats container，也就是常规 SQL 统计数据。
+
+// 2. `insights.Provider`
+
+// [provider.go](D:/opensource/cockroach/pkg/sql/sqlstats/insights/provider.go:33)
+
+// ```go
+// func (p *Provider) ObserveTransaction(...)
+// ```
+
+// 它负责把事务统计送进 insights 子系统，用来分析慢 SQL、异常、执行洞察这些信息。
+for _, sink := range i.sinks {
+		// sink 负责把这批统计写入具体目标，比如 SQL stats container 或 insights。
 		sink.ObserveTransaction(ctx, transaction, *statements)
 	}
 }

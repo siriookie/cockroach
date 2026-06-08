@@ -97,9 +97,12 @@ func (s *InboundStreamInfo) finishLocked() {
 	s.onFinish()
 }
 
-// cancelIfNotConnected cancels and finishes s if it's not marked as connected,
-// finished, or canceled, and sends the provided error to the pending receiver
-// if so. A boolean indicating whether s is canceled is returned.
+// cancelIfNotConnected 如果 stream 尚未连接、尚未完成、也未被取消，则取消它。
+// 返回 true 表示本次确实取消了该 stream，false 表示它已经被处理过。
+//
+// connected=true：FlowStream RPC 已到达，ConnectInboundStream 已成功完成握手
+// finished=true：流已完成数据传输
+// canceled=true：已被之前的超时或其他错误取消
 func (s *InboundStreamInfo) cancelIfNotConnected(err error) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -110,13 +113,19 @@ func (s *InboundStreamInfo) cancelIfNotConnected(err error) bool {
 	return true
 }
 
-// cancelLocked marks s as canceled, finishes it, and sends the given error to
-// the receiver. The mutex of s must be held when calling this method.
+// cancelLocked 将 stream 标记为已取消，完成清理，并向 receiver 推送错误。
+// 必须在持有 s.mu 时调用。
+//
+// 两步操作：
+//   1. finishLocked()：标记 finished=true，调用 onFinish() = WaitGroup.Done()
+//      释放 flow 的 WaitGroup 计数，确保 flow 不会被永久阻塞
+//   2. 异步推送 error 到 receiver（processor 的 input synchronizer 或 inbox）：
+//      错误沿 processor 链传播，最终导致整个 flow 被 drain
+//      用 goroutine 是因为 receiver.Timeout 可能阻塞
 func (s *InboundStreamInfo) cancelLocked(err error) {
 	s.mu.AssertHeld()
 	s.mu.canceled = true
 	s.finishLocked()
-	// Since Timeout might block, we must send the error in a new goroutine.
 	go func() {
 		s.receiver.Timeout(err)
 	}()
@@ -136,14 +145,14 @@ func (s *InboundStreamInfo) finish() {
 type flowEntry struct {
 	// waitCh is set if one or more clients are waiting for the flow; the
 	// channel gets closed when the flow is registered.
-	waitCh chan struct{}
+	waitCh chan struct{}  // FlowStream 先到时在此等待
 
 	// refCount is used to allow multiple clients to wait for a flow - if the
 	// flow never shows up, the refCount is used to decide which client cleans
 	// up the entry.
-	refCount int
+	refCount int // 引用计数
 
-	flow *FlowBase
+	flow *FlowBase // 实际的 flow 对象
 
 	// inboundStreams are streams that receive data from other hosts, through
 	// the FlowStream API. This map is set in Flow.Setup(), so it is safe to
@@ -151,11 +160,11 @@ type flowEntry struct {
 	//
 	// Each InboundStreamInfo has its own mutex, separate from the FlowRegistry
 	// mutex. These two mutexes should **not** be held at the same time.
-	inboundStreams map[execinfrapb.StreamID]*InboundStreamInfo
+	inboundStreams map[execinfrapb.StreamID]*InboundStreamInfo // 所有远程入站流
 
 	// streamTimer is a timer that fires after a timeout and verifies that all
 	// inbound streams have been connected.
-	streamTimer *time.Timer
+	streamTimer *time.Timer  // 超时定时器
 }
 
 // FlowRegistry allows clients to look up flows by ID and to wait for flows to
@@ -165,14 +174,14 @@ type FlowRegistry struct {
 
 	// All fields in the flowEntry's are protected by the FlowRegistry mutex,
 	// except flow, whose methods can be called freely.
-	flows map[execinfrapb.FlowID]*flowEntry
+	flows map[execinfrapb.FlowID]*flowEntry// flowID → flow
 
 	// draining specifies whether the FlowRegistry is in drain mode. If it is,
 	// the FlowRegistry will not accept new flows.
-	draining bool
+	draining bool // 是否在排空中
 
 	// flowDone is signaled whenever the size of flows decreases.
-	flowDone *sync.Cond
+	flowDone *sync.Cond// flow 数减少时通知 Drain
 
 	// testingRunBeforeDrainSleep is a testing knob executed when a draining
 	// FlowRegistry has no registered flows but must still wait for a minimum time
@@ -181,15 +190,50 @@ type FlowRegistry struct {
 }
 
 // NewFlowRegistry creates a new FlowRegistry.
+// FlowRegistry` 是每个节点上管理**分布式 flow** 的注册中心，解决一个核心时序问题：**`SetupFlow` RPC 和 `FlowStream` RPC 到达顺序不确定**。
+// 看一张图就清楚了：
+
+// ```
+// 节点 A (Gateway)                         节点 B (Remote)
+//      │                                       │
+//      ├── SetupFlow RPC ────────────────────► │ 创建 flow，但没有数据接收者
+//      │                                       │ 把 flow 注册到 FlowRegistry
+//      │                                       │ 等待 inbound streams 连接...
+//      │                                       │
+//      ├── FlowStream RPC ───────────────────► │ 数据来了！
+//      │   (携带 FlowID + StreamID)             │ FlowRegistry.ConnectInboundStream()
+//      │                                       │   → 按 FlowID 找到 flow
+//      │                                       │   → 按 StreamID 找到对应的 InboundStreamInfo
+//      │                                       │   → 把 gRPC stream 交给 processor 的 input sync
+//      │                                       │
+//      │   ←── 数据流 ──────────────────────   │ processor 开始消费数据
+// ```
+
+// ### 它解决的具体问题
+
+// SetupFlow 和 FlowStream 是**两个独立的 gRPC 调用**，谁先到不一定：
+
+// | 场景 | 处理方式 |
+// |------|---------|
+// | SetupFlow 先到 | flow 注册好，等在 registry 里，FlowStream 来了直接找到 |
+// | FlowStream 先到 | `waitForFlow()` 创建 `waitCh`，阻塞等待，SetupFlow 来的时候 close(waitCh) 唤醒 |
+// | 超时 | `streamTimer` 触发 → `cancelPendingStreams()` → 推 error 给所有等待的 receiver |
+// | 节点关闭 | `Drain()` 拒绝新 flow，等正在跑的结束，超时后 `flow.Cancel()` 全部取消
 func NewFlowRegistry() *FlowRegistry {
 	fr := &FlowRegistry{flows: make(map[execinfrapb.FlowID]*flowEntry)}
 	fr.flowDone = sync.NewCond(fr)
 	return fr
 }
 
-// getEntryLocked returns the flowEntry associated with the id. If the entry
-// doesn't exist, one is created and inserted into the map.
-// It should only be called while holding the mutex.
+// getEntryLocked 获取 flowID 对应的 flowEntry，如果不存在则创建空 entry 并插入 map。
+// 必须在持有 FlowRegistry 锁时调用。
+//
+// 这是 RegisterFlow 和 ConnectInboundStream 共享的入口点——无论谁先到，
+// 都会拿到同一个 flowEntry 对象，从而实现了两者之间的同步：
+//   - FlowStream 先到：ConnectInboundStream 调用本函数创建空 entry（含 waitCh），
+//     RegisterFlow 后到拿到同一个 entry，通过 close(waitCh) 唤醒等待者。
+//   - SetupFlow 先到：RegisterFlow 创建 entry 并设置 entry.flow，
+//     ConnectInboundStream 后到直接拿到 entry.flow。
 func (fr *FlowRegistry) getEntryLocked(id execinfrapb.FlowID) *flowEntry {
 	entry, ok := fr.flows[id]
 	if !ok {
@@ -199,9 +243,15 @@ func (fr *FlowRegistry) getEntryLocked(id execinfrapb.FlowID) *flowEntry {
 	return entry
 }
 
-// releaseEntryLocked decreases the refCount in the entry for the given id, and
-// cleans up the entry if the refCount reaches 0.
-// It should only be called while holding the mutex.
+// releaseEntryLocked 减少 entry 的引用计数，计数归零时从 map 中删除。
+// 必须在持有 FlowRegistry 锁时调用。
+//
+// 引用计数的来源：
+//   - RegisterFlow 中 +1（对应 UnregisterFlow 中 -1）
+//   - ConnectInboundStream 中 +1（对应其 defer 中 -1）
+//
+// 当所有引用者都释放后，删除 entry 并通过 flowDone.Signal() 通知
+// 可能正在 Drain 中等待的 goroutine（见 Drain 的 flowDone.Wait() 循环）。
 func (fr *FlowRegistry) releaseEntryLocked(id execinfrapb.FlowID) {
 	entry := fr.flows[id]
 	if entry.refCount > 1 {
@@ -241,20 +291,29 @@ func IsFlowRetryableError(e error) bool {
 	return errors.HasType(e, (*flowRetryableError)(nil))
 }
 
-// RegisterFlow makes a flow accessible to ConnectInboundStream. Any concurrent
-// ConnectInboundStream calls that are waiting for this flow are woken up.
+// RegisterFlow 将一个 flow 注册到 FlowRegistry 中，使其可被 ConnectInboundStream 找到。
 //
-// It is expected that UnregisterFlow will be called at some point to remove the
-// flow from the registry.
+// 调用时机：在远程节点上，SetupFlow RPC 处理完毕后，flow 启动时调用。
+// 调用路径：FlowBase.StartInternal() → RegisterFlow()。
 //
-// inboundStreams are all the remote streams that will be connected into this
-// flow. If any of them is not connected within timeout, errors are propagated.
-// The inboundStreams are expected to have been initialized with their
-// WaitGroups (the group should have been incremented). RegisterFlow takes
-// responsibility for finishing the inboundStreams (which will call Done() on
-// that WaitGroup); this responsibility will be forwarded forward by
-// ConnectInboundStream. In case this method returns an error, the
-// inboundStreams are finished here.
+// 核心功能：解决 SetupFlow 和 FlowStream 两个独立 RPC 的竞态问题。
+//
+// 两种时序：
+//   时序 1：SetupFlow 先到 → RegisterFlow 注册 flow，close(waitCh) 唤醒等待者
+//   时序 2：FlowStream 先到 → ConnectInboundStream 调用 getEntryLocked 创建空 entry 和 waitCh，
+//          然后 waitForFlow 阻塞在 waitCh 上，RegisterFlow 到来后 close(waitCh) 唤醒
+//
+// inboundStreams 是这个 flow 期望接收的所有远程入站流，在 Flow.Setup() 时创建好，
+// 每个 InboundStreamInfo 的 WaitGroup 已经 +1。RegisterFlow 接管这些 stream 的生命周期：
+//   - 正常流程：ConnectInboundStream 接管，调用 stream.finish() → onFinish() → WaitGroup.Done()
+//   - 注册失败：本函数通过 defer 直接调 stream.onFinish() 释放
+//   - 超时：timer 触发 cancelPendingStreams → cancelLocked → finishLocked → onFinish()
+//
+// 参数：
+//   id       - flow 的唯一标识，由 gateway 生成
+//   f        - 已装配好的 FlowBase（processor 链已就绪，只等数据流入）
+//   inboundStreams - 期望的远程入站流映射，key 是 StreamID
+//   timeout  - 等待 inbound stream 连接的超时，默认 10s（SettingFlowStreamTimeout）
 func (fr *FlowRegistry) RegisterFlow(
 	ctx context.Context,
 	id execinfrapb.FlowID,
@@ -262,8 +321,14 @@ func (fr *FlowRegistry) RegisterFlow(
 	inboundStreams map[execinfrapb.StreamID]*InboundStreamInfo,
 	timeout time.Duration,
 ) (retErr error) {
+	// 持锁保护整个注册过程，保证与 ConnectInboundStream 之间的并发安全。
 	fr.Lock()
 	defer fr.Unlock()
+
+	// 注册失败时的回滚逻辑：逐个调用 stream.onFinish()（即 WaitGroup.Done()）。
+	// 为什么必须这样做：inboundStreams 在创建时 WaitGroup 已经 +1，
+	// 如果注册失败，这些 stream 永远不会被 ConnectInboundStream 接管，
+	// 不调 Done() 会导致 Flow.Wait() 永久阻塞。
 	defer func() {
 		if retErr != nil {
 			for _, stream := range inboundStreams {
@@ -272,45 +337,64 @@ func (fr *FlowRegistry) RegisterFlow(
 		}
 	}()
 
+	// 检查是否在排空模式。如果节点正在关闭，拒绝注册新 flow。
+	// 返回 flowRetryableError：gateway 收到后可重试（重新规划为本地执行或发到其他节点）。
 	draining := fr.draining
+	// 测试钩子：允许测试注入自定义的 draining 状态，覆盖真实的 fr.draining。
 	if f.Cfg != nil {
 		if knobs, ok := f.Cfg.TestingKnobs.Flowinfra.(*TestingKnobs); ok && knobs != nil && knobs.FlowRegistryDraining != nil {
 			draining = knobs.FlowRegistryDraining()
 		}
 	}
-
 	if draining {
 		return &flowRetryableError{cause: errors.Errorf(
 			"could not register flow because the registry is draining",
 		)}
 	}
+
+	// 获取或创建 flowEntry。这里不会分配新 entry 的情况：
+	// 如果 ConnectInboundStream（FlowStream RPC）先到，它已经通过 getEntryLocked
+	// 创建了这个 entry 并设置了 waitCh。此时我们拿到的是同一个 entry 对象。
 	entry := fr.getEntryLocked(id)
+
+	// 防御：同一个 FlowID 不允许重复注册。
 	if entry.flow != nil {
 		return errors.Errorf(
 			"flow already registered: flowID: %s.\n"+
 				"Current flow: %+v\nExisting flow: %+v",
 			f.spec.FlowID, f.spec, entry.flow.spec)
 	}
-	// Take a reference that will be removed by UnregisterFlow.
+
+	// 引用计数 +1。配对操作：
+	//   - UnregisterFlow() 中 releaseEntryLocked → refCount--，归零时从 map 删除
+	//   - ConnectInboundStream() 中也会 refCount++，其 defer 中 releaseEntryLocked
+	// 引用计数保证了：只要还有等待者（ConnectInboundStream）或 flow 自身在运行，
+	// entry 就不会被清理。
 	entry.refCount++
 	entry.flow = f
 	entry.inboundStreams = inboundStreams
-	// If there are any waiters, wake them up by closing waitCh.
+
+	// 唤醒所有等待者。如果 FlowStream RPC 先到，它的 waitForFlow() 正阻塞在
+	// entry.waitCh 上（见 waitForFlow 实现：持锁创建 waitCh，释放锁后 select 等待）。
+	// close(waitCh) 会让所有阻塞在 <-waitCh 上的 goroutine 立即返回。
 	if entry.waitCh != nil {
 		close(entry.waitCh)
 	}
 
+	// 如果这个 flow 期望有远程入站流（分布式查询才有，本地 flow 的 inboundStreams 为空），
+	// 启动超时定时器。超时后，对所有尚未连接的 stream 推送错误，错误会沿 processor 链传播，
+	// 最终导致整个 flow 失败。
 	if len(inboundStreams) > 0 {
-		// Set up a function to time out inbound streams after a while.
 		entry.streamTimer = time.AfterFunc(timeout, func() {
-			// We're giving up waiting for these inbound streams. We will push
-			// an error to its consumer; the error will propagate and eventually
-			// drain all the processors.
+			// 在独立的 timer goroutine 中执行，不持有 FlowRegistry 锁。
+			// cancelPendingStreams 遍历所有 inboundStreams，对每个未连接的 stream：
+			//   1. cancelIfNotConnected 检查是否已 connected/finished/canceled
+			//   2. 如果都没有 → cancelLocked → finishLocked（调 WaitGroup.Done）
+			//      → goroutine 中调 receiver.Timeout(err) 把错误推入数据流
 			numTimedOutReceivers := fr.cancelPendingStreams(id, errNoInboundStreamConnection)
 			if numTimedOutReceivers != 0 {
-				// The span in the context might be finished by the time this runs. In
-				// principle, we could ForkSpan() beforehand, but we don't want to
-				// create the extra span every time.
+				// ctx 的 tracing span 此时可能已经结束，
+				// 所以清除 span 信息避免日志携带无效 trace。
 				timeoutCtx := tracing.ContextWithSpan(ctx, nil)
 				log.Dev.Errorf(
 					timeoutCtx,
@@ -325,21 +409,28 @@ func (fr *FlowRegistry) RegisterFlow(
 	return nil
 }
 
-// cancelPendingStreams cancels all of the streams that haven't been connected
-// yet in this flow, by setting them to finished and ending their wait group.
-// All InboundStreamHandlers of these streams are timed out with the provided
-// error. The number of such timed out receivers is returned.
+// cancelPendingStreams 取消 flow 中所有尚未连接的入站流。
 //
-// This method should be called without holding the mutex of the FlowRegistry.
+// 调用时机：由 RegisterFlow 中的 streamTimer 在超时后触发（timer goroutine 中执行）。
+// 调用时不持有 FlowRegistry 锁。
+//
+// 对每个 InboundStreamInfo 调用 cancelIfNotConnected：
+//   - 已连接的 stream（FlowStream RPC 已到达并完成握手）→ 跳过，由正常流程处理
+//   - 已完成的 stream → 跳过
+//   - 已取消的 stream → 跳过
+//   - 其余（还在等 FlowStream RPC 到来）→ cancelLocked：
+//       finishLocked() 调 WaitGroup.Done()，然后 goroutine 中 receiver.Timeout(err) 推送错误
+//
+// 返回实际被取消的 stream 数量。
 func (fr *FlowRegistry) cancelPendingStreams(
 	id execinfrapb.FlowID, pendingReceiverErr error,
 ) (numTimedOutReceivers int) {
 	var inboundStreams map[execinfrapb.StreamID]*InboundStreamInfo
+	// 短暂持锁获取 inboundStreams map 的引用。
+	// inboundStreams 在 RegisterFlow 中设置后不会被修改，所以可以无锁访问。
 	fr.Lock()
 	entry := fr.flows[id]
 	if entry != nil && entry.flow != nil {
-		// It is safe to access the inboundStreams map without holding the
-		// FlowRegistry mutex.
 		inboundStreams = entry.inboundStreams
 	}
 	fr.Unlock()
@@ -347,8 +438,8 @@ func (fr *FlowRegistry) cancelPendingStreams(
 		return 0
 	}
 	for _, is := range inboundStreams {
-		// Connected, non-finished inbound streams will get an error returned in
-		// ProcessInboundStream(). Handle non-connected streams here.
+		// cancelIfNotConnected 内部使用 InboundStreamInfo 自己的 mutex，
+		// 与 ConnectInboundStream 中设置 connected=true 互斥。
 		if is.cancelIfNotConnected(pendingReceiverErr) {
 			numTimedOutReceivers++
 		}
@@ -369,39 +460,45 @@ func (fr *FlowRegistry) UnregisterFlow(id execinfrapb.FlowID) {
 	fr.releaseEntryLocked(id)
 }
 
-// waitForFlow waits until the flow with the given id gets registered - up to
-// the given timeout - and returns the FlowBase. If the timeout elapses, returns
-// nil. It should only be called without holding the mutex.
+// waitForFlow 等待指定 flowID 的 flow 被注册，最多等 timeout 时长。
+// 调用路径：ConnectInboundStream → waitForFlow。
+// 调用时不应持有 FlowRegistry 锁。
+//
+// 两种结果：
+//   1. flow 在超时前被注册（RegisterFlow close(waitCh)）→ 返回 FlowBase
+//   2. 超时或 ctx 取消 → 返回 nil（调用方 ConnectInboundStream 会返回 error）
+//
+// 注意 select 之后重新持锁读取 entry.flow，因为在释放锁期间 flow 可能已被注册。
 func (fr *FlowRegistry) waitForFlow(
 	ctx context.Context, id execinfrapb.FlowID, timeout time.Duration,
 ) *FlowBase {
 	fr.Lock()
-	defer fr.Unlock()
 	entry := fr.getEntryLocked(id)
+	// 快速路径：在发送握手消息的间隙，flow 恰好被注册了。
 	if entry.flow != nil {
-		// The flow has just arrived (when the caller temporarily released the
-		// lock to send a handshake message on the gRPC stream).
 		return entry.flow
 	}
 
-	// Flow not registered (at least not yet).
-
-	// Set up a channel that gets closed when the flow shows up, or when the
-	// timeout elapses. The channel might have been created already if there are
-	// other waiters for the same id.
+	// 创建/复用等待 channel。如果已有其他 ConnectInboundStream 调用者
+	// 为同一个 flowID 创建了 waitCh，则复用同一个 channel（广播唤醒）。
 	waitCh := entry.waitCh
 	if waitCh == nil {
 		waitCh = make(chan struct{})
 		entry.waitCh = waitCh
 	}
-	fr.Unlock()
+	fr.Unlock() // 释放锁，等待唤醒
 
+	// 三种唤醒条件：
+	//   waitCh 关闭 → RegisterFlow 已注册该 flow
+	//   time.After → 超过 SettingFlowStreamTimeout（默认 10s）
+	//   ctx.Done  → RPC 上下文被取消
 	select {
 	case <-waitCh:
 	case <-time.After(timeout):
 	case <-ctx.Done():
 	}
 
+	// 重新持锁读取结果：entry.flow 可能为 nil（超时/取消），也可能非 nil（注册成功）。
 	fr.Lock()
 	return entry.flow
 }
@@ -522,21 +619,33 @@ func (fr *FlowRegistry) undrain() {
 	fr.Unlock()
 }
 
-// ConnectInboundStream finds the InboundStreamInfo for the given
-// <flowID,streamID> pair and marks it as connected. It waits up to timeout for
-// the stream to be registered with the registry. It also sends the handshake
-// messages to the producer of the stream.
+// ConnectInboundStream 将 FlowStream RPC 的入站 gRPC 流连接到已注册的 flow。
 //
-// stream is the inbound stream.
+// 调用路径：FlowStream RPC → flowStreamInt() → ConnectInboundStream()
+// 调用时机：远程节点的 outbox 向本节点发起 FlowStream RPC，携带 FlowID + StreamID。
 //
-// It returns the Flow that the stream is connecting to, the receiver that the
-// stream must push data to and a cleanup function that must be called to
-// unregister the flow from the registry after all the data has been pushed.
+// 与 RegisterFlow 的竞态处理（时序图见文件顶部注释）：
 //
-// The cleanup function will decrement the flow's WaitGroup, so that Flow.Wait()
-// is not blocked on this stream any more.
-// In case an error is returned, the cleanup function is nil, the Flow is not
-// considered connected and is not cleaned up.
+//   时序 1：SetupFlow 先到，FlowStream 后到
+//     flow 已注册 → flow != nil → 跳过 waitForFlow → 直接查找 stream → 连接成功
+//
+//   时序 2：FlowStream 先到，SetupFlow 后到
+//     flow 未注册 → 发握手(ConsumerScheduled=false) → waitForFlow 阻塞等待
+//     → RegisterFlow 到来 close(waitCh) → waitForFlow 返回 → 查找 stream → 连接成功
+//
+//   时序 3：FlowStream 到来但 SetupFlow 超时未到
+//     waitForFlow 超时返回 nil → 返回 error
+//
+// 两次握手的协议设计：
+//   第一次握手（flow==nil 时）：通知 producer "consumer 还没就绪，你等着"
+//   第二次握手（找到 flow 后）：通知 producer "consumer 已就绪，开始传数据"
+//   这样避免 producer 在 consumer 未就绪时空转等待。
+//
+// 返回值：
+//   FlowBase              - 数据要流入的 flow
+//   InboundStreamHandler  - 数据接收者（processor 的 input synchronizer 或 vectorized inbox）
+//   cleanup               - 调用方在数据传输完成后调用，最终触发 WaitGroup.Done()
+//   error                 - 连接失败时非 nil，此时 cleanup 为 nil
 func (fr *FlowRegistry) ConnectInboundStream(
 	ctx context.Context,
 	flowID execinfrapb.FlowID,
@@ -544,25 +653,28 @@ func (fr *FlowRegistry) ConnectInboundStream(
 	stream execinfrapb.RPCDistSQL_FlowStreamStream,
 	timeout time.Duration,
 ) (_ *FlowBase, _ InboundStreamHandler, cleanup func(), retErr error) {
+	// 获取/创建 flowEntry，获取当前 flow 的注册状态。
 	fr.Lock()
 	entry := fr.getEntryLocked(flowID)
-	flow := entry.flow
-	// Take a reference that is always released at the end of this method. In
-	// the happy case (when we end up returning a flow that we connected to),
-	// that flow also took reference in RegisterFlow, so the ref count won't go
-	// below one; in all other cases we want to make sure to delete the entry
-	// from the registry if we're holding the only reference.
+	flow := entry.flow // 可能为 nil（SetupFlow 还没到）
+	// 引用计数 +1，确保 entry 不会在本函数执行期间被清理。
+	// 对应的 releaseEntryLocked 在 defer 中。
 	entry.refCount++
 	fr.Unlock()
+
+	// defer 中释放本函数持有的引用。如果这是最后一个引用（flow 注册失败等），
+	// releaseEntryLocked 会从 map 中删除 entry 并 signal flowDone。
 	defer func() {
 		fr.Lock()
 		defer fr.Unlock()
 		fr.releaseEntryLocked(flowID)
 	}()
+
+	// --- 情况 A：flow 尚未注册（FlowStream 先于 SetupFlow 到达）---
 	if flow == nil {
-		// Send the handshake message informing the producer that the consumer has
-		// not been scheduled yet. Another handshake will be sent below once the
-		// consumer has been connected.
+		// 第一次握手：告诉 producer（远端 outbox）"我这边的 consumer 还没调度好，等着"。
+		// ConsumerScheduled=false 表示 processor 还没就绪，
+		// ConsumerScheduleDeadline 告诉 producer 最多等到什么时候。
 		deadline := timeutil.Now().Add(timeout)
 		if err := stream.Send(&execinfrapb.ConsumerSignal{
 			Handshake: &execinfrapb.ConsumerHandshake{
@@ -570,57 +682,78 @@ func (fr *FlowRegistry) ConnectInboundStream(
 				ConsumerScheduleDeadline: &deadline,
 			},
 		}); err != nil {
+			// 连握手消息都发不出去，说明 gRPC 连接有问题，直接失败。
 			return nil, nil, nil, err
 		}
+		// 阻塞等待 flow 被注册。内部机制：
+		//   getEntryLocked → 拿到的就是上面同一个 entry（已经存在）
+		//   创建 waitCh → 放到 entry.waitCh
+		//   释放锁 → select 等待 waitCh 关闭 / 超时 / ctx 取消
+		//   RegisterFlow 到来时 close(waitCh) → waitForFlow 返回 FlowBase
 		flow = fr.waitForFlow(ctx, flowID, timeout)
 		if flow == nil {
+			// 超时或取消：SetupFlow 没来得及到达。
 			return nil, nil, nil, errors.Errorf("flow %s not found", flowID)
 		}
 	}
 
+	// --- 此时 flow 一定不为 nil ---
+
+	// 如果后续步骤出错（stream 找不到、握手失败、已被取消等），
+	// 取消整个 flow。因为一个 inbound stream 失败意味着分布式查询无法完成，
+	// 需要让所有节点上的相关 flow 都停止。
 	defer func() {
 		if retErr != nil {
-			// If any error is encountered below, we know that the distributed
-			// query execution will fail, so we cancel the flow on this node. If
-			// this node is the gateway, this might actually be required for
-			// proper shutdown of the whole distributed plan.
 			flow.Cancel()
 		}
 	}()
 
-	// entry.inboundStreams is safe to access without holding the mutex since
-	// the map is not modified after Flow.Setup.
+	// 从 entry.inboundStreams 中按 streamID 查找对应的 InboundStreamInfo。
+	// 这个 map 在 Flow.Setup() 时创建，之后不会被修改，所以不需要持锁读取。
 	s, ok := entry.inboundStreams[streamID]
 	if !ok {
 		return nil, nil, nil, errors.Errorf("flow %s: no inbound stream %d", flowID, streamID)
 	}
 
-	// Don't mark s as connected until after the handshake succeeds.
+	// 第二次握手：告诉 producer "consumer 已就绪，可以开始发数据了"。
+	// ConsumerScheduled=true 是 producer 开始推送数据的信号。
 	handshakeErr := stream.Send(&execinfrapb.ConsumerSignal{
 		Handshake: &execinfrapb.ConsumerHandshake{
 			ConsumerScheduled: true,
 		},
 	})
 
+	// 持 stream 自己的锁，检查状态并标记为已连接。
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// 检查 1：stream 是否已被取消（超时 timer 先触发）
 	if s.mu.canceled {
-		// Regardless of whether the handshake succeeded or not, this inbound
-		// stream has already been canceled and properly finished.
+		// 不管握手成不成功，这个 stream 已经被 timer 取消并完成了清理。
 		return nil, nil, nil, errors.Errorf("flow %s: inbound stream %d came too late", flowID, streamID)
 	}
+
+	// 检查 2：握手是否失败
 	if handshakeErr != nil {
-		// The handshake failed, so we're canceling this stream.
+		// 握手失败 → 取消这个 stream，推错误给 receiver，
+		// 错误会沿 processor 链传播并 drain 整个 flow。
 		s.cancelLocked(handshakeErr)
 		return nil, nil, nil, handshakeErr
 	}
+
+	// 检查 3：是否重复连接（同一个 StreamID 被连接两次）
 	if s.mu.connected {
-		// This is unexpected - the FlowStream RPC was issued twice by the
-		// outboxes for the same stream. We are processing the second RPC call
-		// right now, so there is another goroutine that will handle the
-		// cleanup, so we defer the cleanup to that goroutine.
+		// 这是第二次 FlowStream RPC——另一个 goroutine 已经处理了同一个 stream。
+		// 不需要再次清理，直接返回错误。
 		return nil, nil, nil, errors.AssertionFailedf("flow %s: inbound stream %d already connected", flowID, streamID)
 	}
+
+	// 标记为已连接。此时 producer 可以安全地开始推送数据到 receiver。
 	s.mu.connected = true
+
+	// 返回给调用方（FlowStream RPC handler）：
+	//   flow     - 用于获取 AmbientContext 做日志标注
+	//   receiver - processor 的数据入口（row-based: input synchronizer; vectorized: inbox）
+	//   finish   - 数据传输完成后调用，内部调 onFinish() → WaitGroup.Done()
 	return flow, s.receiver, s.finish, nil
 }

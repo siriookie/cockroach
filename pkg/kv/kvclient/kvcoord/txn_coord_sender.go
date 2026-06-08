@@ -515,29 +515,41 @@ func (tc *TxnCoordSender) Send(
 	// here, and unlock at the bottom of the interceptor stack, in the
 	// txnLockGatekeeper. Then we lock again in that interceptor when the response
 	// comes, and unlock again in the defer below.
+	// 先拿事务协调器锁，检查和更新本地事务状态。
+	// 注意：这个锁不会覆盖整个网络请求过程，中途会在 txnLockGatekeeper 处释放。
 	tc.mu.Lock()
+	// Send 结束时释放锁；如果中途 interceptor 释放过锁，返回路径会重新拿锁后再走到这里。
 	defer tc.mu.Unlock()
+	// 标记这个事务已经真正发送过请求；savepoint、EndTxn 快路径等逻辑会用到这个状态。
 	tc.mu.active = true
 
+	// 检查请求是否和当前事务类型/状态不兼容，例如 leaf/root txn 不允许的请求。
 	if pErr := tc.maybeRejectIncompatibleRequest(ctx, ba); pErr != nil {
 		return nil, pErr
 	}
 
+	// 检查客户端是否还能继续发这个请求。
+	// 例如事务已经 finalized、prepared、处于 retryable error 状态时，某些请求会被拒绝。
 	if pErr := tc.maybeRejectClientLocked(ctx, ba); pErr != nil {
 		return nil, pErr
 	}
 
+	// 如果这是唯一的 EndTxn 请求，并且事务没有获取锁也没有 buffered writes，
+	// 说明它是 read-only / non-locking 事务，可以在本地走快速 finalize，不必真的发送 EndTxn 到 KV。
 	if ba.IsSingleEndTxnRequest() && !tc.hasAcquiredLocksOrBufferedWritesLocked() {
 		return nil, tc.finalizeNonLockingTxnLocked(ctx, ba)
 	}
 
+	// 给 TxnCoordSender 这一层创建 tracing span，方便在 trace/profile 中看到事务协调阶段。
 	ctx, sp := tc.AnnotateCtxWithSpan(ctx, OpTxnCoordSender)
 	defer sp.Finish()
 
 	// Associate the txnID with the trace.
+	// 事务请求必须绑定具体 txn ID；没有 ID 说明 TxnCoordSender 状态异常。
 	if tc.mu.txn.ID == (uuid.UUID{}) {
 		log.KvExec.Fatalf(ctx, "cannot send transactional request through unbound TxnCoordSender")
 	}
+	// verbose trace 时，把 txnID 和写时间戳打到 span/log tag 里，方便排查事务请求链路。
 	if sp.IsVerbose() {
 		sp.SetTag("txnID", attribute.StringValue(tc.mu.txn.ID.String()))
 		ctx = logtags.AddTag(ctx, "txn", uuid.ShortStringer(tc.mu.txn.ID))
@@ -548,57 +560,75 @@ func (tc *TxnCoordSender) Send(
 
 	// It doesn't make sense to use inconsistent reads in a transaction. However,
 	// we still need to accept it as a parameter for this to compile.
+	// 事务请求必须使用 CONSISTENT；INCONSISTENT/READ_UNCOMMITTED 不适合事务语义。
 	if ba.ReadConsistency != kvpb.CONSISTENT {
 		return nil, kvpb.NewErrorf("cannot use %s ReadConsistency in txn",
 			ba.ReadConsistency)
 	}
 
+	// 空 batch 没有请求需要发送，直接返回空 response/error。
 	lastIndex := len(ba.Requests) - 1
 	if lastIndex < 0 {
 		return nil, nil
 	}
 
+	// 如果事务启用了 stepping，这里可能在发送前自动推进读时间戳。
 	if tc.shouldStepReadTimestampLocked() {
 		tc.maybeAutoStepReadTimestampLocked()
 	}
 
 	// Clone the Txn's Proto so that future modifications can be made without
 	// worrying about synchronization.
+	// 把当前事务 proto 克隆到 BatchRequest 上。
+	// 后续 DistSender/leaseholder 会按这个 txn proto 执行请求。
 	ba.Txn = tc.mu.txn.Clone()
 
 	// Send the command through the txnInterceptor stack.
+	// 请求先经过事务 interceptor 栈：分配 seq num、写 buffer、pipeliner、span refresher、committer 等。
+	// 栈底部才会进入 DistSender，最终发到目标 range leaseholder。
 	br, pErr := tc.interceptorStack[0].SendLocked(ctx, ba)
 
+	// 根据 response/error 更新 TxnCoordSender 本地状态，例如推进 timestamp、保存 retryable error。
 	pErr = tc.updateStateLocked(ctx, ba, br, pErr)
 
 	// If we succeeded to commit, or we attempted to rollback, we move to
 	// txnFinalized. If we succeeded to prepare, we move to txnPrepared.
+	// EndTxn 是事务结束请求；根据 commit/rollback/prepare 结果切换本地事务状态。
 	if req, ok := ba.GetArg(kvpb.EndTxn); ok {
 		et := req.(*kvpb.EndTxnRequest)
 		if et.Commit {
+			// commit=true 只有在没有错误时才能认为提交或 prepare 成功。
 			if pErr == nil {
 				if et.Prepare {
+					// 两阶段提交 prepare 成功，事务进入 prepared 状态，还不是最终 committed。
 					tc.markTxnPreparedLocked(ctx)
 				} else {
+					// 普通 commit 成功，事务进入 finalized，并清理 interceptor/heartbeat 等资源。
 					tc.finalizeAndCleanupTxnLocked(ctx)
 				}
+				// commit 成功后执行 commit-wait，保证外部一致性。
 				if err := tc.maybeCommitWait(ctx, false /* deferred */); err != nil {
 					return nil, kvpb.NewError(err)
 				}
 			}
 		} else /* !et.Commit */ {
+			// rollback 请求一旦发出，客户端侧就认为事务 finalized；
+			// 即使底层 rollback 失败，后续也只允许有限的清理/重试 rollback。
 			tc.finalizeAndCleanupTxnLocked(ctx)
 		}
 	}
 
+	// 有 KV 错误就返回给上层；上层可能会进入 PrepareForRetry 自动重试。
 	if pErr != nil {
 		return nil, pErr
 	}
 
+	// 正常情况下错误只应通过 pErr 返回，不应该藏在 BatchResponse.Error 里。
 	if br != nil && br.Error != nil {
 		panic(kvpb.ErrorUnexpectedlySet(nil /* culprit */, br))
 	}
 
+	// 返回成功 response。
 	return br, nil
 }
 

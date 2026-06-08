@@ -160,6 +160,8 @@ func (c *StatementHintsCache) Clear() {
 func (c *StatementHintsCache) Start(
 	ctx context.Context, sysTableResolver catalog.SystemTableIDResolver,
 ) error {
+	// 启动 statement hints cache 的 rangefeed 监听。
+	// 真正的初始化逻辑放在 startRangefeedInternal 中，Start 只作为对外入口。
 	return c.startRangefeedInternal(ctx, sysTableResolver)
 }
 

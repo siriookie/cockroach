@@ -768,64 +768,102 @@ func (r *Registry) pollStmtRequests(ctx context.Context) error {
 func StartPolling(ctx context.Context, tr *TxnRegistry, sr *Registry, stopper *stop.Stopper) {
 	// The registry has the same lifetime as the server, so the cancellation
 	// function can be ignored and it'll be called by the stopper.
+	// 给轮询任务创建一个会在 stopper quiesce 时取消的 context。
+	// registry 生命周期和 server 一样长，所以这里可以忽略 cancel 返回值。
 	ctx, _ = stopper.WithCancelOnQuiesce(ctx) // nolint:quiesce
 
 	// Since background diagnostics collection is not under user
 	// control, exclude it from cost accounting and control.
+	// 诊断请求轮询是系统后台任务，不由普通用户直接控制，不计入 tenant cost control。
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 
 	// NB: The only error that should occur here would be if the server were
 	// shutting down so let's swallow it.
+	// 启动后台轮询任务。
+	// RunAsyncTask 失败通常只会发生在 server 正在关闭时，所以这里忽略返回错误。
 	_ = stopper.RunAsyncTask(ctx, "stmt-txn-diag-poll", func(ctx context.Context) {
+		// 声明轮询任务需要的状态。
 		var (
-			timer               timeutil.Timer
-			lastPoll            time.Time
-			deadline            time.Time
+			// timer 控制下一次 poll 的时间。
+			timer timeutil.Timer
+			// lastPoll 记录上一次成功完成 poll 的时间。
+			lastPoll time.Time
+			// deadline 记录当前 timer 对应的目标触发时间。
+			deadline time.Time
+			// pollIntervalChanged 用来接收 pollingInterval setting 变化通知。
+			// 缓冲为 1，避免 setting 高频变化时阻塞回调。
 			pollIntervalChanged = make(chan struct{}, 1)
-			maybeResetTimer     = func() {
+			// maybeResetTimer 根据当前 cluster setting 重新设置 timer。
+			maybeResetTimer = func() {
+				// 读取诊断请求轮询间隔。
 				if interval := pollingInterval.Get(&sr.st.SV); interval == 0 {
 					// Setting the interval to zero stops the polling.
+					// interval 为 0 表示禁用轮询，停止 timer。
 					timer.Stop()
 				} else {
+					// 下一次 poll 的目标时间 = 上一次 poll 时间 + 当前配置的 interval。
 					newDeadline := lastPoll.Add(interval)
+					// 如果之前没有 deadline，或者 interval 变化导致 deadline 不同，就重置 timer。
 					if deadline.IsZero() || !deadline.Equal(newDeadline) {
+						// 记录新的目标触发时间。
 						deadline = newDeadline
+						// 设置 timer 在距离新 deadline 的剩余时间后触发。
 						timer.Reset(timeutil.Until(deadline))
 					}
 				}
 			}
+			// poll 执行一次完整轮询：
+			// 先同步 transaction diagnostics requests，再同步 statement diagnostics requests。
 			poll = func() {
+				// 从系统表读取 transaction diagnostics requests，并更新事务诊断 registry。
 				if err := tr.pollTxnRequests(ctx); err != nil {
+					// 如果 context 已取消，说明 server 正在停止，不再记录噪声日志。
 					if ctx.Err() != nil {
 						return
 					}
+					// 记录事务诊断请求轮询错误，但不中止后台任务。
 					log.Ops.Warningf(ctx, "error polling for transaction diagnostics requests: %s", err)
 				}
+				// 从 system.statement_diagnostics_requests 读取 statement diagnostics requests，
+				// 并更新 statement diagnostics registry。
 				if err := sr.pollStmtRequests(ctx); err != nil {
+					// 如果 context 已取消，说明 server 正在停止，不再记录噪声日志。
 					if ctx.Err() != nil {
 						return
 					}
+					// 记录语句诊断请求轮询错误，但不中止后台任务。
 					log.Ops.Warningf(ctx, "error polling for statement diagnostics requests: %s", err)
 				}
+				// 记录本轮 poll 完成时间，用于计算下一次 timer deadline。
 				lastPoll = timeutil.Now()
 			}
 		)
 
+		// 注册 pollingInterval cluster setting 变化回调。
 		pollingInterval.SetOnChange(&sr.st.SV, func(ctx context.Context) {
+			// 通知后台 loop：轮询间隔变了，需要重新计算 timer。
 			select {
+			// 正常路径：发送一次变化通知。
 			case pollIntervalChanged <- struct{}{}:
+			// 如果已经有待处理通知，就不重复发送，避免阻塞 setting 回调。
 			default:
 			}
 		})
+		// 后台轮询主循环。
 		for {
+			// 每轮 select 前，根据当前 setting 和 lastPoll 调整 timer。
 			maybeResetTimer()
 			select {
+			// pollingInterval setting 发生变化，回到循环开头重新设置 timer。
 			case <-pollIntervalChanged:
 				continue // go back around and maybe reset the timer
+			// timer 到期，继续往下执行 poll。
 			case <-timer.C:
+			// context 被 stopper quiesce 或外部取消，退出后台任务。
 			case <-ctx.Done():
 				return
 			}
+			// 执行一轮 statement/transaction diagnostics request 同步。
 			poll()
 		}
 	})

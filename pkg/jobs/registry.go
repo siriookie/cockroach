@@ -929,214 +929,320 @@ func (r *Registry) withSession(ctx context.Context, f withSessionFunc) {
 // Start 轮询当前节点的存活性故障，并在观察到故障时取消所有已注册的作业。
 // 否则，它将启动注册表的所有主要守护进程，这些进程负责轮询作业表并启动/取消/垃圾回收作业。
 func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
+	// 测试/knob 开关：如果禁用了 registry 生命周期管理，就不启动任何后台 job controller。
 	if r.knobs.DisableRegistryLifecycleManagement {
 		return nil
 	}
 
 	// Since the job polling system is outside user control, exclude it from cost
 	// accounting and control. Individual jobs are not part of this exclusion.
+	// job registry 的轮询/调度属于系统后台控制逻辑，不应该计入 tenant cost control。
+	// 注意：具体 job 自己执行的工作不在这个豁免里。
 	ctx = multitenant.WithTenantCostControlExemption(ctx)
 
+	// 把一个需要 sqlliveness session 的函数包装成普通 ctx 函数。
+	// 每次执行时都会通过 r.withSession 获取/验证当前节点的 live session。
 	wrapWithSession := func(f withSessionFunc) func(ctx context.Context) {
+		// 返回给 loop controller 调用的闭包。
 		return func(ctx context.Context) { r.withSession(ctx, f) }
 	}
 
 	// removeClaimsFromDeadSessions queries the jobs table for non-terminal
 	// jobs and nullifies their claims if the claims are owned by known dead sessions.
+	// 清理那些被“已死亡 sqlliveness session”占有的 job claim。
+	// 这样其他活节点后续才能重新 claim/adopt 这些非终止状态 jobs。
 	removeClaimsFromDeadSessions := func(ctx context.Context, s sqlliveness.Session) {
+		// 在 SQL transaction 中更新 system.jobs。
 		if err := r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			// Run the expiration transaction at low priority to ensure that it does
 			// not contend with foreground reads. Note that the adoption and cancellation
 			// queries also use low priority so they will interact nicely.
+			// 使用低优先级，避免后台清理和前台读写争用。
 			if err := txn.KV().SetUserPriority(roachpb.MinUserPriority); err != nil {
 				return errors.WithAssertionFailure(err)
 			}
+			// 执行 SQL：把 dead session 持有的非终止 job claim 置空。
 			_, err := txn.ExecEx(
 				ctx, "expire-sessions", txn.KV(),
 				sessiondata.NodeUserSessionDataOverride,
 				removeClaimsForDeadSessionsQuery,
+				// 当前 live session ID 作为查询参数，用来识别哪些 session 已死亡。
 				s.ID().UnsafeBytes(),
+				// 每轮最多更新的 cancellation/claim 数量，避免单次事务过大。
 				cancellationsUpdateLimitSetting.Get(&r.settings.SV),
 			)
+			// 把 ExecEx 的错误返回给外层事务。
 			return err
 		}); err != nil {
+			// 这里只记录错误，不让后台 loop 因一次清理失败而退出。
 			log.Dev.Errorf(ctx, "error expiring job sessions: %s", err)
 		}
 	}
 	// servePauseAndCancelRequests queries tho pause-requested and cancel-requested
 	// jobs that this node has claimed and sets their states to paused or cancel
 	// respectively, and then stops the execution of those jobs.
+	// 处理用户发起的 pause-requested / cancel-requested jobs。
+	// 只处理当前节点 session 已经 claim 的 jobs。
 	servePauseAndCancelRequests := func(ctx context.Context, s sqlliveness.Session) {
+		// 调用 registry 的具体暂停/取消处理逻辑。
 		if err := r.servePauseAndCancelRequests(ctx, s); err != nil {
+			// 单轮处理失败只记录日志，下一轮还会继续扫描。
 			log.Dev.Errorf(ctx, "failed to serve pause and cancel requests: %v", err)
 		}
 	}
+	// cancelLoopTask 是 jobs/cancel controller 每轮执行的工作。
 	cancelLoopTask := wrapWithSession(func(ctx context.Context, s sqlliveness.Session) {
+		// 先释放 dead session 持有的 claims。
 		removeClaimsFromDeadSessions(ctx, s)
+		// 如果本节点内存中有 job 运行着，但 session claim 已经不再属于当前 session，就取消它。
 		r.maybeCancelJobs(ctx, s)
+		// 处理 pause/cancel 请求。
 		servePauseAndCancelRequests(ctx, s)
 	})
 	// claimJobs iterates the set of jobs which are not currently claimed and
 	// claims jobs up to maxAdoptionsPerLoop.
+	// 限制“adoption disabled”日志频率，避免每轮都刷日志。
 	logDisabledAdoptionLimiter := log.Every(time.Minute)
+	// claimJobs 尝试从 system.jobs 中 claim 一批尚未被其他 live session claim 的 jobs。
 	claimJobs := wrapWithSession(func(ctx context.Context, s sqlliveness.Session) {
+		// 如果当前 registry 禁止 adoption，就不 claim 新 job。
 		if r.adoptionDisabled(ctx) {
+			// 日志限频。
 			if logDisabledAdoptionLimiter.ShouldLog() {
 				log.Dev.Warningf(ctx, "job adoption is disabled, registry will not claim any jobs")
 			}
 			return
 		}
+		// 记录一次 adoption loop 迭代。
 		r.metrics.AdoptIterations.Inc(1)
+		// 真正执行 job claim，把符合条件的 jobs 绑定到当前 sqlliveness session。
 		if err := r.claimJobs(ctx, s); err != nil {
+			// claim 失败只记录日志，后续 loop 会重试。
 			log.Dev.Errorf(ctx, "error claiming jobs: %s", err)
 		}
 	})
 	// removeClaimsFromJobs queries the jobs table for non-terminal jobs and
 	// nullifies their claims if the claims are owned by the current session.
+	// 清理当前 session 自己持有的非终止 job claims。
+	// 常见场景：adoption 被禁用或节点 drain，需要释放 claims 让其他节点接管。
 	removeClaimsFromSession := func(ctx context.Context, s sqlliveness.Session) {
+		// 在 SQL transaction 中更新 system.jobs。
 		if err := r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			// Run the expiration transaction at low priority to ensure that it does
 			// not contend with foreground reads. Note that the adoption and cancellation
 			// queries also use low priority so they will interact nicely.
+			// 使用低优先级，避免后台释放 claim 干扰前台工作。
 			if err := txn.KV().SetUserPriority(roachpb.MinUserPriority); err != nil {
 				return errors.WithAssertionFailure(err)
 			}
+			// 执行 SQL：清空当前 session 持有的非终止 job claims。
 			_, err := txn.ExecEx(
 				ctx, "remove-claims-for-session", txn.KV(),
 				sessiondata.NodeUserSessionDataOverride,
 				removeClaimsForSessionQuery, s.ID().UnsafeBytes(),
 			)
+			// 把 ExecEx 的错误返回给外层事务。
 			return err
 		}); err != nil {
+			// 这里只记录错误，后台 loop 不退出。
 			log.Dev.Errorf(ctx, "error expiring job sessions: %s", err)
 		}
 	}
 	// processClaimedJobs iterates the jobs claimed by the current node that
 	// are in the running or reverting state, and then it starts those jobs if
 	// they are not already running.
+	// 限制“claim disabled”日志频率。
 	logDisabledClaimLimiter := log.Every(time.Minute)
+	// processClaimedJobs 处理当前 session 已经 claim 的 jobs：
+	// 如果它们还没在本节点跑起来，就启动对应 resumer。
 	processClaimedJobs := wrapWithSession(func(ctx context.Context, s sqlliveness.Session) {
 		// If job adoption is disabled for the registry then we remove our claim on
 		// all adopted job, and cancel them.
+		// adoption 被禁用时，当前节点不应该继续持有/执行已 adopt 的 jobs。
 		if r.adoptionDisabled(ctx) {
+			// 日志限频。
 			if logDisabledClaimLimiter.ShouldLog() {
 				log.Dev.Warningf(ctx, "job adoptions is disabled, canceling all adopted "+
 					"jobs due to liveness failure")
 			}
+			// 释放当前 session 在 system.jobs 里的 claims。
 			removeClaimsFromSession(ctx, s)
+			// 取消内存中当前节点已经 adopt 的所有 jobs。
 			r.cancelAllAdoptedJobs()
 			return
 		}
+		// 正常路径：扫描当前 session 已 claim 的 running/reverting jobs，并启动尚未运行的 resumer。
 		if err := r.processClaimedJobs(ctx, s); err != nil {
+			// 单轮启动失败只记录日志，下一轮继续重试。
 			log.Dev.Errorf(ctx, "error processing claimed jobs: %s", err)
 		}
 	})
 
+	// 记录即将启动一个 controller task，供关闭流程等待这些 task 启动/退出。
 	r.startedControllerTasksWG.Add(1)
+	// 启动 jobs/cancel controller。
 	if err := stopper.RunAsyncTask(ctx, "jobs/cancel", func(ctx context.Context) {
+		// task 退出时减少 startedControllerTasksWG 计数。
 		defer r.startedControllerTasksWG.Done()
 
+		// 创建一个会在 stopper quiesce 时自动 cancel 的 context。
 		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		// task 退出时释放 context。
 		defer cancel()
 
+		// 启动后先跑一轮 cancel loop，尽快清理 dead session claims 和 pause/cancel 请求。
 		cancelLoopTask(ctx)
+		// 创建 cancel loop 的 interval controller，支持 cluster setting/knob 动态调整间隔。
 		lc := makeLoopController(r, cancelIntervalSetting, r.knobs.IntervalOverrides.Cancel)
+		// 退出时清理 timer/setting watcher。
 		defer lc.cleanup()
+		// cancel controller 主循环。
 		for {
 			select {
+			// interval setting 更新时，重新计算 timer。
 			case <-lc.updated:
 				lc.onUpdate()
+			// stopper quiesce 时退出。
 			case <-r.stopper.ShouldQuiesce():
 				// Note: the jobs are cancelled by virtue of being run with a
 				// WithCancelOnQuesce context. See the resumeJob() function.
+				// 正在运行的 jobs 会因为 resumeJob 使用的 quiesce context 被取消。
 				return
+			// drainJobs 表示节点正在优雅 drain，需要停止本节点 adopt 的 jobs。
 			case <-r.drainJobs:
 				log.Dev.Warningf(ctx, "canceling all adopted jobs due to graceful drain request")
+				// 取消当前节点内存中所有 adopted jobs。
 				r.cancelAllAdoptedJobs()
 				return
+			// cancel interval 到期，执行一轮 cancel loop。
 			case <-lc.timer.C:
 				cancelLoopTask(ctx)
+				// 通知 loop controller 本轮执行完成，并重置下一次 timer。
 				lc.onExecute()
 			}
 		}
 	}); err != nil {
+		// 启动失败时撤销前面的 Add(1)。
 		r.startedControllerTasksWG.Done()
+		// 把启动失败错误返回给调用者。
 		return err
 	}
 
+	// 记录即将启动 jobs/gc controller。
 	r.startedControllerTasksWG.Add(1)
+	// 启动 jobs/gc controller。
 	if err := stopper.RunAsyncTask(ctx, "jobs/gc", func(ctx context.Context) {
+		// task 退出时减少 startedControllerTasksWG 计数。
 		defer r.startedControllerTasksWG.Done()
 
+		// 创建一个会在 stopper quiesce 时自动 cancel 的 context。
 		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		// task 退出时释放 context。
 		defer cancel()
 
+		// 创建 GC loop 的 interval controller。
 		lc := makeLoopController(r, gcIntervalSetting, r.knobs.IntervalOverrides.Gc)
+		// 退出时清理 timer/setting watcher。
 		defer lc.cleanup()
 
 		// Retention duration of terminal job records.
+		// 计算 terminal job 记录保留多久后可以被删除。
 		retentionDuration := func() time.Duration {
+			// 测试 knob 可以覆盖 retention time。
 			if r.knobs.IntervalOverrides.RetentionTime != nil {
 				return *r.knobs.IntervalOverrides.RetentionTime
 			}
+			// 正常路径读取 cluster setting。
 			return RetentionTimeSetting.Get(&r.settings.SV)
 		}
 
+		// GC controller 主循环。
 		for {
 			select {
+			// interval setting 更新时，重新计算 timer。
 			case <-lc.updated:
 				lc.onUpdate()
+			// stopper quiesce 时退出。
 			case <-stopper.ShouldQuiesce():
 				return
+			// drainJobs 时退出，不再做 job GC。
 			case <-r.drainJobs:
 				return
+			// GC interval 到期，清理过期 terminal jobs。
 			case <-lc.timer.C:
+				// 计算过期阈值：早于 now - retentionDuration 的 terminal job 可以清理。
 				old := timeutil.Now().Add(-1 * retentionDuration())
+				// 删除 system.jobs 以及 job metadata 表中的过期 terminal job 记录。
 				if err := r.cleanupOldJobs(ctx, old); err != nil {
 					log.Dev.Warningf(ctx, "error cleaning up old job records: %v", err)
 				}
+				// 通知 loop controller 本轮执行完成，并重置下一次 timer。
 				lc.onExecute()
 			}
 		}
 	}); err != nil {
+		// 启动失败时撤销前面的 Add(1)。
 		r.startedControllerTasksWG.Done()
+		// 把启动失败错误返回给调用者。
 		return err
 	}
 
+	// 记录即将启动 jobs/adopt controller。
 	r.startedControllerTasksWG.Add(1)
+	// 启动 jobs/adopt controller。
 	if err := stopper.RunAsyncTask(ctx, "jobs/adopt", func(ctx context.Context) {
+		// task 退出时减少 startedControllerTasksWG 计数。
 		defer r.startedControllerTasksWG.Done()
 
+		// 创建一个会在 stopper quiesce 时自动 cancel 的 context。
 		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		// task 退出时释放 context。
 		defer cancel()
+		// 创建 adoption loop 的 interval controller。
 		lc := makeLoopController(r, adoptIntervalSetting, r.knobs.IntervalOverrides.Adopt)
+		// 退出时清理 timer/setting watcher。
 		defer lc.cleanup()
+		// adoption controller 主循环。
 		for {
 			select {
+			// interval setting 更新时，重新计算 timer。
 			case <-lc.updated:
 				lc.onUpdate()
+			// stopper quiesce 时退出。
 			case <-stopper.ShouldQuiesce():
 				return
+			// drainRequested 表示开始 drain，不再 adopt 新 jobs。
 			case <-r.drainRequested:
 				return
+			// drainJobs 表示 jobs 也要停止，adoption loop 退出。
 			case <-r.drainJobs:
 				return
+			// adoptionCh 用于在新 job 创建等场景下主动唤醒 adoption loop。
 			case shouldClaim := <-r.adoptionCh:
 				// Try to adopt the most recently created job.
+				// shouldClaim 为 true 时，先尝试 claim 最新创建/可运行的 jobs。
 				if shouldClaim {
 					claimJobs(ctx)
 				}
+				// 无论是否 claim，都处理当前 session 已经 claim 的 jobs，启动尚未运行的 resumer。
 				processClaimedJobs(ctx)
+			// adoption interval 到期，执行常规 claim + process。
 			case <-lc.timer.C:
+				// 尝试 claim 一批未被其他 live session claim 的 jobs。
 				claimJobs(ctx)
+				// 启动/处理当前 session 已经 claim 的 jobs。
 				processClaimedJobs(ctx)
+				// 通知 loop controller 本轮执行完成，并重置下一次 timer。
 				lc.onExecute()
 			}
 		}
 	}); err != nil {
+		// 启动失败时撤销前面的 Add(1)。
 		r.startedControllerTasksWG.Done()
+		// 把启动失败错误返回给调用者。
 		return err
 	}
+	// 三个 controller task 都成功提交给 stopper。
 	return nil
 }
 

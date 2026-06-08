@@ -126,24 +126,33 @@ func (b *Batch) validate() error {
 }
 
 func (b *Batch) initResult(calls, numRows int, raw bool, err error) {
+	// 如果这个 Batch 已经是 raw batch，就不能再混入普通高层操作。
+	// raw batch 只能通过 AddRawRequest 添加原始 kvpb.Request。
 	if err == nil && b.raw && !raw {
 		err = errors.Errorf("must not use non-raw operations on a raw batch")
 	}
 	// TODO(tschottdorf): assert that calls is 0 or 1?
+	// 为本次加入 Batch 的一次逻辑操作创建 Result。
+	// calls 表示这个 Result 对应底层几个 request；Err 记录构造阶段已经发现的错误。
 	r := Result{calls: calls, Err: err}
+	// 如果调用方预期这个操作会返回固定数量的行，并且不是 raw batch，就提前给 Rows 分配空间。
 	if numRows > 0 && !b.raw {
+		// 优先使用 Batch 内置的小数组，避免小 batch 为 Rows 产生堆分配。
 		if b.rowsStaticIdx+numRows <= len(b.rowsStaticBuf) {
 			r.Rows = b.rowsStaticBuf[b.rowsStaticIdx : b.rowsStaticIdx+numRows]
 			b.rowsStaticIdx += numRows
 		} else {
 			// Most requests produce 0 (unknown) or 1 result rows, so optimize for
 			// that case.
+			// 内置小数组不够时，按返回行数选择分配策略。
 			switch numRows {
 			case 1:
 				// Use a buffer to batch allocate the result rows.
+				// 单行结果很常见，复用 rowsBuf 这种批量增长的 buffer，减少频繁小对象分配。
 				if cap(b.rowsBuf)-len(b.rowsBuf) == 0 {
 					const minSize = 16
 					const maxSize = 128
+					// rowsBuf 容量用 2 倍增长，至少 16，最多一次增长到 128。
 					size := cap(b.rowsBuf) * 2
 					if size < minSize {
 						size = minSize
@@ -152,17 +161,22 @@ func (b *Batch) initResult(calls, numRows int, raw bool, err error) {
 					}
 					b.rowsBuf = make([]KeyValue, 0, size)
 				}
+				// 从 rowsBuf 尾部切出 1 个 KeyValue 给当前 Result 使用。
 				pos := len(b.rowsBuf)
 				r.Rows = b.rowsBuf[pos : pos+1 : pos+1]
 				b.rowsBuf = b.rowsBuf[:pos+1]
 			default:
+				// 多行固定结果不常见，直接按需要的行数分配一个新的 slice。
 				r.Rows = make([]KeyValue, numRows)
 			}
 		}
 	}
+	// Results 首次使用时，先指向 Batch 内置的小数组，避免小 batch 为 Result 列表分配堆内存。
 	if b.Results == nil {
 		b.Results = b.resultsBuf[:0]
 	}
+	// 把这个逻辑操作对应的 Result 追加到 Batch.Results。
+	// 后续 Run 成功后，fillResults 会按顺序把响应填进这些 Result。
 	b.Results = append(b.Results, r)
 }
 
@@ -374,21 +388,29 @@ func (b *Batch) AddRawRequest(reqs ...kvpb.Request) {
 }
 
 func (b *Batch) get(
+	// key 是调用方传入的逻辑 key，可以是 string、[]byte、roachpb.Key 等可 marshal 的类型。
 	key interface{}, str kvpb.KeyLockingStrengthType, dur kvpb.KeyLockingDurabilityType,
 ) {
+	// 把调用方传入的 key 统一编码成 roachpb.Key，供底层 KV request 使用。
 	k, err := marshalKey(key)
+	// 如果 key 类型非法或编码失败，不会构造 KV 请求，只在 Batch.Results 里记录这个构造阶段错误。
 	if err != nil {
 		b.initResult(0, 1, notRaw, err)
 		return
 	}
+	// 根据锁强度决定构造普通 Get，还是构造带锁的 GetForShare/GetForUpdate。
 	switch str {
 	case kvpb.NonLocking:
+		// 普通读：只读取 key，不主动获取共享锁或排他锁。
 		b.appendReqs(kvpb.NewGet(k))
 	case kvpb.ForShare, kvpb.ForUpdate:
+		// 锁定读：读取 key 的同时携带锁强度和锁持久性，后续 leaseholder 侧会按这些参数处理锁。
 		b.appendReqs(kvpb.NewLockingGet(k, str, dur))
 	default:
+		// get 的调用方只能传 NonLocking / ForShare / ForUpdate，其它值说明代码路径有 bug。
 		panic(errors.AssertionFailedf("unknown str %d", str))
 	}
+	// 为这个 Get 请求预留一个 Result；真正的返回值要等 Batch 被 Run 以后再填充。
 	b.initResult(1, 1, notRaw, nil)
 }
 

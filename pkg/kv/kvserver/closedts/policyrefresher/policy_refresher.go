@@ -168,66 +168,96 @@ func (pr *PolicyRefresher) Run(ctx context.Context) {
 // replicas based on the current latency information. It also handles on-demand
 // refresh requests from EnqueueReplicaForRefresh.
 func (pr *PolicyRefresher) run(ctx context.Context) {
+	// configUpdateCh 用来接收 policy refresh interval 配置变化通知，容量为 1 表示合并重复通知。
 	configUpdateCh := make(chan struct{}, 1)
 	// Note that the config channel doesn't subscribe to cluster version
 	// changes. We rely on the relatively short
 	// RangeClosedTimestampPolicyRefreshInterval to ensure timely updates when
 	// cluster version changes occur.
+	// onConfigChange 是 closed timestamp policy 刷新周期的 setting 变更回调。
 	onConfigChange := func(ctx context.Context) {
+		// 非阻塞发送，避免 setting 回调被后台刷新 goroutine 卡住。
 		select {
 		case configUpdateCh <- struct{}{}:
 		default:
 		}
 	}
+	// 注册刷新周期 setting 的变更回调；配置变化后会重置 policyRefresherTimer。
 	closedts.RangeClosedTimestampPolicyRefreshInterval.SetOnChange(&pr.settings.SV, onConfigChange)
 
+	// latencyRefresherConfigUpdateCh 用来接收“节点延迟缓存刷新周期”的配置变化通知。
 	latencyRefresherConfigUpdateCh := make(chan struct{}, 1)
+	// onLatencyRefresherConfigChange 是 latency refresh interval 的 setting 变更回调。
 	onLatencyRefresherConfigChange := func(ctx context.Context) {
+		// 非阻塞发送，多个配置变化可以合并成一次 timer 重置。
 		select {
 		case latencyRefresherConfigUpdateCh <- struct{}{}:
 		default:
 		}
 	}
+	// 注册延迟缓存刷新周期 setting 的变更回调。
 	closedts.RangeClosedTimestampPolicyLatencyRefreshInterval.SetOnChange(&pr.settings.SV, onLatencyRefresherConfigChange)
 
+	// getPolicyRefresh 读取 range closed timestamp policy 的周期性刷新间隔。
 	getPolicyRefresh := func() time.Duration {
 		return closedts.RangeClosedTimestampPolicyRefreshInterval.Get(&pr.settings.SV)
 	}
+	// getLatencyRefresh 读取节点延迟缓存的周期性刷新间隔。
 	getLatencyRefresh := func() time.Duration {
 		return closedts.RangeClosedTimestampPolicyLatencyRefreshInterval.Get(&pr.settings.SV)
 	}
 
+	// policyRefresherTimer 控制“给本节点所有 leaseholder replicas 刷新 policy”的周期。
 	var policyRefresherTimer timeutil.Timer
+	// 启动第一次 policy 刷新定时。
 	policyRefresherTimer.Reset(getPolicyRefresh())
+	// run 退出时停止 timer。
 	defer policyRefresherTimer.Stop()
 
+	// latencyRefresherTimer 控制“刷新节点 RTT 延迟缓存”的周期。
 	var latencyRefresherTimer timeutil.Timer
+	// 启动第一次 latency cache 刷新定时。
 	latencyRefresherTimer.Reset(getLatencyRefresh())
+	// run 退出时停止 timer。
 	defer latencyRefresherTimer.Stop()
 
+	// 后台循环持续处理即时刷新、周期刷新、配置变更和退出信号。
 	for {
+		// 等待任意一个事件发生。
 		select {
 		// Refresh the policy on-demand.
+		// 某些 replica 因为 leaseholder 变化或 span config 变化主动请求刷新 policy。
 		case <-pr.refreshNotificationCh:
+			// 取出并清空待刷新 replicas 列表，然后只刷新这些 replicas。
 			pr.refreshPolicies(pr.detachReplicas())
 
 		// Refresh the policy for ranges with leaseholders on the node.
+		// 周期到期：刷新本节点当前所有 leaseholder replicas 的 closed timestamp policy。
 		case <-policyRefresherTimer.C:
+			// 重置下一次 policy 周期刷新时间。
 			policyRefresherTimer.Reset(getPolicyRefresh())
+			// 获取本节点当前 leaseholder replicas，并基于当前延迟信息刷新它们的 policy。
 			pr.refreshPolicies(pr.getLeaseholderReplicas())
 		case <-configUpdateCh:
+			// policy 刷新周期配置变化：按最新配置重置 timer。
 			policyRefresherTimer.Reset(getPolicyRefresh())
 
 		// Refresh the latency cache.
+		// latency cache 周期到期：刷新本节点观察到的到其它节点的 RTT 延迟缓存。
 		case <-latencyRefresherTimer.C:
+			// 重置下一次 latency cache 刷新时间。
 			latencyRefresherTimer.Reset(getLatencyRefresh())
+			// 从 RPC clock monitor 等来源拉取最新节点延迟，并写入本地缓存。
 			pr.updateLatencyCache()
 		case <-latencyRefresherConfigUpdateCh:
+			// latency 刷新周期配置变化：按最新配置重置 timer。
 			latencyRefresherTimer.Reset(getLatencyRefresh())
 
 		// Stop the for loop.
+		// stopper 进入 quiesce，说明 server 正在关闭，退出后台循环。
 		case <-pr.stopper.ShouldQuiesce():
 			return
+		// 外层 context 被取消，也退出后台循环。
 		case <-ctx.Done():
 			return
 		}

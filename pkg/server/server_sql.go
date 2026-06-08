@@ -1798,27 +1798,44 @@ func (s *SQLServer) preStart(
 
 func (s *SQLServer) startJobScheduler(ctx context.Context, knobs base.TestingKnobs) {
 	// Start scheduled jobs daemon.
+	// 启动 scheduled jobs 后台 daemon；它会周期性扫描 system.scheduled_jobs。
 	jobs.StartJobSchedulerDaemon(
+		// 启动上下文。
 		ctx,
+		// stopper 用来托管后台任务生命周期，server quiesce 时会让 daemon 退出。
 		s.stopper,
+		// metricsRegistry 用来注册 scheduler 和 executor 相关指标。
 		s.metricsRegistry,
+		// JobExecutionConfig 是 scheduled job 执行时需要的依赖集合。
 		&scheduledjobs.JobExecutionConfig{
-			Settings:     s.execCfg.Settings,
-			DB:           s.execCfg.InternalDB,
+			// Settings 提供 scheduler pace、enabled、max jobs 等 cluster settings。
+			Settings: s.execCfg.Settings,
+			// InternalDB 用来读写 system.scheduled_jobs 和 system.jobs。
+			DB: s.execCfg.InternalDB,
+			// 测试 knobs 可以覆盖 scheduler 环境、扫描周期、执行器等。
 			TestingKnobs: knobs.JobsTestingKnobs,
+			// PlanHookMaker 用来为 scheduled job executor 创建 internal planner。
 			PlanHookMaker: func(ctx context.Context, opName redact.SafeString, txn *kv.Txn, user username.SQLUsername) (interface{}, func()) {
 				// This is a hack to get around a Go package dependency cycle. See comment
 				// in sql/jobs/registry.go on planHookMaker.
+				// 这里返回 internal planner 和 cleanup 函数，供 scheduled job 的 SQL 执行器使用。
 				return sql.NewInternalPlanner(
+					// opName 用于 trace/log/statement stats。
 					opName,
+					// 使用 scheduler 当前事务，保证 schedule 更新和 job 创建在同一事务上下文里。
 					txn,
+					// 以 schedule 指定的用户身份执行。
 					user,
+					// internal planner 使用独立的内存指标对象。
 					&sql.MemoryMetrics{},
+					// SQL executor 配置，包含 codec/settings/internal db 等。
 					s.execCfg,
+					// 为 internal planner 创建 internal session data。
 					sql.NewInternalSessionData(ctx, s.execCfg.Settings, opName),
 				)
 			},
 		},
+		// 生产环境使用真实 system.scheduled_jobs/system.jobs 和真实时间。
 		scheduledjobs.ProdJobSchedulerEnv,
 	)
 }

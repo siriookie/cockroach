@@ -244,46 +244,67 @@ func newSenderWithConnFactory(
 // nodeID is the id of the local node. Used to avoid connecting to ourselves.
 // This is not know at construction time.
 func (s *Sender) Run(ctx context.Context, nodeID roachpb.NodeID) {
+	// 记录本节点的 NodeID；后续建立 closed timestamp side transport 连接时会用它避免连接自己。
 	s.nodeID = nodeID
+	// confCh 用来接收 SideTransportCloseInterval 配置变更通知，容量为 1 表示只需要记住“发生过变更”。
 	confCh := make(chan struct{}, 1)
+	// confChanged 是 cluster setting 变更回调；它只负责唤醒后台循环重新读取 interval。
 	confChanged := func(ctx context.Context) {
+		// 非阻塞发送，避免配置频繁变化时回调卡住；如果 channel 已经有通知，说明后台循环迟早会醒来。
 		select {
 		case confCh <- struct{}{}:
 		default:
 		}
 	}
+	// 当 closed timestamp side transport 的关闭时间推进周期发生变化时，触发 confChanged。
 	closedts.SideTransportCloseInterval.SetOnChange(&s.st.SV, confChanged)
 
 	// Set up callback for pacing refresh interval changes.
+	// pacingConfChanged 是 pacing 配置变更回调；pacing 控制发送更新时如何分批/节流。
 	pacingConfChanged := func(ctx context.Context) {
+		// 重新根据最新 settings 更新 buffer 内部的 pacer。
 		s.buf.updatePacer(s.st)
 	}
+	// 当 side transport pacing refresh interval 变化时，刷新发送缓冲区的 pacer。
 	closedts.SideTransportPacingRefreshInterval.SetOnChange(&s.st.SV, pacingConfChanged)
 
+	// 启动 closed timestamp side transport 的 publisher 后台任务。
 	_ /* err */ = s.stopper.RunAsyncTask(ctx, "closedts side-transport publisher",
 		func(ctx context.Context) {
+			// 后台任务退出时关闭 buffer；buffer 关闭会通知所有 side transport 连接退出。
 			defer func() {
 				// Closing the buffer signals all connections to quit.
 				s.buf.Close()
 			}()
 
+			// timer 控制 publish 的周期。
 			var timer timeutil.Timer
+			// 退出 goroutine 时停止 timer，释放 timer 资源。
 			defer timer.Stop()
+			// 周期性推进并发布本节点 leaseholder ranges 的 closed timestamp。
 			for {
+				// 每轮都重新读取配置，确保 setting 变化后能生效。
 				interval := closedts.SideTransportCloseInterval.Get(&s.st.SV)
+				// interval > 0 表示启用 side transport publisher。
 				if interval > 0 {
+					// 设置下一次 publish 的等待时间。
 					timer.Reset(interval)
 				} else {
 					// Disable the side-transport.
+					// interval <= 0 表示禁用 side transport，停止 timer，等待配置变更或 server 退出。
 					timer.Stop()
 				}
+				// 等待 timer 到期、配置变化，或者 server 开始关闭。
 				select {
 				case <-timer.C:
+					// 到达周期点：收集 closed timestamp 更新并发布给其它节点。
 					s.publish(ctx)
 				case <-confCh:
 					// Loop around to use the updated timer.
+					// 配置变化：回到循环开头重新读取 interval 并重置 timer。
 					continue
 				case <-s.stopper.ShouldQuiesce():
+					// server 正在关闭：退出后台任务，defer 会关闭 buffer 并让连接退出。
 					return
 				}
 			}
@@ -340,37 +361,57 @@ func (s *Sender) maxClosedTimestampPolicy() int {
 }
 
 func (s *Sender) publish(ctx context.Context) hlc.ClockTimestamp {
+	// trackedMu 保护 Sender 已经通过 side transport 跟踪的 range 状态。
 	s.trackedMu.Lock()
+	// publish 会读写 tracked map、lastClosed、lastSeqNum 等状态，结束时统一释放锁。
 	defer s.trackedMu.Unlock()
+	// 打 verbose 日志，表示本轮开始生成一条新的 closed timestamp side transport 消息。
 	log.VEventf(ctx, 4, "side-transport generating a new message")
+	// 重置本轮推进 closed timestamp 失败原因的统计。
 	s.trackedMu.closingFailures = [MaxReason]int{}
 	// TODO(wenyihu6): a cluster version check is needed here once we add new
 	// policies to ctpb.RangeClosedTimestampPolicies that do not have a
 	// corresponding roachpb.RangeClosedTimestampPolicy.
+	// 计算当前集群版本下需要发布多少种 closed timestamp policy。
 	numPolicies := s.maxClosedTimestampPolicy()
+	// 为本轮每种 policy 准备一个目标 closed timestamp 记录。
 	s.trackedMu.lastClosed = make(map[ctpb.RangeClosedTimestampPolicy]hlc.Timestamp, numPolicies)
+	// 构造要推送给 follower 节点的 update 消息。
 	msg := &ctpb.Update{
-		NodeID:           s.nodeID,
+		// 标记这条消息来自哪个节点。
+		NodeID: s.nodeID,
+		// 每种 policy 都有一组独立的 closed timestamp 更新。
 		ClosedTimestamps: make([]ctpb.Update_GroupUpdate, numPolicies),
 	}
 
 	// Determine the message's sequence number.
+	// 递增发送序号；receiver 用它判断消息顺序以及是否需要快照。
 	s.trackedMu.lastSeqNum++
+	// 把本轮序号写入消息。
 	msg.SeqNum = s.trackedMu.lastSeqNum
 	// The first message produced is essentially a snapshot, since it has no
 	// previous state to reference.
+	// 第一条消息没有历史状态可依赖，所以标记为 snapshot，让 receiver 按全量状态处理。
 	msg.Snapshot = msg.SeqNum == 1
 
 	// Fix the closed timestamps that will be communicated to by this message.
 	// These timestamps (one per range policy) will apply to all the ranges
 	// included in message.
+	// 读取当前 HLC 时间，作为计算本轮目标 closed timestamp 的基准。
 	now := s.clock.NowAsClockTimestamp()
+	// 读取最大时钟偏移；跨节点 closed timestamp 计算需要考虑时钟不确定性。
 	maxClockOffset := s.clock.MaxOffset()
+	// 读取目标滞后时长，通常表示 closed timestamp 应该落后当前时间多少。
 	lagTargetDuration := closedts.TargetDuration.Get(&s.st.SV)
+	// 读取 global reads 的 lead override，用于对应 policy 下的目标时间计算。
 	leadTargetOverride := closedts.LeadForGlobalReadsOverride.Get(&s.st.SV)
+	// 读取 side transport 推进周期，用于计算目标时间。
 	sideTransportCloseInterval := closedts.SideTransportCloseInterval.Get(&s.st.SV)
+	// 读取 pacing 刷新周期，用于计算带 pacing 的目标时间。
 	sideTransportPacingInterval := closedts.SideTransportPacingRefreshInterval.Get(&s.st.SV)
+	// 为每种 closed timestamp policy 分别计算本轮想要关闭到的时间戳。
 	for pol := ctpb.RangeClosedTimestampPolicy(0); pol < ctpb.RangeClosedTimestampPolicy(numPolicies); pol++ {
+		// 根据当前时间、时钟偏移、配置和 policy 算出目标 closed timestamp。
 		target := closedts.TargetForPolicy(
 			now,
 			maxClockOffset,
@@ -380,9 +421,13 @@ func (s *Sender) publish(ctx context.Context) hlc.ClockTimestamp {
 			sideTransportPacingInterval,
 			pol,
 		)
+		// 记录本轮该 policy 的目标时间，后续 bump 每个 range 时会使用。
 		s.trackedMu.lastClosed[pol] = target
+		// 把该 policy 的目标 closed timestamp 写入消息体。
 		msg.ClosedTimestamps[pol] = ctpb.Update_GroupUpdate{
-			Policy:          pol,
+			// 当前 group 对应的 policy。
+			Policy: pol,
+			// 该 policy 下本轮发布的 closed timestamp。
 			ClosedTimestamp: target,
 		}
 	}
@@ -391,33 +436,47 @@ func (s *Sender) publish(ctx context.Context) hlc.ClockTimestamp {
 	// quickly. We can't hold this mutex while calling into any replicas (and
 	// locking the replica) because replicas call into the Sender and take
 	// leaseholdersMu through Register/UnregisterLeaseholder.
+	// 拷贝 leaseholders map 前先加锁，避免 Register/UnregisterLeaseholder 并发修改。
 	s.leaseholdersMu.Lock()
+	// 创建一份当前 leaseholder 集合的快照，后续遍历这份副本。
 	leaseholders := make(map[roachpb.RangeID]leaseholder, len(s.leaseholdersMu.leaseholders))
+	// 拷贝本节点当前持有 lease 的所有 ranges。
 	for k, v := range s.leaseholdersMu.leaseholders {
 		leaseholders[k] = v
 	}
+	// 快照拷贝完成后立即释放锁，避免后面调用 Replica 方法时形成锁顺序问题。
 	s.leaseholdersMu.Unlock()
 
 	// We'll accumulate all the nodes we need to connect to in order to check if
 	// we need to open new connections or close existing ones.
+	// 记录本轮发现的 follower 所在节点；后面根据它维护 side transport 连接集合。
 	nodesWithFollowers := intsets.MakeFast()
 
 	// If there's any tracked ranges for which we're not the leaseholder any more,
 	// we need to untrack them and tell the connections about it.
+	// 遍历之前已经通过 side transport 跟踪的 ranges。
 	for rid := range s.trackedMu.tracked {
+		// 如果本节点已经不再是这个 range 的 leaseholder，需要通知 receiver 移除它。
 		if _, ok := leaseholders[rid]; !ok {
+			// 把 rangeID 加进 Removed，receiver 收到后会停止按本 Sender 的消息更新该 range。
 			msg.Removed = append(msg.Removed, rid)
+			// 从本地 tracked 集合删除，后续不再认为这个 range 由本节点负责发布。
 			delete(s.trackedMu.tracked, rid)
 		}
 	}
 
 	// Iterate through each leaseholder and determine whether it can be part of
 	// this update or not.
+	// 遍历本节点当前作为 leaseholder 的所有 ranges，尝试推进它们的 side transport closed timestamp。
 	for _, lh := range leaseholders {
+		// 当前 leaseholder replica 对应的 rangeID。
 		lhRangeID := lh.GetRangeID()
+		// 查看这个 range 上一轮是否已经被 side transport 跟踪，以及上次发布的 LAI/policy。
 		lastMsg, tracked := s.trackedMu.tracked[lhRangeID]
 
 		// Check whether the desired timestamp can be closed on this range.
+		// 尝试把当前 range 的 side transport closed timestamp 推进到本轮目标时间。
+		// 这里会检查 lease、LAI、proposal 状态等条件，只有安全时才会返回 OK。
 		closeRes := lh.BumpSideTransportClosed(ctx, now, s.trackedMu.lastClosed)
 
 		// Ensure that we're communicating with all of the range's followers. Note
@@ -425,50 +484,69 @@ func (s *Sender) publish(ctx context.Context) hlc.ClockTimestamp {
 		// current message will include this range; we don't want dynamic conditions
 		// about the activity of this range to dictate the opening and closing of
 		// connections to the other nodes.
+		// 从 range descriptor 中拿到所有 replica 描述。
 		repls := closeRes.Desc.Replicas().Descriptors()
+		// 遍历所有 replica，找出 follower 所在节点。
 		for i := range repls {
 			// We want to track all followers including ones running on the same node
 			// but different store. We want to bump side transport to update followers
 			// even if two replicas are colocated on the same node during rebalancing.
+			// 排除当前 leaseholder 所在 store；其它 store 上的 replica 都需要接收 closed timestamp。
 			if repls[i].StoreID != lh.StoreID() {
+				// 记录 follower 所在 node，后面会确保到这些 node 的连接存在。
 				nodesWithFollowers.Add(int(repls[i].NodeID))
 			}
 		}
 
+		// 如果这个 range 当前不能安全关闭到目标时间，需要记录失败并可能取消跟踪。
 		if !closeRes.OK {
+			// 统计失败原因，供 debug 页面或指标观察。
 			s.trackedMu.closingFailures[closeRes.FailReason]++
 			// We can't close the desired timestamp. If this range was tracked, we
 			// need to un-track it.
+			// 如果之前已经跟踪过该 range，需要通知 receiver 移除，避免 receiver 继续用旧状态隐式推进。
 			if tracked {
+				// 告诉 receiver 这个 range 本轮开始不再由隐式更新维护。
 				msg.Removed = append(msg.Removed, lhRangeID)
+				// 从本地 tracked 集合移除。
 				delete(s.trackedMu.tracked, lhRangeID)
 			}
+			// 当前 range 处理完毕，继续看下一个 leaseholder range。
 			continue
 		}
 
 		// Check whether the range needs to be explicitly updated through the
 		// current message, or if its update can be implicit.
+		// needExplicit 表示本轮消息是否必须显式携带这个 range 的 LAI/policy。
 		needExplicit := false
+		// 如果这个 range 之前没有被跟踪，需要显式加入，receiver 才知道从现在开始可以跟踪它。
 		if !tracked {
 			// If the range was not included in the last message, we need to include
 			// it now to start "tracking" it in the side-transport.
 			needExplicit = true
+			// 如果 LAI 变大，说明 range 有新的 lease-applied index，需要显式发布给 receiver。
 		} else if lastMsg.lai < closeRes.LAI {
 			// If the range's LAI has changed, we need to explicitly publish the new
 			// LAI.
 			needExplicit = true
+			// 如果 closed timestamp policy 变了，也需要显式发布，让 receiver 更新 bookkeeping。
 		} else if lastMsg.policy != closeRes.Policy {
 			// If the policy changed, we need to explicitly publish that; the
 			// receiver will updates its bookkeeping to indicate that this range is
 			// updated through implicit updates for the new policy.
 			needExplicit = true
 		}
+		// 如果需要显式更新，就把 range 的 LAI/policy 放入 AddedOrUpdated。
 		if needExplicit {
 			msg.AddedOrUpdated = append(msg.AddedOrUpdated, ctpb.Update_RangeUpdate{
+				// 被新增或更新的 rangeID。
 				RangeID: lhRangeID,
-				LAI:     closeRes.LAI,
-				Policy:  closeRes.Policy,
+				// 当前 range 可以安全发布到 follower 的 lease-applied index。
+				LAI: closeRes.LAI,
+				// 当前 range 使用的 closed timestamp policy。
+				Policy: closeRes.Policy,
 			})
+			// 更新本地 tracked 状态；后续如果 LAI/policy 不变，可以只靠 group closed timestamp 隐式推进。
 			s.trackedMu.tracked[lhRangeID] = trackedRange{lai: closeRes.LAI, policy: closeRes.Policy}
 		}
 	}
@@ -477,16 +555,23 @@ func (s *Sender) publish(ctx context.Context) hlc.ClockTimestamp {
 	// (because they don't have replicas for any of the ranges with leases on this
 	// node).
 	{
+		// 加锁保护 side transport 连接集合。
 		s.connsMu.Lock()
+		// 遍历当前已有的连接。
 		for nodeID, c := range s.connsMu.conns {
+			// 如果这个 node 已经没有任何 follower 需要接收本节点的 closed timestamp，关闭连接。
 			if !nodesWithFollowers.Contains(int(nodeID)) {
+				// 从连接表删除。
 				delete(s.connsMu.conns, nodeID)
+				// 关闭连接，停止继续向该 node 发送 update。
 				c.close()
 			}
 		}
 
 		// Open connections to any node that needs info from us and is missing a conn.
+		// 遍历本轮需要接收 closed timestamp 的 follower 节点。
 		nodesWithFollowers.ForEach(func(nid int) {
+			// int 转回 NodeID。
 			nodeID := roachpb.NodeID(nid)
 			// We don't need to update leaseholders because timestamps we are closing
 			// are written directly to the sideTransportClosedTimestamp fields of the
@@ -494,20 +579,28 @@ func (s *Sender) publish(ctx context.Context) hlc.ClockTimestamp {
 			// At the same time we can have followers colocated on the same node in
 			// different stores (e.g. during store rebalancing) so we can create
 			// connection to ourselves if we find such replicas.
+			// 如果到这个 node 的连接还不存在，就创建并启动一条连接。
 			if _, ok := s.connsMu.conns[nodeID]; !ok {
+				// 通过 connFactory 创建连接对象；真实实现通常是 RPC stream。
 				c := s.connFactory.new(s, nodeID)
+				// 启动连接后台任务，它会从 s.buf 读取 update 并发给目标 node。
 				c.run(ctx, s.stopper)
+				// 保存连接，下一轮 publish 可以复用。
 				s.connsMu.conns[nodeID] = c
 			}
 		})
+		// 连接集合维护完毕，释放锁。
 		s.connsMu.Unlock()
 	}
 
 	// Publish the new message to all connections.
+	// 记录本轮发布的 closed timestamp 消息内容。
 	log.VEventf(ctx, 4, "side-transport publishing message with closed timestamps: %v (%v)", msg.ClosedTimestamps, msg)
+	// 把消息推入共享 buffer；所有 connection 会从 buffer 看到这条消息并发送给对应 follower node。
 	s.buf.Push(ctx, msg)
 
 	// Return the publication time, for tests.
+	// 返回本轮 publish 使用的 now，主要给测试断言使用。
 	return now
 }
 
