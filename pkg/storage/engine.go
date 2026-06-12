@@ -1590,7 +1590,7 @@ func ScanLocks(
 }
 
 // WriteSyncNoop 的作用：对底层存储引擎执行一次“同步空操作”写入。
-// 
+//
 // 核心逻辑与用途：
 // 1. 为什么叫 No-op（空操作）？
 //    因为它调用了 batch.LogData(nil)，这在 RocksDB/Pebble 等引擎中只会向 WAL（预写日志）
@@ -1995,14 +1995,24 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 	maxLockConflicts int64,
 	targetLockConflictBytes int64,
 ) (needIntentHistory bool, err error) {
+	// 这个函数运行在 read-only batch 已经 pin 住 engine snapshot 之后、
+	// 准备提前释放 latches 之前。它的目标不是读 MVCC 数据，而是先扫
+	// separated lock table，确认这次读不会撞上其它事务留下的 intent。
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 
+	// Get 这类单点读不会设置 EndKey。没有 EndKey 时，下面会使用 prefix
+	// iterator，只扫描 start 这个用户 key 对应的 lock table 前缀。
 	upperBoundUnset := len(end) == 0 // NB: Get requests do not set the end key.
 	if !upperBoundUnset && bytes.Compare(start, end) >= 0 {
+		// Scan/ReverseScan 的用户 key 范围必须是 [start, end)，
+		// start >= end 说明调用方给了非法 span。
 		return true, errors.AssertionFailedf("start key must be less than end key")
 	}
+	// 用户 key 不能直接拿去扫 lock table；lock table 有自己的本地 key 编码。
+	// 对用户范围 [start, end)，对应的 lock table 范围是
+	// [LockTableSingleKey(start), LockTableSingleKey(end))。
 	ltStart, _ := keys.LockTableSingleKey(start, nil)
 	opts := LockTableIteratorOptions{
 		LowerBound: ltStart,
@@ -2017,8 +2027,10 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 		ReadCategory: fs.BatchEvalReadCategory,
 	}
 	if upperBoundUnset {
+		// 单点读：只扫描这个用户 key 下的 lock table entries。
 		opts.Prefix = true
 	} else {
+		// 范围读：把用户 end key 转成 lock table 上界，扫描 [start, end) 内所有锁。
 		ltEnd, _ := keys.LockTableSingleKey(end, nil)
 		opts.UpperBound = ltEnd
 	}
@@ -2036,18 +2048,26 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 
 	var meta enginepb.MVCCMetadata
 	var ok bool
+	// 已经收集到的冲突 intent 的估算字节数，用来避免一次 LockConflictError
+	// 携带过多锁信息，导致响应过大或内存压力过高。
 	intentSize := int64(0)
 	for ok, err = iter.SeekEngineKeyGE(EngineKey{Key: ltStart}); ok; ok, err = iter.NextEngineKey() {
 		if maxLockConflicts != 0 && int64(len(*intents)) >= maxLockConflicts {
 			// Return early if we're done accumulating intents; make no claims about
 			// not needing intent history.
+			// 达到冲突数量上限后提前返回。因为还没扫完整个范围，不能证明后面
+			// 没有自己的 intent，所以保守返回 needsIntentHistory=true。
 			return true /* needsIntentHistory */, nil
 		}
 		if targetLockConflictBytes != 0 && intentSize >= targetLockConflictBytes {
 			// Return early if we're exceed intent byte limits; make no claims about
 			// not needing intent history.
+			// 达到冲突字节预算后也提前返回。同理，扫描没完成时必须保守地要求
+			// 后续 MVCC scan 具备读取 intent history 的能力。
 			return true /* needsIntentHistory */, nil
 		}
+		// Lock table value 存的是 intent/replicated lock 的 MVCCMetadata。
+		// 对 intent 来说，meta.Txn 指向写入这个 provisional value 的事务。
 		err := iter.ValueProto(&meta)
 		if err != nil {
 			return false, err
@@ -2055,6 +2075,9 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 		if meta.Txn == nil {
 			return false, errors.Errorf("intent without transaction")
 		}
+		// 当前事务自己的 intent 不构成锁冲突；事务应该能 read-your-own-write。
+		// 但读取自己的 intent 可能需要 intent history，才能按 sequence number、
+		// epoch、savepoint rollback 等规则读到正确的 provisional value。
 		ownIntent := txnID != uuid.Nil && txnID == meta.Txn.ID
 		if ownIntent {
 			// If we ran into one of our own intents, a corresponding scan over the
@@ -2089,9 +2112,13 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 			needIntentHistory = true
 			continue
 		}
+		// 其它事务的 intent 只有在 intent timestamp <= 本次读 timestamp 时才冲突。
+		// 如果 intent timestamp 更大，本次读在 MVCC 语义下看不到它，可以忽略。
 		if intentConflicts := meta.Timestamp.ToTimestamp().LessEq(ts); !intentConflicts {
 			continue
 		}
+		// 走到这里说明发现了其它事务留下的、当前读必须等待/处理的 intent。
+		// 从 engine key 解码回 LockTableKey，拿到原始用户 key 后构造 roachpb.Intent。
 		key, err := iter.EngineKey()
 		if err != nil {
 			return false, err
@@ -2113,5 +2140,9 @@ func ScanConflictingIntentsForDroppingLatchesEarly(
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	// 扫完整个 lock table 范围后：
+	// - intents 里包含需要上层转成 LockConflictError 的其它事务 intent。
+	// - needIntentHistory 表示后续真正读 MVCC 数据时是否还需要 interleave intents。
+	//   典型场景是当前事务读到了自己的未提交写入。
 	return needIntentHistory, nil /* err */
 }

@@ -1107,20 +1107,30 @@ func (ds *DistSender) getRoutingInfo(
 // verifies batch constraints before splitting.
 func (ds *DistSender) initAndVerifyBatch(ctx context.Context, ba *kvpb.BatchRequest) *kvpb.Error {
 	// Attach the local node ID to each request.
+	// 如果上层没有显式设置 GatewayNodeID，就把当前 DistSender 所在节点写进去。
+	// 这个字段表示请求的 gateway node，后续 tracing、admission、租户计费、
+	// 错误诊断等逻辑都可能用它判断请求从哪个节点发起。
 	if ba.GatewayNodeID == 0 {
 		ba.GatewayNodeID = ds.nodeIDGetter()
 	}
 
 	// Attach a clock reading from the local node to help stabilize HLCs across
 	// the cluster. This is NOT required for correctness.
+	// 把当前节点的 HLC 时间放进 BatchRequest。
+	// 这不是正确性必需条件，但可以帮助集群节点之间传播 HLC，减少时钟不确定性。
 	ba.Now = ds.clock.NowAsClockTimestamp()
 
 	// In the event that timestamp isn't set and read consistency isn't
 	// required, set the timestamp using the local clock.
+	// 如果不是强一致读，并且调用方没有指定 timestamp，就用本地当前时间作为读时间。
+	// 例如 inconsistent/read-uncommitted 这类请求不依赖事务 timestamp，
+	// 但底层仍然需要一个具体 timestamp 去读 MVCC 数据。
 	if ba.ReadConsistency != kvpb.CONSISTENT && ba.Timestamp.IsEmpty() {
 		ba.Timestamp = ba.Now.ToTimestamp()
 	}
 
+	// DistSender 不接受空 batch。
+	// 后面会直接访问 ba.Requests[len-1] 或按请求计算 span，空 batch 没有意义。
 	if len(ba.Requests) < 1 {
 		return kvpb.NewErrorf("empty batch")
 	}
@@ -1128,62 +1138,87 @@ func (ds *DistSender) initAndVerifyBatch(ctx context.Context, ba *kvpb.BatchRequ
 	// Verify that forward and reverse range requests are never in the same
 	// batch. Also verify that the batch with limits contains only specific
 	// requests.
+	// foundForward 记录当前 batch 是否出现过正向 range 请求，比如 Scan/DeleteRange。
 	var foundForward, foundReverse bool
+	// disallowedReq 记录在带 limit 的 batch 里不允许出现的请求类型。
+	// MaxSpanRequestKeys/TargetBytes 这类 limit 只对部分请求有明确定义。
 	var disallowedReq string
 	for _, req := range ba.Requests {
+		// 取出 RequestUnion 里的真实请求类型，用类型判断决定它属于哪一类。
 		inner := req.GetInner()
 		switch inner.(type) {
 		case *kvpb.ScanRequest, *kvpb.ResolveIntentRangeRequest,
 			*kvpb.DeleteRangeRequest, *kvpb.RevertRangeRequest,
 			*kvpb.ExportRequest, *kvpb.QueryLocksRequest, *kvpb.IsSpanEmptyRequest:
 			// Accepted forward range requests.
+			// 正向 range 请求会按 key 从小到大扫描/处理，batch header 不能设置 IsReverse。
 			foundForward = true
 
 		case *kvpb.ReverseScanRequest:
 			// Accepted reverse range requests.
+			// 反向 range 请求会按 key 从大到小扫描，batch header 必须设置 IsReverse。
 			foundReverse = true
 
 		case *kvpb.QueryIntentRequest, *kvpb.EndTxnRequest,
 			*kvpb.GetRequest, *kvpb.ResolveIntentRequest, *kvpb.DeleteRequest, *kvpb.PutRequest:
 			// Accepted point requests that can be in batches with limit. No
 			// need to set disallowedReq.
+			// 这些是点请求，或者可以安全地和带 limit 的 batch 放在一起的请求。
 		case *kvpb.FlushLockTableRequest:
 			// FlushLockTableRequest handles limits itself. It is also an isAlone request so
 			// most of these checks should not be relevant.
+			// FlushLockTableRequest 自己处理 limit，而且通常要求单独成 batch，
+			// 所以这里不把它归到 disallowedReq。
 		default:
+			// 其它请求如果出现在带 limit 的 batch 里，后面会报错。
 			disallowedReq = inner.Method().String()
 		}
 	}
+	// 同一个 batch 不能同时包含正向 range 请求和反向 range 请求。
+	// 因为 DistSender 后续按一个方向做 range 切分和路由，混在一起无法统一处理。
 	if foundForward && foundReverse {
 		return kvpb.NewErrorf("batch contains both forward and reverse requests")
 	}
+	// 如果 batch 设置了 MaxSpanRequestKeys 或 TargetBytes，
+	// 只能包含明确支持 limit 语义的请求；否则 limit 的含义不清楚。
 	if (ba.MaxSpanRequestKeys != 0 || ba.TargetBytes != 0) && disallowedReq != "" {
 		return kvpb.NewErrorf("batch with limit contains %s request", disallowedReq)
 	}
 	// Also verify that IsReverse is set accordingly on the batch header.
+	// 如果实际请求是正向 range 请求，但 header.IsReverse=true，说明调用方构造 batch 错了。
 	if foundForward && ba.Header.IsReverse {
 		return kvpb.NewErrorf("batch contains forward requests but IsReverse is set")
 	}
+	// 如果实际请求是反向 range 请求，但 header.IsReverse=false，也是不一致的。
 	if foundReverse && !ba.Header.IsReverse {
 		return kvpb.NewErrorf("batch contains reverse requests but IsReverse is not set")
 	}
 
+	// 校验 batch 的 WaitPolicy。
+	// WaitPolicy 控制遇到锁冲突时是阻塞、直接报错，还是跳过 locked rows。
 	switch ba.WaitPolicy {
 	case lock.WaitPolicy_Block, lock.WaitPolicy_Error:
 		// Default. All request types supported.
+		// Block/Error 是通用策略，所有请求类型都能支持。
 	case lock.WaitPolicy_SkipLocked:
+		// SkipLocked 只适用于支持“遇到锁就跳过”的请求。
+		// 典型场景是 SELECT ... FOR UPDATE SKIP LOCKED。
 		for _, req := range ba.Requests {
 			inner := req.GetInner()
 			if !kvpb.CanSkipLocked(inner) {
 				switch inner.(type) {
 				case *kvpb.QueryIntentRequest, *kvpb.EndTxnRequest:
 					// Not directly supported, but can be part of the same batch.
+					// QueryIntent/EndTxn 自身不执行 skip locked，
+					// 但它们可能由事务流水线或提交逻辑附带在同一个 batch 里，所以允许出现。
 				default:
+					// 其它不支持 SkipLocked 的请求不能放在 SkipLocked batch 中。
 					return kvpb.NewErrorf("batch with SkipLocked wait policy contains %s request", inner.Method())
 				}
 			}
 		}
 	default:
+		// 未知 WaitPolicy 直接拒绝，避免底层出现未定义行为。
 		return kvpb.NewErrorf("unknown wait policy %s", ba.WaitPolicy)
 	}
 
@@ -1191,11 +1226,17 @@ func (ds *DistSender) initAndVerifyBatch(ctx context.Context, ba *kvpb.BatchRequ
 	//  These labels will be applied to the root context processing the request
 	//  server-side, if the node processing the request is collecting a CPU
 	//  profile with labels.
+	// 把当前 context 上的 pprof labels 复制到 BatchRequest。
+	// 请求到达 leaseholder 后，服务端执行该请求时可以恢复这些 labels，
+	// 这样 CPU profile 能按业务请求、rangefeed、后台任务等标签归因。
 	pprof.ForLabels(ctx, func(key, value string) bool {
+		// labels 以 key/value/key/value 的扁平数组形式存储。
 		ba.ProfileLabels = append(ba.ProfileLabels, key, value)
+		// 返回 true 表示继续遍历后续 labels。
 		return true
 	})
 
+	// 所有初始化和校验都通过，返回 nil 表示 DistSender.Send 可以继续拆分和路由 batch。
 	return nil
 }
 
@@ -1259,26 +1300,43 @@ func unsetCanForwardReadTimestampFlag(ba *kvpb.BatchRequest) {
 func (ds *DistSender) Send(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) (*kvpb.BatchResponse, *kvpb.Error) {
+	// 确保当前调用处于允许 startup retry 的启动上下文中。
+	// DistSender 在启动期可能会参与内部 KV 请求，这里用断言保证调用方遵守启动重试约定。
 	startup.AssertStartupRetry(ctx)
 
+	// 按 batch 类型、请求数量等维度更新 DistSender 侧的统计指标。
 	ds.incrementBatchCounters(ba)
 
+	// 初始化并校验 BatchRequest，例如补齐必要 header、校验请求组合是否合法、
+	// 检查 transaction / consistency / key span 等基础约束。
 	if pErr := ds.initAndVerifyBatch(ctx, ba); pErr != nil {
 		return nil, pErr
 	}
 
+	// 给 context 加上 DistSender 的 log tags，并创建 tracing span。
+	// 后续 range lookup、RPC、重试等都会挂在这个 trace 下面。
 	ctx = ds.AnnotateCtx(ctx)
 	ctx, sp := tracing.ChildSpan(ctx, "dist sender send")
 	defer sp.Finish()
 
 	// Send proxy requests directly through the transport. Any errors are
 	// encoded in the response.
+	// ProxyRangeInfo 不为空表示这是一个 proxy request。
+	// 这类请求已经携带了目标 range/lease 的路由信息，当前节点只是代理转发，
+	// 不在本地做普通 DistSender 的 range cache 路由和重试。
 	if ba.ProxyRangeInfo != nil {
 		return ds.sendProxyRequest(ctx, ba), nil
 	}
 
+	// splitET 表示是否需要把 EndTxn 单独拆成一个 batch part。
+	// retry 过的事务通常要把 EndTxn 拆开，先让普通 writes 铺下 intents，
+	// 再单独提交，避免因为 EndTxn 和其它请求混在一起导致饥饿或提交语义复杂化。
 	splitET := false
+	// require1PC 表示最后一个 EndTxn 强制要求 1PC。
+	// 这种事务不能拆分；一旦拆分就不再满足 1PC 的语义。
 	var require1PC bool
+	// DistSender 只需要看最后一个请求是否为 EndTxn。
+	// 上层会保证 EndTxn 如果存在，应当在 batch 的末尾。
 	lastReq := ba.Requests[len(ba.Requests)-1].GetInner()
 	if et, ok := lastReq.(*kvpb.EndTxnRequest); ok && et.Require1PC {
 		require1PC = true
@@ -1286,17 +1344,31 @@ func (ds *DistSender) Send(
 	// To ensure that we lay down intents to prevent starvation, always
 	// split the end transaction request into its own batch on retries.
 	// Txns requiring 1PC are an exception and should never be split.
+	// Epoch > 0 表示这个事务已经经历过 retry。
+	// retry 后如果继续把 EndTxn 和其它 writes 放在一起，可能一直因为提交阶段被 push/retry，
+	// 导致前面的 writes 也无法先落下 intents，所以这里倾向于拆出 EndTxn。
 	if ba.Txn != nil && ba.Txn.Epoch > 0 && !require1PC {
 		splitET = true
 	}
+	// 按请求类型和 EndTxn 拆分需求，把原始 batch 切成若干合法的 request chunks。
+	// 这里还会处理 refresh span 相关约束：如果 batch 会跨 range 且某些请求需要 refresh，
+	// 就不能允许某个 range 局部前推 read timestamp，避免读到不一致快照。
 	parts := splitBatchAndCheckForRefreshSpans(ba, splitET)
+	// 常见情况只有一个 response chunk，用栈上小数组避免额外分配。
 	var singleRplChunk [1]*kvpb.BatchResponse
 	rplChunks := singleRplChunk[:0:1]
 
+	// onePart 表示原始 batch 没被拆成多个 request chunks。
+	// 如果只有一个 part，就可以复用原始 ba；否则循环里会 shallow copy 再替换 Requests。
 	onePart := len(parts) == 1
+	// errIdxOffset 用来修正错误下标。
+	// 因为原始 batch 被拆成多个 parts 后，每个 part 内部的错误下标都是局部下标，
+	// 返回给上层前必须加上之前 parts 的请求数量，恢复成原始 batch 的全局下标。
 	errIdxOffset := 0
 	for len(parts) > 0 {
 		if !onePart {
+			// 多 part 情况下不能直接改原始 BatchRequest，所以 shallow copy 一份，
+			// 然后只替换当前这一轮要发送的 Requests。
 			ba = ba.ShallowCopy()
 			ba.Requests = parts[0]
 		}
@@ -1304,6 +1376,8 @@ func (ds *DistSender) Send(
 		// Local addressing has already been resolved.
 		// TODO(tschottdorf): consider rudimentary validation of the batch here
 		// (for example, non-range requests with EndKey, or empty key ranges).
+		// 计算当前 part 覆盖的最小 key span。
+		// 后面 divideAndSendBatchToRanges 会根据这个 span 继续按 range 边界切分并路由。
 		rs, err := keys.Range(ba.Requests)
 		if err != nil {
 			return nil, kvpb.NewError(err)
@@ -1311,6 +1385,8 @@ func (ds *DistSender) Send(
 
 		// Determine whether this part of the BatchRequest contains a committing
 		// EndTxn request.
+		// 判断当前 part 是否包含提交型 EndTxn。
+		// withCommit 会影响后续发送策略；withParallelCommit 则进入 parallel commit 专用路径。
 		var withCommit, withParallelCommit bool
 		if etArg, ok := ba.GetArg(kvpb.EndTxn); ok {
 			et := etArg.(*kvpb.EndTxnRequest)
@@ -1321,14 +1397,21 @@ func (ds *DistSender) Send(
 		var rpl *kvpb.BatchResponse
 		var pErr *kvpb.Error
 		if withParallelCommit {
+			// parallel commit 需要特殊处理 STAGING txn record 和 in-flight writes，
+			// 所以走专门的 divideAndSendParallelCommit。
 			rpl, pErr = ds.divideAndSendParallelCommit(ctx, ba, rs, 0 /* batchIdx */)
 		} else {
+			// 普通路径：把当前 part 再按 range 拆分，分别发送到各 range leaseholder，
+			// 必要时并发发送，最后合并这些 range-level responses。
 			rpl, pErr = ds.divideAndSendBatchToRanges(ctx, ba, rs, withCommit, 0 /* batchIdx */)
 		}
 
 		if pErr == errNo1PCTxn {
 			// If we tried to send a single round-trip EndTxn but it looks like
 			// it's going to hit multiple ranges, split it here and try again.
+			// errNo1PCTxn 表示之前尝试把 EndTxn 当作单轮提交发送，
+			// 但实际发现它会跨多个 ranges，无法满足 1PC。
+			// 如果不是强制 Require1PC，就把 EndTxn 拆成单独 part 后重试。
 			if len(parts) != 1 {
 				panic("EndTxn not in last chunk of batch")
 			} else if require1PC {
@@ -1341,35 +1424,48 @@ func (ds *DistSender) Send(
 			continue
 		}
 		if pErr != nil {
+			// 如果底层返回了带请求下标的错误，把 part 内的局部下标修正成原始 batch 下标。
+			// 这样上层看到的错误位置仍然对应它提交进来的 BatchRequest。
 			if pErr.Index != nil && pErr.Index.Index != -1 {
 				pErr.Index.Index += int32(errIdxOffset)
 			}
 			return nil, pErr
 		}
 
+		// 当前 part 成功后，累加它的请求数量，供后续 part 的错误下标修正使用。
 		errIdxOffset += len(ba.Requests)
 
 		// Propagate transaction from last reply to next request. The final
 		// update is taken and put into the response's main header.
+		// 保存当前 part 的 response chunk，稍后统一合并。
 		rplChunks = append(rplChunks, rpl)
 		parts = parts[1:]
 		if len(parts) > 0 {
+			// 把当前 part 返回的最新 txn proto 传给下一个 part。
+			// 例如 timestamp、epoch、priority 等可能在前一个 part 中被推进或更新。
 			ba.UpdateTxn(rpl.Txn)
 		}
 	}
 
 	var reply *kvpb.BatchResponse
 	if len(rplChunks) > 0 {
+		// 用第一个 response chunk 作为合并目标，避免重新构造完整 BatchResponse。
 		reply = rplChunks[0]
 		for _, rpl := range rplChunks[1:] {
+			// 把后续 chunks 的单个请求 responses 按原始请求顺序拼回去。
 			reply.Responses = append(reply.Responses, rpl.Responses...)
+			// trace / tracing span 收集到的 spans 也一起合并。
 			reply.CollectedSpans = append(reply.CollectedSpans, rpl.CollectedSpans...)
 		}
+		// BatchResponse header 使用最后一个 chunk 的 header。
+		// 原因是事务 proto 的最终状态以最后一个 part 为准。
 		lastHeader := rplChunks[len(rplChunks)-1].BatchResponse_Header
+		// 但 CollectedSpans 要使用前面合并后的完整集合。
 		lastHeader.CollectedSpans = reply.CollectedSpans
 		reply.BatchResponse_Header = lastHeader
 	}
 
+	// 返回合并后的完整 response。
 	return reply, nil
 }
 
@@ -1403,13 +1499,23 @@ func (ds *DistSender) Send(
 func (ds *DistSender) sendProxyRequest(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) *kvpb.BatchResponse {
+	// 当前 DistSender 位于 proxy 节点上。
+	// ba.ProxyRangeInfo 里带着原始 gateway 节点看到的 range descriptor 和 leaseholder。
+	// 这里记录 trace，方便排查“请求被哪个 proxy 节点转发到了哪个 leaseholder”。
 	log.VEventf(ctx, 3, "processing a proxy request to %v", ba.ProxyRangeInfo.Lease)
+	// 统计 proxy 节点实际执行转发的次数。
 	ds.metrics.ProxyForwardSentCount.Inc(1)
 	// If the proxy node has a more recent range cache than the client, update
 	// our cache.
+	// 把原始 gateway 携带的 RangeInfo 插入当前 proxy 节点的 range cache。
+	// 如果这份信息比 proxy 节点本地 cache 新，就能顺便更新本地 cache。
+	// 但注意：下面真正路由时不会重新查 proxy 节点自己的 cache，
+	// 而是严格使用 ProxyRangeInfo 里的 leaseholder。
 	ds.rangeCache.Insert(ctx, *ba.ProxyRangeInfo)
 
 	// Use the same connection class as we normally use for this request.
+	// 构造发送选项，连接类型仍然按照这个请求正常会使用的 connection class 来选。
+	// ConnectionClassForKey 会根据 range 起始 key 和请求 header 的 ConnectionClass 决定 RPC 连接池类型。
 	opts := SendOptions{
 		class:   rpcbase.ConnectionClassForKey(ba.ProxyRangeInfo.Desc.RSpan().Key, ba.ConnectionClass),
 		metrics: &ds.metrics,
@@ -1417,15 +1523,24 @@ func (ds *DistSender) sendProxyRequest(
 
 	// We construct a replica slice containing only the leaseholder, since we're
 	// only going to contact this replica and try once.
+	// proxy 转发只联系 ProxyRangeInfo 指定的 leaseholder replica。
+	// 它不会像普通 DistSender 那样遍历多个 replicas、刷新 range cache、再做多轮重试。
 	transport := ds.transportFactory(opts, ReplicaSlice{{ReplicaDescriptor: ba.ProxyRangeInfo.Lease.Replica}})
 	defer transport.Release()
 
+	// 浅拷贝请求，避免直接改调用方传进来的 BatchRequest。
 	requestToSend := ba.ShallowCopy()
+	// 清掉 ProxyRangeInfo，防止请求到达最终 leaseholder 后再次被当成 proxy 请求处理。
+	// 也就是说：proxy 链路只允许一跳代理，不会 n1 -> n2 -> n4 -> n3 这样无限转发。
 	requestToSend.ProxyRangeInfo = nil
+	// transport 里只有 leaseholder 一个 replica，这里取出的就是最终目标 leaseholder。
 	requestToSend.Replica = transport.NextReplica()
 
 	// Determine whether this part of the BatchRequest contains a committing
 	// EndTxn request.
+	// 判断这个请求是否包含 commit 型 EndTxn。
+	// circuit breaker 需要知道请求是否可能是非幂等/提交类请求，
+	// 以便后续发生取消或错误时正确处理歧义。
 	var withCommit bool
 	if etArg, ok := ba.GetArg(kvpb.EndTxn); ok {
 		withCommit = etArg.(*kvpb.EndTxnRequest).Commit
@@ -1435,10 +1550,15 @@ func (ds *DistSender) sendProxyRequest(
 	// cancel if the lease moves and the request has not responded.
 	// NB: The replicaCircuitBreakerToken is ignored since a proxy request is
 	// never evaluated locally.
+	// 给目标 leaseholder replica 建立 circuit breaker tracking。
+	// 如果该 replica 已经被认为不可达，Track 会直接返回 cbErr，避免继续发 RPC。
+	// 如果发送过程中 lease 变化或 circuit breaker 触发，sendCtx 会被取消。
 	sendCtx, cbToken, cbErr := ds.circuitBreakers.
 		ForReplica(&ba.ProxyRangeInfo.Desc, &ba.ProxyRangeInfo.Lease.Replica).
 		Track(ctx, ba, withCommit, crtime.NowMono())
 	if cbErr != nil {
+		// circuit breaker 已经打开，说明当前 proxy 节点认为目标 leaseholder 不可用。
+		// proxy 不在本地重试，直接把失败包装回给原始 gateway。
 		ds.metrics.ProxyForwardErrCount.Inc(1)
 		// Circuit breaker is tripped. Return immediately.
 		log.VEventf(ctx, 2, "failing proxy request for tripped circuit breaker %s", cbErr)
@@ -1447,11 +1567,15 @@ func (ds *DistSender) sendProxyRequest(
 		return reply
 	}
 
+	// 真正执行代理转发：proxy 节点向最终 leaseholder 发送一次请求。
+	// 这里没有普通 DistSender 的 range 切分、cache 刷新、多 replica 重试。
 	br, err := transport.SendNext(sendCtx, requestToSend)
 	log.VEventf(ctx, 3, "proxy result is %v %v", br, err)
 
 	// If the request failed because the circuit breaker tripped, change our
 	// error to the circuit breaker's error.
+	// 结束 circuit breaker tracking。
+	// 如果请求过程中 circuit breaker 触发取消，把返回错误替换成 circuit breaker 的错误。
 	if cancelErr := cbToken.Done(br, err, crtime.NowMono()); cancelErr != nil {
 		log.VEventf(ctx, 2, "failing proxy request after cb cancellation %s", err)
 		br, err = nil, cancelErr
@@ -1461,12 +1585,16 @@ func (ds *DistSender) sendProxyRequest(
 		// Convert the error from an error on the transport to a
 		// ProxyFailedError. This can then be sent over the wire and decoded by
 		// the client.
+		// proxy 转发失败时，不能直接把本地 transport error 当普通 response 返回。
+		// 需要包装成 ProxyFailedError，原始 gateway 收到后会 unwrap，
+		// 再按普通 send error 规则判断是否 retry、是否 ambiguous。
 		ds.metrics.ProxyForwardErrCount.Inc(1)
 		log.VEventf(ctx, 2, "failing proxy request after error %s", err)
 		reply := &kvpb.BatchResponse{}
 		reply.Error = kvpb.NewError(kvpb.NewProxyFailedError(err))
 		return reply
 	}
+	// 转发成功，直接把 leaseholder 返回的 BatchResponse 交回原始 gateway。
 	return br
 }
 

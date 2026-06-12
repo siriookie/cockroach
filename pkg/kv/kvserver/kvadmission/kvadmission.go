@@ -292,11 +292,25 @@ func (n *controllerImpl) AdmitKVWork(
 	rangeTenantID roachpb.TenantID,
 	ba *kvpb.BatchRequest,
 ) (_ Handle, retErr error) {
+	// 如果 kvAdmissionQ 为空，说明当前节点没有启用 KV admission control。
+	// 这种情况下直接放行，返回一个空 Handle；调用方后续调用
+	// AdmittedKVWorkDone 时也不会产生任何结算动作。
 	if n.kvAdmissionQ == nil {
 		return Handle{}, nil
 	}
+	// 根据 BatchRequest 提取 admission 所需的统一信息：
+	// - 该按哪个 tenant 计费/限流。
+	// - 请求优先级是什么。
+	// - 请求创建时间是什么。
+	// - 是否应该绕过 admission 阻塞，但仍可能需要做 token accounting。
 	admissionInfo := workInfoForBatch(n.settings, requestTenantID, rangeTenantID, ba)
+	// Handle 会被返回给调用方，后续：
+	// - AnnotateCtx() 会把 raft/elastic CPU 元数据塞进 ctx。
+	// - AdmittedKVWorkDone() 会根据 Handle 做 CPU/token/write-bytes 结算。
 	ah := Handle{tenantID: admissionInfo.TenantID}
+	// admissionEnabled 表示后续是否还要进入节点级 CPU admission。
+	// 某些 store admission 路径只做一次性 accounting，不需要后续 done 回调，
+	// 这时会把 admissionEnabled 关掉，避免重复 admission。
 	admissionEnabled := true
 	// Don't subject HeartbeatTxnRequest to the storeAdmissionQ. Even though
 	// it would bypass admission, it would consume a slot. When writes are
@@ -304,15 +318,31 @@ func (n *controllerImpl) AdmitKVWork(
 	// all the slots, causing no useful work to happen. We do want useful work
 	// to continue even when throttling since there are often significant
 	// number of tokens available.
+	//
+	// 对写请求先走写入相关的 admission 控制。事务 heartbeat 是特殊请求：
+	// 写入被限流时 heartbeat 数量反而可能变多，如果它们也占 storeAdmissionQ
+	// slot，就可能把真正能推进事务的写请求饿死，所以这里排除掉。
 	if ba.IsWrite() && !ba.IsSingleHeartbeatTxnRequest() {
 		var admitted bool
+		// kvflowcontrol 是 raft replication admission control：
+		// 写请求进入 Raft 前，先检查对应 range 的复制流是否还有 flow tokens。
 		attemptFlowControl := kvflowcontrol.Enabled.Get(&n.settings.SV)
 		if attemptFlowControl && !admissionInfo.BypassAdmission {
+			// 每个 range 会有一个 replication admission handle。
+			// 找不到通常表示这个 range 当前没有可用的 flow-control 状态，
+			// 这里选择不阻塞，直接放行。
+			// 
+			// 这段代码是在问：“当前 node 上有没有这个 range 的 Raft flow-control 控制器？
+			// 如果有，就先等复制流控 token；如果连本地 replica 都找不到，就不要在 admission 层瞎拦，
+			// 直接放过，让后面的 KV 执行路径返回正常的 range/lease 路由错误。”
 			kvflowHandle, found := n.kvflowHandles.LookupReplicationAdmissionHandle(ba.RangeID)
 			if !found {
 				return Handle{}, nil
 			}
 			var err error
+			// 向 range 级 flow control 申请 admission。
+			// admitted=true 表示请求已经通过 raft flow-control admission，
+			// 后面就不需要再走 leaseholder 本地的 storeAdmissionQ。
 			admitted, err = kvflowHandle.Admit(
 				ctx, admissionInfo.Priority, timeutil.FromUnixNanos(admissionInfo.CreateTime))
 			if err != nil {
@@ -323,6 +353,10 @@ func (n *controllerImpl) AdmitKVWork(
 				// deduct tokens from, if the range experiences a split between now
 				// and the point of deduction. That's ok, there's no strong
 				// synchronization needed between these two points.
+				//
+				// 把 admission 元数据放进 Handle，调用方随后会通过
+				// Handle.AnnotateCtx() 写入 ctx，后续 Raft command 编码时会携带这些
+				// 信息，用于真正扣减 replication flow tokens。
 				ah.raftAdmissionMeta = &kvflowcontrolpb.RaftAdmissionMeta{
 					// NOTE: The priority is identical for v1 and v2, a
 					// admissionpb.WorkPriority,  until we encode the command in
@@ -336,32 +370,54 @@ func (n *controllerImpl) AdmitKVWork(
 		}
 		// If flow control is disabled or if work bypasses flow control, we still
 		// subject it above-raft, leaseholder-only IO admission control.
+		//
+		// 如果 raft flow control 没启用，或者这次没有被 flow control admit，
+		// 就退回到 store 级 admission：这是 leaseholder 本地、Raft 之上的
+		// IO/token admission，用来保护本 store 不被写入压力打爆。
 		if !attemptFlowControl || !admitted {
+			// 根据目标 replica 所在 store 找到对应的 store admission queue。
+			// 如果没有队列，说明这个 store 当前不做这层 admission，直接继续。
 			storeAdmissionQ := n.storeGrantCoords.TryGetQueueForStore(ba.Replica.StoreID)
 			if storeAdmissionQ != nil {
 				//  NB: Even though we would know here we're bypassing admission (via
 				//  `bypassAdmission`), we still have to explicitly invoke `.Admit()`.
 				//  We do it for correct token accounting (i.e. we deduct tokens without
 				//  blocking).
+				//
+				// 即使 admissionInfo.BypassAdmission 为 true，也仍然调用 Admit：
+				// bypass 只表示不排队等待，但仍要扣 token/记录 accounting，
+				// 否则 admission 控制器看到的负载会失真。
 				storeWorkHandle, err := storeAdmissionQ.Admit(
 					ctx, admission.StoreWriteWorkInfo{WorkInfo: admissionInfo})
 				if err != nil {
 					return Handle{}, err
 				}
+				// 有些 store admission 路径不要求后续 AdmittedWorkDone 回调。
+				// UseAdmittedWorkDone() 告诉这里是否需要把 handle 保存下来，
+				// 等请求真正执行完后再用写入字节数做结算。
 				admissionEnabled = storeWorkHandle.UseAdmittedWorkDone()
 				if admissionEnabled {
 					defer func() {
 						if retErr != nil {
 							// No bytes were written.
+							// 这里函数使用命名返回值 retErr：
+							// 如果 store admission 已经成功，但后续 CPU admission 又失败，
+							// 实际 KV work 没有执行，需要立刻归还/结算这次 store admission。
 							_ = storeAdmissionQ.AdmittedWorkDone(ah.storeWorkHandle, admission.StoreWorkDoneInfo{})
 						}
 					}()
+					// 保存 store admission 的队列和 handle，供调用方执行完请求后
+					// 调用 AdmittedKVWorkDone() 做最终写入字节数 accounting。
 					ah.storeAdmissionQ, ah.storeWorkHandle = storeAdmissionQ, storeWorkHandle
 				}
 			}
 		}
 	}
 	if admissionEnabled {
+		// 通过写入侧 admission 后，还要进入节点级 CPU admission。
+		// 这里有两套机制：
+		// - elastic CPU：给 export/bulk low priority 这类弹性低优先级工作发 CPU 配额。
+		// - slots-based queue：普通 KV work 通过 slot 控制并发和 CPU accounting。
 		// - Backups generate batches with single export requests, which we
 		//   admit through the elastic CPU work queue. We grant this
 		//   CPU-intensive work a set amount of CPU time and expect it to
@@ -378,6 +434,9 @@ func (n *controllerImpl) AdmitKVWork(
 		//   general (notably, for KV work done on the behalf of row-level TTL
 		//   reads or other jobs). Everything admissionpb.UserLowPri and above uses
 		//   the slots mechanism.
+		//
+		// shouldUseElasticCPU 判断这次请求是否属于“可被弹性调度”的低优先级 CPU work。
+		// 典型例子是备份 ExportRequest，或者内部提交的 BulkLowPri 读请求。
 		shouldUseElasticCPU :=
 			(exportRequestElasticControlEnabled.Get(&n.settings.SV) && ba.IsSingleExportRequest()) ||
 				(admissionInfo.Priority <= admissionpb.BulkLowPri && elasticAdmissionAllLowPri.Get(&n.settings.SV))
@@ -385,8 +444,10 @@ func (n *controllerImpl) AdmitKVWork(
 		if shouldUseElasticCPU {
 			var admitDuration time.Duration
 			if ba.IsSingleExportRequest() {
+				// ExportRequest 通常 CPU 消耗较大，使用专门的 export CPU 配额。
 				admitDuration = elasticCPUDurationPerExportRequest.Get(&n.settings.SV)
 			} else { // isInternalLowPriRead
+				// 其它内部低优先级读请求使用单独的低优先级读 CPU 配额。
 				admitDuration = elasticCPUDurationPerInternalLowPriRead.Get(&n.settings.SV)
 			}
 
@@ -395,21 +456,32 @@ func (n *controllerImpl) AdmitKVWork(
 			// don't do this for the general case of low priority internal
 			// reads, so in some sense, the integration is incomplete. This is
 			// probably harmless.
+			//
+			// 向 elastic CPU 队列申请一段 CPU 时间。
+			// 返回的 elasticWorkHandle 会放进 ctx，底层执行 export/bulk read 时
+			// 可以协作式地检查配额是否用完。
 			elasticWorkHandle, err := n.elasticCPUGrantCoordinator.ElasticCPUWorkQueue.Admit(
 				ctx, admitDuration, admissionInfo,
 			)
 			if err != nil {
 				return Handle{}, err
 			}
+			// 保存 elastic CPU handle，供 AnnotateCtx() 和最终 AdmittedKVWorkDone() 使用。
 			ah.elasticCPUWorkHandle = elasticWorkHandle
 			defer func() {
 				if retErr != nil {
 					// No elastic work was done.
+					// elastic CPU admission 已成功，但后续步骤失败时，实际 work 没执行，
+					// 需要立即结束这次 elastic handle，避免配额一直被认为占用中。
 					n.elasticCPUGrantCoordinator.ElasticCPUWorkQueue.AdmittedWorkDone(ah.elasticCPUWorkHandle)
 				}
 			}()
 		} else {
 			// Use the slots-based mechanism for everything else.
+			//
+			// 普通 KV 请求进入 slots-based admission queue。
+			// 这里可能会排队等待 slot；拿到 slot 后，返回值告诉我们后续是否需要
+			// 调用 AdmittedWorkDone 来归还 slot/记录 CPU 使用量。
 			callAdmittedWorkDoneOnKVAdmissionQ, err := n.kvAdmissionQ.Admit(ctx, admissionInfo)
 			if err != nil {
 				return Handle{}, err
@@ -417,11 +489,18 @@ func (n *controllerImpl) AdmitKVWork(
 			if callAdmittedWorkDoneOnKVAdmissionQ {
 				// We include the time to do other activities like intent resolution,
 				// since it is acceptable to charge them to the tenant.
+				//
+				// 记录当前 goroutine 已消耗 CPU 时间的起点。
+				// 请求完成时会用 grunning.Time() - cpuStart 估算这次 KV work
+				// 应该向 tenant admission accounting 计入多少 CPU。
 				ah.cpuStart = grunning.Time()
 			}
+			// 保存是否需要在 AdmittedKVWorkDone() 中通知 kvAdmissionQ。
 			ah.callAdmittedWorkDoneOnKVAdmissionQ = callAdmittedWorkDoneOnKVAdmissionQ
 		}
 	}
+	// 返回 admission handle。请求真正执行前，调用方会用它 annotate ctx；
+	// 请求执行结束后，调用方必须把它传给 AdmittedKVWorkDone 做收尾 accounting。
 	return ah, nil
 }
 
@@ -646,10 +725,20 @@ func workInfoForBatch(
 	rangeTenantID roachpb.TenantID,
 	ba *kvpb.BatchRequest,
 ) admission.WorkInfo {
+	// 默认按请求发起方的 tenant 计费/限流。
+	// 对 system tenant 的请求，某些场景下会改用 range 所属 tenant，
+	// 这样系统内部工作也能更贴近“谁在消耗这份资源”的语义。
 	bypassAdmission := ba.IsAdmin()
+	// admission source 记录这批请求来自哪里：
+	// - SQL gateway
+	// - 其它来源（比如内部系统请求）
+	// 这个字段会影响后续是否允许 bypass admission。
 	source := ba.AdmissionHeader.Source
 	tenantID := requestTenantID
 	if requestTenantID.IsSystem() {
+		// system tenant 的请求比较特殊：
+		// 如果开启了设置，并且这不是一个显式 bypass 的 admin 请求，
+		// 同时 rangeTenantID 也有效，那么把计费 tenant 切到 range 所属 tenant。
 		if useRangeTenantIDForNonAdminEnabled.Get(&st.SV) && !bypassAdmission &&
 			rangeTenantID.IsSet() {
 			tenantID = rangeTenantID
@@ -659,13 +748,17 @@ func workInfoForBatch(
 		// SystemTenantID.
 	} else {
 		// Request is from a SQL node.
+		// 非 system tenant 的请求，说明它来自 SQL 层，不允许再把它当成
+		// admin 请求来绕过 admission。
 		bypassAdmission = false
 		source = kvpb.AdmissionHeader_FROM_SQL
 	}
+	// AdmissionHeader.Source 为 OTHER 时，表示这是明确不该进入 admission 的请求。
 	if source == kvpb.AdmissionHeader_OTHER {
 		bypassAdmission = true
 	}
 	// TODO(abaptist): Revisit and deprecate this setting in v23.1.
+	// 旧的 bulk-only admission 模式下，普通优先级及以上请求直接绕过 admission。
 	if admission.KVBulkOnlyAdmissionControlEnabled.Get(&st.SV) {
 		if admissionpb.WorkPriority(ba.AdmissionHeader.Priority) >= admissionpb.NormalPri {
 			bypassAdmission = true
@@ -676,6 +769,8 @@ func workInfoForBatch(
 	//
 	// TODO(erikgrinaker): the various bypass conditions here should be moved to
 	// one or more request flags.
+	// LeaseInfo 请求常被 DistSender 用作副本健康探测，不应该因为 admission
+	// 而被延迟，否则连“探活”本身都可能超时。
 	if ba.IsSingleLeaseInfoRequest() {
 		bypassAdmission = true
 	}
@@ -683,8 +778,12 @@ func workInfoForBatch(
 	if !bypassAdmission && createTime == 0 {
 		// TODO(sumeer): revisit this for multi-tenant. Specifically, the SQL use
 		// of zero CreateTime needs to be revisited. It should use high priority.
+		// 如果没有显式的创建时间，并且又不是 bypass 请求，就在这里补一个当前时间。
+		// 这样 admission 控制器可以按请求“年龄”做排序或公平性判断。
 		createTime = timeutil.Now().UnixNano()
 	}
+	// 把 batch header 中的 admission 信息统一整理成 WorkInfo。
+	// 这个结构会被后面的 admission / flow-control / CPU queue 复用。
 	admissionInfo := admission.WorkInfo{
 		TenantID:        tenantID,
 		Priority:        admissionpb.WorkPriority(ba.AdmissionHeader.Priority),

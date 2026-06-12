@@ -205,76 +205,87 @@ func (h *txnHeartbeater) init(
 func (h *txnHeartbeater) SendLocked(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) (*kvpb.BatchResponse, *kvpb.Error) {
+	// 看当前 batch 里有没有 EndTxn。EndTxn 表示事务要 commit/rollback/prepare。
 	etArg, hasET := ba.GetArg(kvpb.EndTxn)
+	// 从当前 batch 中随机找一个会加锁/写 intent 的请求下标。
+	// 如果 batch 完全是只读、非锁请求，这里会返回 -1。
 	randLockingIdx, pErr := h.randLockingIndex(ba)
 	if pErr != nil {
+		// 随机选择 locking request 的过程中发现 batch 不合法，直接返回错误。
 		return nil, pErr
 	}
 	if randLockingIdx != -1 {
-		// If the anchor key for the transaction's txn record is unset, we set it
-		// here to a random key that it's locking in the supplied batch. If it's
-		// already set, however, make sure we keep the anchor key the same.
+		// 当前 batch 会留下锁/intent，说明事务需要一个服务端 txn record。
+		// 如果 txn record 的 anchor key 还没确定，就用这个 batch 里的一个 locking key。
+		// 如果已经确定过，则必须保持不变，因为 txn record 的位置不能在事务中途漂移。
 		if len(h.mu.txn.Key) == 0 {
+			// 取这个 locking request 的 key 作为 txn record 的 anchor key。
 			anchor := ba.Requests[randLockingIdx].GetInner().Header().Key
+			// 更新 TxnCoordSender 本地持有的 txn proto。
 			h.mu.txn.Key = anchor
-			// Put the anchor also in the ba's copy of the txn, since this batch
-			// was prepared before we had an anchor.
+			// 同步更新当前 BatchRequest 上的 txn proto。
+			// 这个 batch 是在设置 anchor key 之前构造的，所以这里要补进去。
 			ba.Txn.Key = anchor
 		}
 
-		// Start the heartbeat loop if it has not already started.
+		// 只要事务开始留下锁/intent，就需要 heartbeat txn record，
+		// 防止事务记录长时间不更新后被其它事务当成过期事务 push/abort。
 		if !h.mu.loopStarted {
+			// 启动后台 heartbeat loop；后续会周期性发送 HeartbeatTxnRequest。
 			h.startHeartbeatLoopLocked(ctx)
 		}
 	}
 
 	if hasET {
+		// EndTxnRequest 可能是 commit，也可能是 rollback。
 		et := etArg.(*kvpb.EndTxnRequest)
 
-		// Preemptively stop the heartbeat loop in case of transaction abort.
-		// In case of transaction commit we don't want to do this because commit
-		// could fail with retryable error and transaction would be restarted
-		// with the next epoch.
+		// 如果是 rollback，先主动停止 heartbeat loop。
+		// 如果是 commit，不能在这里提前停 heartbeat，因为 commit 可能失败并返回 retryable error，
+		// 事务还可能进入下一个 epoch 继续重试。
 		if !et.Commit {
+			// rollback 不需要继续 heartbeat；事务马上要被 abort。
 			h.cancelHeartbeatLoopLocked()
 
-			// If an abortTxnAsyncLocked() rollback is in flight, we'll wait for
-			// its result here to avoid sending a concurrent rollback.
-			// Otherwise, txnLockGatekeeper would error since it does not allow
-			// concurrent requests (to enforce a synchronous client protocol).
+			// 如果之前已经有 abortTxnAsyncLocked() 发起了异步 rollback，
+			// 这里等待那个异步 rollback 的结果，避免再发送一个并发 rollback。
+			// 否则栈底的 txnLockGatekeeper 会因为 root txn 不允许并发请求而报错。
 			if resultC := h.mu.abortTxnAsyncResultC; resultC != nil {
-				// We have to unlock the mutex while waiting, to allow the
-				// txnLockGatekeeper to acquire the mutex when receiving the
-				// async abort response. Once we receive our copy of the
-				// response, we re-acquire the lock to return it to the client.
+				// 等待异步 rollback 结果时必须释放 TxnCoordSender 锁。
+				// 因为异步请求返回时，txnLockGatekeeper 也需要重新拿这把锁。
+				// 拿到异步 rollback 结果后，再重新加锁并把结果返回给当前调用方。
 				h.mu.Unlock()
 				defer h.mu.Lock()
 				select {
 				case res := <-resultC:
+					// 异步 rollback 已经完成，直接复用它的 response/error。
 					return res.br, res.pErr
 				case <-ctx.Done():
+					// 当前调用方不想等了，返回 context 错误。
 					return nil, kvpb.NewError(ctx.Err())
 				}
 			}
 		}
 	}
 
-	// Forward the batch through the wrapped lockedSender, recording the
-	// in-flight request to coordinate with abortTxnAsyncLocked(). Recall that
-	// the mutex is unlocked for the duration of the SendLocked() call.
+	// 把 batch 继续交给下一层 interceptor。
+	// ifReqs 记录当前有多少请求正在下层执行，用来和 abortTxnAsyncLocked() 协调：
+	// 如果 heartbeat 发现事务已经被 abort，它可能要等正在执行的请求结束后再发异步 abort。
+	// 注意：真正发送到下层时，栈底 txnLockGatekeeper 会释放 TxnCoordSender 锁。
 	h.mu.ifReqs++
 	br, pErr := h.wrapped.SendLocked(ctx, ba)
 	h.mu.ifReqs--
 
-	// If an abortTxnAsyncLocked() call is waiting for this in-flight
-	// request to complete, call it. At this point, finalObservedStatus has
-	// already been set, so we don't have to worry about additional incoming
-	// requests (except rollbacks) -- the TxnCoordSender will block them.
+	// 如果有异步 abort 正在等待所有 in-flight 请求结束，并且当前已经没有请求在飞，
+	// 就在这里真正发起 abortTxnAsyncLocked()。
+	// 此时 finalObservedStatus 已经被设置，普通后续请求会被 TxnCoordSender 拦住；
+	// rollback 作为清理请求仍可能被允许。
 	if h.mu.abortTxnAsyncPending && h.mu.ifReqs == 0 {
 		h.abortTxnAsyncLocked(ctx)
 		h.mu.abortTxnAsyncPending = false
 	}
 
+	// 返回下一层 interceptor / DistSender / KVServer 的结果。
 	return br, pErr
 }
 
@@ -314,59 +325,73 @@ func (h *txnHeartbeater) closeLocked() {
 	h.cancelHeartbeatLoopLocked()
 }
 
-// startHeartbeatLoopLocked starts a heartbeat loop in a different goroutine.
+// startHeartbeatLoopLocked 在后台 goroutine 中启动事务 heartbeat loop。
 func (h *txnHeartbeater) startHeartbeatLoopLocked(ctx context.Context) {
 	if h.loopInterval < 0 {
+		// 测试或特殊配置可以把 heartbeat interval 设成负数，表示完全禁用 heartbeat loop。
 		log.KvExec.Infof(ctx, "coordinator heartbeat loop disabled")
 		return
 	}
 	if h.mu.loopStarted {
+		// 一个事务只允许启动一个 heartbeat loop；重复启动说明协调器状态机出错。
 		log.KvExec.Fatal(ctx, "attempting to start a second heartbeat loop")
 	}
+	// 记录 trace/log 事件：即将启动 heartbeat loop。
 	log.VEventf(ctx, 2, kvbase.SpawningHeartbeatLoopMsg)
+	// 标记 heartbeat loop 已经启动过，后续 SendLocked 不会再次启动。
 	h.mu.loopStarted = true
-	// NB: we can't do this in init() because the txn isn't populated yet then
-	// (it's zero).
+	// 不能在 init() 里加这个 log tag，因为 init() 时 txn 还没有填充，是零值。
+	// 这里 txn 已经有 ID，所以可以把短事务 ID 加到日志 tag 中，方便定位 heartbeat 日志。
 	h.AmbientContext.AddLogTag("txn-hb", h.mu.txn.Short())
 
-	// Create a new context so that the heartbeat loop doesn't inherit the
-	// caller's cancelation or span.
+	// 创建新的后台 context，避免 heartbeat loop 继承当前请求的 cancellation 或 tracing span。
+	// 否则一次 SQL/KV 请求结束后，heartbeat loop 可能被错误取消。
 	hbCtx, hbCancel := context.WithCancel(h.AnnotateCtx(context.Background()))
 
-	// If, by the time heartbeatTxnBufferPeriod has passed, this transaction would
-	// be considered expired, then synchronously attempt to heartbeat immediately
-	// before spawning the loop.
+	// 默认第一次 heartbeat 会延迟 loopInterval 后再启动，以减少短事务的后台 goroutine 成本。
+	// 但如果等到 heartbeatTxnBufferPeriod 后事务就会被认为过期，
+	// 那就必须在启动 loop 前同步 heartbeat 一次，避免事务记录被别人当成过期事务处理。
 	heartbeatLoopDelay := h.loopInterval
 	now := h.clock.Now()
 	if txnwait.IsExpired(
 		now.Add(heartbeatTxnBufferPeriod.Nanoseconds(), 0 /* logical */),
 		h.mu.txn,
 	) {
+		// 当前事务离过期太近，马上发送一次 HeartbeatTxnRequest。
 		log.VEventf(ctx, 2, "heartbeating immediately to avoid expiration")
 		h.heartbeatLocked(ctx)
 	} else {
+		// 事务还没接近过期，但可能在正常 loopInterval 到来前就接近过期。
+		// 这里计算距离过期还有多久，用来决定是否提前启动 heartbeat loop。
 		timeUntilExpiry := txnwait.TxnExpiration(h.mu.txn).GoTime().Sub(now.GoTime())
 		if (timeUntilExpiry - heartbeatTxnBufferPeriod) < heartbeatLoopDelay {
+			// 正常 loopInterval 太晚了，提前到“过期前 buffer 时间”启动 heartbeat loop。
 			log.VEventf(ctx, 2, "scheduling heartbeat early to avoid expiration")
 			heartbeatLoopDelay = timeUntilExpiry - heartbeatTxnBufferPeriod
 		}
 	}
-	// Delay spawning the loop goroutine until the first loopInterval passes or
-	// until a defined buffer period prior to expiration (whichever is first) to
-	// avoid the associated cost for small write transactions. In benchmarks,
-	// this gave a 3% throughput increase for point writes at high concurrency.
+	// 延迟启动 heartbeat loop goroutine：
+	// - 要么等到第一个 loopInterval；
+	// - 要么等到事务过期前的 buffer 时间；
+	// 取更早的那个时间点。
+	// 这么做是为了避免短写事务也立刻创建后台 goroutine。
+	// benchmark 显示，在高并发点写场景下，这能提升约 3% 吞吐。
 	timer := time.AfterFunc(heartbeatLoopDelay, func() {
 		const taskName = "kv.TxnCoordSender: heartbeat loop"
 		var span *tracing.Span
+		// 给 heartbeat loop 创建独立 tracing span。
 		hbCtx, span = h.AmbientContext.Tracer.StartSpanCtx(hbCtx, taskName)
 		defer span.Finish()
 
-		// Only errors on quiesce, which is safe to ignore.
+		// 通过 stopper 注册后台任务，保证节点关闭时任务能被统一管理。
+		// RunTask 只会在 stopper quiesce 时返回错误，这里可以忽略。
 		_ = h.stopper.RunTask(hbCtx, taskName, h.heartbeatLoop)
 	})
 
 	h.mu.loopCancel = func() {
+		// 如果 timer 还没触发，停止它，避免 heartbeat loop 被启动。
 		timer.Stop()
+		// 如果 heartbeat loop 已经启动或即将使用 hbCtx，取消这个后台 context。
 		hbCancel()
 	}
 }
@@ -442,97 +467,118 @@ func (h *txnHeartbeater) heartbeat(ctx context.Context) bool {
 	return h.heartbeatLocked(ctx)
 }
 
-// heartbeatLocked sends a HeartbeatTxnRequest to the txn record.
-// Returns true if heartbeating should continue, false if the transaction is no
-// longer Pending and so there's no point in heartbeating further.
+// heartbeatLocked 向事务记录发送 HeartbeatTxnRequest。
+// 返回 true 表示还应该继续 heartbeat；
+// 返回 false 表示事务已经不再是 PENDING，没有必要继续 heartbeat。
 func (h *txnHeartbeater) heartbeatLocked(ctx context.Context) bool {
+	// heartbeat 只对 PENDING 事务有意义。
+	// 其它状态要么已经稳定，要么已经终止。
 	switch h.mu.txn.Status {
 	case roachpb.PENDING:
-		// Continue heartbeating.
+		// PENDING 表示事务仍在运行，继续发送 heartbeat。
 	case roachpb.PREPARED:
-		// If the transaction is prepared, there's no point in heartbeating. The
-		// transaction will remain active without heartbeats until it is committed
-		// or rolled back.
+		// PREPARED 表示事务已经进入两阶段提交的 prepared 状态。
+		// prepared 事务不靠 heartbeat 保活；它会一直保持 active，直到 commit 或 rollback。
 		return false
 	case roachpb.ABORTED:
-		// If the transaction is aborted, there's no point in heartbeating. The
-		// client needs to send a rollback.
+		// ABORTED 表示事务已经被 abort，继续 heartbeat 没有意义。
+		// 客户端后续需要发送 rollback 做清理。
 		return false
 	case roachpb.COMMITTED:
+		// COMMITTED 后 heartbeat loop 应该早就被停止。
+		// 如果还在跑，说明本地状态机没有正确关闭 heartbeat loop。
 		log.KvExec.Fatalf(ctx, "txn committed but heartbeat loop hasn't been signaled to stop: %s", h.mu.txn)
 	default:
+		// 事务状态枚举出现未知值，直接 fatal。
 		log.KvExec.Fatalf(ctx, "unexpected txn status in heartbeat loop: %s", h.mu.txn)
 	}
 
-	// Clone the txn in order to put it in the heartbeat request.
+	// 克隆当前事务 proto，放到 HeartbeatTxnRequest 所属的 BatchRequest 里。
+	// 这样下层发送过程中即使本地 txn 状态变化，也不会直接修改这个请求里的 txn。
 	txn := h.mu.txn.Clone()
 	if txn.Key == nil {
+		// heartbeat 必须知道 txn record anchor key。
+		// 没有 txn.Key 就无法定位 keys.TransactionKey(txn.Key, txn.ID)。
 		log.KvExec.Fatalf(ctx, "attempting to heartbeat txn without anchor key: %v", txn)
 	}
+	// 构造一个只包含 HeartbeatTxnRequest 的 batch。
 	ba := &kvpb.BatchRequest{}
+	// 把事务 proto 放进 batch header，表示这是这个事务自己的 heartbeat。
 	ba.Txn = txn
 	ba.Add(&kvpb.HeartbeatTxnRequest{
 		RequestHeader: kvpb.RequestHeader{
+			// HeartbeatTxnRequest 的 key 必须是 txn.Key，也就是 txn record anchor key。
 			Key: txn.Key,
 		},
+		// 告诉服务端“协调器当前还活着”的时间点。
 		Now: h.clock.Now(),
 	})
 
-	// Send the heartbeat request directly through the gatekeeper interceptor.
-	// See comment on h.gatekeeper for a discussion of why.
+	// heartbeat 直接通过 gatekeeper 发送，而不是从 interceptor 栈顶重新走一遍。
+	// 这样可以避开 seq num、write buffer、pipeliner、committer 等事务请求处理逻辑。
+	// gatekeeper 仍然负责发送期间释放 TxnCoordSender 锁，并调用底层 DistSender。
 	log.VEvent(ctx, 2, "heartbeat")
 	br, pErr := h.gatekeeper.SendLocked(ctx, ba)
 
-	// If the txn is no longer pending, ignore the result of the heartbeat
-	// and tear down the heartbeat loop.
+	// heartbeat RPC 返回时，本地事务可能已经被客户端 commit/rollback 改成非 PENDING。
+	// 如果已经不是 PENDING，就忽略这次 heartbeat 结果，并停止 heartbeat loop。
 	if h.mu.txn.Status != roachpb.PENDING {
 		return false
 	}
 
 	var respTxn *roachpb.Transaction
 	if pErr != nil {
+		// heartbeat 失败。下面只对 TransactionAbortedError 做特殊处理；
+		// 其它错误会从错误里取 txn proto，用于后续判断。
 		log.VEventf(ctx, 2, "heartbeat failed for %s: %s", h.mu.txn, pErr)
 
-		// We need to be prepared here to handle the case of a
-		// TransactionAbortedError with no transaction proto in it.
+		// 这里必须处理一种特殊情况：
+		// TransactionAbortedError 可能没有携带 transaction proto。
 		//
-		// TODO(nvanbenschoten): Make this the only case where we get back an
-		// Aborted txn.
+		// TODO(nvanbenschoten): 后续希望只有这种情况会返回 aborted txn。
 		if _, ok := pErr.GetDetail().(*kvpb.TransactionAbortedError); ok {
-			// Note that it's possible that the txn actually committed but its
-			// record got GC'ed. In that case, aborting won't hurt anyone though,
-			// since all intents have already been resolved.
-			// The only thing we must ascertain is that we don't tell the client
-			// about this error - it will get either a definitive result of
-			// its commit or an ambiguous one and we have nothing to offer that
-			// provides more clarity. We do however prevent it from running more
-			// requests in case it isn't aware that the transaction is over.
+			// 注意：这里也可能是事务其实已经 commit，但 txn record 已经被 GC，
+			// 服务端看不到记录后合成了 aborted 结果。
+			// 这种情况下再发 abort 不会破坏正确性，因为 intents 已经被清理。
+			//
+			// 这里不能把这个 heartbeat 错误直接告诉客户端。
+			// 客户端会通过自己的 commit/rollback 请求拿到确定结果或 ambiguous 结果；
+			// heartbeat 这边没有更清晰的信息可以提供。
+			// 但我们要阻止客户端继续在这个事务上发普通请求。
 			log.VEventf(ctx, 1, "Heartbeat detected aborted txn, cleaning up for %s", h.mu.txn)
+			// 异步发送 rollback，用来清理事务 intent。
 			h.abortTxnAsyncLocked(ctx)
+			// 记录 heartbeat 已经观察到事务最终为 ABORTED。
+			// maybeRejectClientLocked 后续会据此阻止普通请求继续执行。
 			h.mu.finalObservedStatus = roachpb.ABORTED
 			return false
 		}
 
+		// 非 TransactionAbortedError，尝试从错误中取回响应事务 proto。
 		respTxn = pErr.GetTxn()
 	} else {
+		// heartbeat 成功时，响应 header 里会带回服务端看到的事务 proto。
 		respTxn = br.Txn
 	}
 
-	// Tear down the heartbeat loop if the response transaction is finalized.
+	// 如果服务端返回的事务 proto 已经 finalized，说明事务已经结束，
+	// 这里要停止 heartbeat loop。
 	if respTxn != nil && respTxn.Status.IsFinalized() {
 		switch respTxn.Status {
 		case roachpb.COMMITTED:
-			// Shut down the heartbeat loop without doing anything else.
-			// We must have raced with an EndTxn(commit=true).
+			// 事务已经 COMMITTED，直接停 heartbeat loop。
+			// 通常说明 heartbeat 和 EndTxn(commit=true) 并发了，commit 先成功。
 		case roachpb.ABORTED:
-			// Roll back the transaction record to clean up intents and
-			// then shut down the heartbeat loop.
+			// 服务端看到事务已经 ABORTED。
+			// 异步发送 rollback，清理这个事务留下的 intents，然后停止 heartbeat loop。
 			log.VEventf(ctx, 1, "Heartbeat detected aborted txn, cleaning up for %s", h.mu.txn)
 			h.abortTxnAsyncLocked(ctx)
 		}
+		// 记录 heartbeat 观察到的最终状态，供 TxnCoordSender 拒绝后续普通请求。
 		h.mu.finalObservedStatus = respTxn.Status
 		return false
 	}
+	// 服务端仍认为事务是 PENDING，继续下一轮 heartbeat。
 	return true
 }
 
@@ -642,39 +688,50 @@ func (h *txnHeartbeater) abortTxnAsyncLocked(ctx context.Context) {
 	}(asyncCtx)
 }
 
-// randLockingIndex returns the index of the first request that acquires locks
-// in the BatchRequest. Returns -1 if the batch has no intention to acquire
-// locks. It also verifies that if an EndTxnRequest is included, then it is the
-// last request in the batch.
+// randLockingIndex 返回 BatchRequest 中某个会获取锁的请求下标。
+// 如果这个 batch 没有任何会获取锁/写 intent 的请求，则返回 -1。
+// 它还会顺便校验：如果 batch 里包含 EndTxnRequest，那么 EndTxn 必须是最后一个请求。
 func (h *txnHeartbeater) randLockingIndex(ba *kvpb.BatchRequest) (int, *kvpb.Error) {
-	// We don't know the number of locking requests in the supplied batch request,
-	// if any. We'll use reservoir sampling to get a uniform distribution for our
-	// random pick. To do so, we need to keep track of the number of locking
-	// requests we've seen so far and the index of our pick.
+	// 这里事先不知道 batch 里有多少个 locking request。
+	// 为了在只遍历一遍 batch 的情况下，从所有 locking request 中“等概率随机选一个”，
+	// 使用 reservoir sampling：
+	// - numLocking 记录目前已经见过多少个 locking request。
+	// - idx 记录当前被选中的 locking request 下标。
 	numLocking := 0
 	idx := -1
+	// 测试 knob 或 cluster setting 可以关闭随机化。
+	// 关闭后就不做 reservoir sampling，直接选择第一个 locking request。
 	disableRandomization := h.knobs.DisableTxnAnchorKeyRandomization ||
 		!RandomizedTxnAnchorKeyEnabled.Get(&h.st.SV)
+	// 遍历 batch 中的每个请求，寻找会加锁/写 intent 的请求。
 	for i, ru := range ba.Requests {
 		args := ru.GetInner()
 		if i < len(ba.Requests)-1 /* if not last */ {
 			if _, ok := args.(*kvpb.EndTxnRequest); ok {
+				// EndTxn 只能作为 batch 的最后一个请求。
+				// 因为 EndTxn 表示事务结束，后面不应该再跟普通 KV 操作。
 				return -1, kvpb.NewErrorf("%s sent as non-terminal call", args.Method())
 			}
 		}
+		// IsLocking 表示这个请求会获取锁或写 intent。
+		// 这类请求说明事务需要服务端 txn record，也就是 SendLocked 里要设置 anchor key。
 		if kvpb.IsLocking(args) {
 			if disableRandomization {
-				return i, nil // return the index of the first locking request if randomization is disabled
+				// 随机化关闭时，直接返回第一个 locking request 的下标。
+				return i, nil
 			}
+			// 又看到一个 locking request。
 			numLocking++
-			if numLocking == 1 { // fastpath; no need to generate a random number
+			if numLocking == 1 {
+				// 第一个 locking request 必然先成为候选，不需要生成随机数。
 				idx = i
 			} else if randutil.FastUint32()%uint32(numLocking) == 0 {
-				// Reservoir sampling picks a locking request with prob =
-				// 1/numLockingRequestsSeenSoFar.
+				// reservoir sampling：第 N 个 locking request 以 1/N 的概率替换当前候选。
+				// 这样遍历结束后，每个 locking request 被选中的概率都是 1/总数。
 				idx = i
 			}
 		}
 	}
+	// 没有 locking request 时 idx 仍是 -1；否则返回被选中的 locking request 下标。
 	return idx, nil
 }

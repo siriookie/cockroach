@@ -475,34 +475,52 @@ func generateTxnDeadlineExceededErr(txn *roachpb.Transaction, deadline hlc.Times
 func (tc *TxnCoordSender) finalizeNonLockingTxnLocked(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) *kvpb.Error {
+	// 这个快路径只会在 Send 发现 batch 是单独 EndTxn，且事务没有锁/intent/buffered writes 时调用。
+	// 因此这里直接取第一个请求里的 EndTxn，不需要再拆 batch。
 	et := ba.Requests[0].GetEndTxn()
+	// commit=true 表示客户端想提交这个 read-only / non-locking 事务。
 	if et.Commit {
+		// EndTxn 可能携带 commit deadline；如果当前事务写时间戳已经超过 deadline，
+		// 即使没有真正发送 EndTxn，也必须模拟出和正常提交路径一致的 retryable error。
 		deadline := et.Deadline
 		if !deadline.IsEmpty() && deadline.LessEq(tc.mu.txn.WriteTimestamp) {
+			// 克隆当前 txn proto，避免后续错误处理修改共享状态。
 			txn := tc.mu.txn.Clone()
+			// 构造“commit deadline exceeded”的事务重试错误。
 			pErr := generateTxnDeadlineExceededErr(txn, deadline)
 			// We need to bump the epoch and transform this retriable error.
+			// updateStateLocked 需要从 ba.Txn 里看到对应 txn，才能按普通 retryable error 路径更新状态。
 			ba.Txn = txn
 			return tc.updateStateLocked(ctx, ba, nil /* br */, pErr)
 		}
+		// 记录 read-only commit 指标；这个事务没有写入/锁，所以可以本地提交。
 		tc.interceptorAlloc.txnMetricRecorder.setReadOnlyCommit()
+		// prepare=true 表示两阶段提交的 prepare 阶段。
 		if et.Prepare {
+			// non-locking 事务 prepare 成功后进入 PREPARED 状态。
 			tc.mu.txn.Status = roachpb.PREPARED
+			// 标记 TxnCoordSender 为 prepared，并清理 interceptors。
 			tc.markTxnPreparedLocked(ctx)
 		} else {
 			// Mark the transaction as committed so that, in case this commit is done
 			// by the closure passed to db.Txn()), db.Txn() doesn't attempt to commit
 			// again. Also, so that the correct metric gets incremented.
+			// 普通提交：本地把 txn proto 标记为 COMMITTED。
 			tc.mu.txn.Status = roachpb.COMMITTED
+			// 标记客户端侧事务已经 finalized，并关闭 heartbeat/interceptor 等本地资源。
 			tc.finalizeAndCleanupTxnLocked(ctx)
 		}
+		// 即使是本地 read-only commit，也要执行 commit-wait，维护外部一致性语义。
 		if err := tc.maybeCommitWait(ctx, false /* deferred */); err != nil {
 			return kvpb.NewError(err)
 		}
 	} else {
+		// commit=false 表示 rollback。non-locking 事务没有服务端事务记录或 intent 要清理，
+		// 所以本地标记 ABORTED 并 finalize 即可。
 		tc.mu.txn.Status = roachpb.ABORTED
 		tc.finalizeAndCleanupTxnLocked(ctx)
 	}
+	// 本地 finalize 成功，不需要返回 KV 错误。
 	return nil
 }
 
@@ -573,7 +591,22 @@ func (tc *TxnCoordSender) Send(
 	}
 
 	// 如果事务启用了 stepping，这里可能在发送前自动推进读时间戳。
-	if tc.shouldStepReadTimestampLocked() {
+	// if txn 是 ReadCommitted && txn.ReadTimestamp 没被固定 {
+//     如果是 root txn，并且不是手动 stepping 模式 {
+//         txn.ReadTimestamp = max(txn.ReadTimestamp, clock.Now())
+//         清空 refresh spans
+//     }
+// }
+	// 
+	// if T1 第二次 SELECT
+ //  -> SQL 层构造 KV BatchRequest
+ //  -> 调 TxnCoordSender.Send(ctx, ba)
+ //  -> 走到你圈的这两行
+ //  -> 把 tc.mu.txn.ReadTimestamp 从旧时间推进到 now()
+ //  -> 后面 ba.Txn = tc.mu.txn.Clone()
+ //  -> 这个新的 read timestamp 被带到 leaseholder
+ //  -> leaseholder 按这个新时间戳读 MVCC 数据
+tc.shouldStepReadTimestampLocked() {
 		tc.maybeAutoStepReadTimestampLocked()
 	}
 
@@ -777,7 +810,11 @@ func (tc *TxnCoordSender) maybeRejectIncompatibleRequest(
 func (tc *TxnCoordSender) maybeRejectClientLocked(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) *kvpb.Error {
+	// 判断当前 batch 是否是单独的 rollback，也就是 EndTxn(commit=false)。
+	// rollback 是清理事务资源的请求，后面会作为特殊情况放行。
 	rollback := ba != nil && ba.IsSingleAbortTxnRequest()
+	// 只要事务还没有被明确知道已经 COMMITTED，就允许 rollback 继续发送。
+	// 即使事务已经进入错误/终止状态，rollback 也可能是上层最后的清理动作。
 	if rollback && tc.mu.txn.Status != roachpb.COMMITTED {
 		// As a special case, we allow rollbacks to be sent at any time. Any
 		// rollback attempt moves the TxnCoordSender state to txnFinalized, but higher
@@ -792,23 +829,31 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 	}
 
 	// Check the transaction coordinator state.
+	// 先检查 TxnCoordSender 自己的客户端侧状态机。
 	switch tc.mu.txnState {
 	case txnPending:
 		// All good.
+		// 正常进行中的事务，可以继续发送请求。
 	case txnRetryableError:
+		// 事务已经遇到 retryable error，在 PrepareForRetry/ClearRetryableErr 之前不能继续发请求。
+		// 继续发送只会把保存的 retry error 返回给客户端。
 		return kvpb.NewError(tc.mu.storedRetryableErr)
 	case txnError:
+		// 事务遇到不可重试错误，普通请求不允许继续。
 		return tc.mu.storedErr
 	case txnPrepared:
+		// prepared 状态只允许 EndTxn 继续完成 commit/rollback，不能再发普通读写。
 		endTxn := ba != nil && ba.IsSingleEndTxnRequest()
 		if endTxn {
 			return nil
 		}
+		// prepared 后还发普通请求，说明客户端状态机用错了，返回 TransactionStatusError。
 		msg := redact.Sprintf("client already prepared the transaction. "+
 			"Trying to execute: %s", ba.Summary())
 		reason := kvpb.TransactionStatusError_REASON_UNKNOWN
 		return kvpb.NewErrorWithTxn(kvpb.NewTransactionStatusError(reason, msg), &tc.mu.txn)
 	case txnFinalized:
+		// finalized 表示客户端已经 commit 或 rollback 过了，后续普通请求都应该被拒绝。
 		msg := redact.Sprintf("client already committed or rolled back the transaction. "+
 			"Trying to execute: %s", ba.Summary())
 		if !rollback {
@@ -819,6 +864,7 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 			log.KvExec.Errorf(ctx, "%s. stack:\n%s", msg, stack)
 		}
 		reason := kvpb.TransactionStatusError_REASON_UNKNOWN
+		// 如果本地 txn proto 已经是 COMMITTED，用更精确的 reason 告诉调用方事务已提交。
 		if tc.mu.txn.Status == roachpb.COMMITTED {
 			reason = kvpb.TransactionStatusError_REASON_TXN_COMMITTED
 		}
@@ -827,27 +873,35 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 
 	// Check the transaction proto state, along with any finalized transaction
 	// status observed by the transaction heartbeat loop.
+	// 再检查事务 proto 自身状态，以及 heartbeat 线程从事务记录里观察到的最终状态。
 	protoStatus := tc.mu.txn.Status
 	hbObservedStatus := tc.interceptorAlloc.txnHeartbeater.mu.finalObservedStatus
 	switch {
 	case protoStatus == roachpb.ABORTED:
 		// The transaction was rolled back synchronously.
+		// 本地 proto 已经 ABORTED，说明事务不能继续；下面统一转成 retryable error。
 		fallthrough
 	case protoStatus != roachpb.COMMITTED && hbObservedStatus == roachpb.ABORTED:
 		// The transaction heartbeat observed an aborted transaction record and
 		// this was not due to a synchronous transaction commit and transaction
 		// record garbage collection.
 		// See the comment on txnHeartbeater.mu.finalObservedStatus for more details.
+		// heartbeat 发现事务记录已经 ABORTED，把它包装成 TransactionAbortedError，
+		// 再交给 handleRetryableErrLocked 转成上层能处理的 retryable error。
 		abortedErr := kvpb.NewErrorWithTxn(
 			kvpb.NewTransactionAbortedError(kvpb.ABORT_REASON_CLIENT_REJECT), &tc.mu.txn)
 		return kvpb.NewError(tc.handleRetryableErrLocked(ctx, abortedErr))
 	case protoStatus != roachpb.PENDING || hbObservedStatus != roachpb.PENDING:
 		// The transaction proto is in an unexpected state.
+		// 正常继续发送请求时，proto 和 heartbeat 观察状态都应该还是 PENDING。
+		// 如果出现其它组合，说明事务状态机不一致，直接返回错误。
 		return kvpb.NewErrorf(
 			"unexpected txn state: %s; heartbeat observed status: %s", tc.mu.txn, hbObservedStatus)
 	default:
 		// All good.
+		// proto 和 heartbeat 都显示事务仍处于 PENDING，可以继续发送。
 	}
+	// 所有检查通过，不拒绝当前请求。
 	return nil
 }
 
@@ -1004,85 +1058,85 @@ func (tc *TxnCoordSender) handleTransactionRetryWithProtoRefreshErrorErrLocked(
 	}
 }
 
-// updateStateLocked updates the transaction state in both the success and error
-// cases. It also updates retryable errors with the updated transaction for use
-// by client restarts.
+// updateStateLocked 在请求成功和请求失败两种情况下更新本地事务状态。
+// 如果遇到 retryable error，它也会把错误中的事务 proto 更新好，供客户端重启事务时使用。
 func (tc *TxnCoordSender) updateStateLocked(
 	ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse, pErr *kvpb.Error,
 ) *kvpb.Error {
 
-	// We handle a couple of different cases:
-	// 1) A successful response. If that response carries a transaction proto,
-	// we'll use it to update our proto.
-	// 2) A non-retriable error. We move to the txnError state and we cleanup. If
-	// the error carries a transaction in it, we update our proto with it
-	// (although Andrei doesn't know if that serves any purpose).
-	// 3) A retriable error. We "handle" it, in the sense that we call
-	// handleRetryableErrLocked() to transform the error. If the error instructs
-	// the client to start a new transaction (i.e. TransactionAbortedError), then
-	// the current transaction is automatically rolled-back. Otherwise, we update
-	// our proto for a new epoch.
-	// NOTE: We'd love to move to state txnError in case of new error but alas
-	// with the current interface we can't: there's no way for the client to ack
-	// the receipt of the error and control the switching to the new epoch. This
-	// is a major problem of the current txn interface - it means that concurrent
-	// users of a txn might operate at the wrong epoch if they race with the
-	// receipt of such an error.
+	// 这里主要处理三种情况：
+	// 1. 请求成功：如果响应里带了事务 proto，就用它刷新本地事务 proto。
+	// 2. 不可重试错误：把事务推进到 txnError 状态并做清理。如果错误里带了事务 proto，
+	//    也用它刷新本地事务 proto。
+	// 3. 可重试错误：调用 handleRetryableErrLocked() 转换错误。如果错误要求客户端
+	//    启动一个全新的事务，比如 TransactionAbortedError，当前事务会被自动 rollback。
+	//    否则，本地事务 proto 会被更新到新的 epoch，准备给下一轮重试使用。
+	//
+	// 注意：遇到新的 retryable error 时，理想上也许可以先进入 txnError，等客户端确认
+	// 收到错误后再切换到新 epoch。但当前事务接口没有这个 ack 机制，所以不能这么做。
+	// 这也是当前 txn 接口的一个限制：如果多个 goroutine 并发使用同一个事务，其中一个
+	// goroutine 收到 retryable error 并切换 epoch，另一个 goroutine 可能还在旧 epoch 上操作。
 
+	// 没有错误，说明底层 KV 请求成功；直接把响应里的事务状态合并到本地事务状态。
 	if pErr == nil {
 		tc.mu.txn.Update(br.Txn)
 		return nil
 	}
 
+	// TransactionRestart != NONE 表示这是事务可重试错误，比如时间戳被 push、
+	// 事务被 abort、读写冲突导致需要重跑等。
 	if pErr.TransactionRestart() != kvpb.TransactionRestart_NONE {
 		if tc.typ == kv.LeafTxn {
-			// Leaves handle retriable errors differently than roots. The leaf
-			// transaction is not supposed to be used any more after a retriable
-			// error. Separately, the error needs to make its way back to the root.
+			// leaf txn 和 root txn 处理 retryable error 的方式不同。
+			// leaf txn 遇到 retryable error 后不能再继续使用；这个错误还必须返回 root，
+			// 由 root txn 决定整个分布式 SQL 事务如何重试。
 
-			// From now on, clients will get this error whenever they Send(). We want
-			// clients to get the same retriable error so we don't wrap it in
-			// TxnAlreadyEncounteredErrorError as we do elsewhere.
+			// 从现在开始，客户端再调用 Send() 都会拿到这个原始 retryable error。
+			// 这里故意不把它包成 TxnAlreadyEncounteredErrorError，因为 root 需要看到
+			// 同一个 retryable error，才能走正确的重试路径。
 			tc.mu.txnState = txnError
 			tc.mu.storedErr = pErr
 
-			// Cleanup.
+			// leaf txn 已经不能继续用，先用错误里的 txn 刷新本地 proto，然后清理本地资源。
 			tc.mu.txn.Update(pErr.GetTxn())
 			tc.cleanupTxnLocked(ctx)
 			return pErr
 		}
 
+		// root txn 的 retryable error 必须属于当前 batch 的事务。
 		txnID := ba.Txn.ID
-		errTxnID := pErr.GetTxn().ID // The ID of the txn that needs to be restarted.
+		errTxnID := pErr.GetTxn().ID // 需要重启的事务 ID。
 		if errTxnID != txnID {
-			// KV should not return errors for transactions other than the one in
-			// the BatchRequest.
+			// KV 不应该返回属于其它事务的错误；如果发生，说明底层状态已经不一致。
 			log.KvExec.Fatalf(ctx, "retryable error for the wrong txn. ba.Txn: %s. pErr: %s",
 				ba.Txn, pErr)
 		}
+		// 交给 handleRetryableErrLocked 更新事务状态机，并把底层错误转换成客户端可处理的形式。
 		return kvpb.NewError(tc.handleRetryableErrLocked(ctx, pErr))
 	}
 
-	// This is the non-retriable error case.
+	// 走到这里说明是不可重试错误。
 
-	// Most errors cause the transaction to not accept further requests (except a
-	// rollback), but some errors are safe to allow continuing (in particular
-	// ConditionFailedError). In particular, SQL can recover by rolling back to a
-	// savepoint.
+	// 大多数不可重试错误会让事务不再接受后续请求，rollback 除外。
+	// 但有些错误是明确、无歧义的，事务可以继续使用；典型例子是 ConditionFailedError。
+	// SQL 层可以通过回滚到 savepoint 来恢复这类错误。
 	if kvpb.ErrPriority(pErr.GoError()) != kvpb.ErrorScoreUnambiguousError {
+		// 错误不是“明确无歧义”的，就把事务切到 txnError。
+		// 后续普通请求会收到 TxnAlreadyEncounteredErrorError，提醒客户端事务已经出过错。
 		tc.mu.txnState = txnError
 		tc.mu.storedErr = kvpb.NewError(&kvpb.TxnAlreadyEncounteredErrorError{
 			PrevError: redact.Sprintf("%v", pErr),
 		})
 	}
 
-	// Update our transaction with any information the error has.
+	// 如果错误里带有事务 proto，先做一致性检查，再用它刷新本地事务状态。
 	if errTxn := pErr.GetTxn(); errTxn != nil {
 		if err := sanityCheckErrWithTxn(ctx, pErr, ba, &tc.testingKnobs); err != nil {
 			return kvpb.NewError(err)
 		}
 		tc.mu.txn.Update(errTxn)
 	}
+	// 返回原始不可重试错误，让上层看到真实失败原因。
 	return pErr
 }
 
@@ -1749,6 +1803,15 @@ func (tc *TxnCoordSender) hasBufferedWritesLocked() bool {
 	return tc.interceptorAlloc.txnWriteBuffer.hasBufferedWrites()
 }
 
+//hasAcquiredLocksOrBufferedWritesLocked()
+// 用来判断事务是不是“真的在 KV 层留下东西了”。
+
+// 没有留下东西：
+//   read-only/non-locking txn，可以本地快速结束。
+
+// 留下了东西：
+//
+//	必须发送 EndTxn，让 KV 层提交或清理。
 func (tc *TxnCoordSender) hasAcquiredLocksOrBufferedWritesLocked() bool {
 	return tc.interceptorAlloc.txnPipeliner.hasAcquiredLocks() || tc.interceptorAlloc.txnWriteBuffer.hasBufferedWrites()
 }

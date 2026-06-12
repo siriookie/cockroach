@@ -2071,6 +2071,8 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 	ctx context.Context, ba *kvpb.BatchRequest, g *concurrency.Guard,
 ) (kvserverpb.LeaseStatus, error) {
+	// 从 BatchRequest 中计算这批请求覆盖的整体 RSpan。
+	// 后面会用它检查请求是否完全落在当前 Replica 的 RangeDescriptor 边界内。
 	rSpan, err := keys.Range(ba.Requests)
 	if err != nil {
 		return kvserverpb.LeaseStatus{}, err
@@ -2081,12 +2083,17 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 	// to handle this case particularly well, but if we do reach here (as some
 	// tests that call directly into Replica.Send have), it's better to return
 	// an error than to panic in checkSpanInRangeRLocked.
+	// 先确认 Replica 已经初始化。正常路径 Store.Send 前面已经检查过，
+	// 但有些测试会直接调用 Replica.Send，所以这里再防御性检查一次。
 	if !r.IsInitialized() {
 		return kvserverpb.LeaseStatus{}, errors.Errorf("%s not initialized", r)
 	}
 
+	// 加读锁读取 Replica 当前内存状态。
+	// 这里只短暂持锁，把后面检查需要的状态复制出来，减少 r.mu 的竞争。
 	r.mu.RLock()
 	// Is the replica destroyed?
+	// 如果 Replica 已经被销毁，例如 merge 后 RHS 被移除，就不能继续服务请求。
 	if _, err := r.isDestroyedRLocked(); err != nil {
 		r.mu.RUnlock()
 		return kvserverpb.LeaseStatus{}, err
@@ -2094,15 +2101,25 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 
 	// In order to reduce replica mutex contention, we take everything we need
 	// from the replica while we hold the RLock and then release it.
+	// 复制 RangeDescriptor，用于后面做 span 边界检查和 lease 检查。
 	desc := r.descRLocked()
+	// 记录当前 range 是否处于 merge critical phase。
 	mergeInProgress := r.mergeInProgressRLocked()
+	// 如果正在 merge，保存 merge transaction ID，用于后面判断某些 Refresh 是否属于该 merge txn。
 	mergeTxnID := r.mu.mergeTxnID
+	// minLeaseProposedTS 用来判断当前 lease 是否已经安全到可以服务请求。
 	minLeaseProposedTS := r.mu.minLeaseProposedTS
+	// minValidObservedTimestamp 用来避免使用过旧 observed timestamp 服务请求。
 	minValidObservedTimestamp := r.mu.minValidObservedTimestamp
+	// 读取 raft basic status，lease 检查里会用它判断 replica/raft 活跃状态。
 	raftBasicStatus := r.raftBasicStatusRLocked()
+	// 当前内存中的 lease。
 	lease := r.shMu.state.Lease
+	// lease applied index，用于 follower read / lease 相关检查。
 	lai := r.shMu.state.LeaseAppliedIndex
+	// raft closed timestamp，用于判断某些 follower read 是否能在非 leaseholder 上服务。
 	closedTS := r.shMu.state.RaftClosedTimestamp
+	// 释放 r.mu，后续检查基于上面复制出来的一致状态快照进行。
 	r.mu.RUnlock()
 
 	// Is the request fully contained in the range?
@@ -2110,11 +2127,17 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 	// at evaluation time, not at application time, because the spanlatch manager
 	// will synchronize all requests (notably EndTxn with SplitTrigger) that may
 	// cause this condition to change.
+	// 取当前缓存的 closed timestamp policy，RangeKeyMismatchError 会把它带给客户端，
+	// 帮助客户端了解这个 range 的 closed timestamp 语义。
 	cachedClosedTimestampPolicy := *r.cachedClosedTimestampPolicy.Load()
+	// 检查请求 key span 是否完全属于当前 range。
+	// 如果请求跨了 range 边界，返回 RangeKeyMismatch，让 DistSender 刷新 range cache 并重新切分路由。
 	if err := checkSpanInRange(ctx, rSpan, desc, lease, cachedClosedTimestampPolicy); err != nil {
 		return kvserverpb.LeaseStatus{}, err
 	}
 
+	// 检查当前 Replica 是否能按 lease 规则服务这个 batch。
+	// 普通一致读/写通常必须由 leaseholder 服务；某些 follower read 或跳过 lease 检查的请求可以例外。
 	st, err := r.checkLease(ctx, ba, desc, minLeaseProposedTS, minValidObservedTimestamp,
 		lease, raftBasicStatus, lai, closedTS)
 	if err != nil {
@@ -2126,6 +2149,8 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 	// Tests such as TestClosedTimestampFrozenAfterSubsumption also rely on this late-checking of
 	// merges by checking for a NotLeaseholderError on replicas in a critical phase for certain
 	// requests.
+	// 最后再检查 pending merge。
+	// 这样如果请求本来就因为 lease / range 边界不能由当前 replica 服务，会先返回更准确的错误。
 	if mergeInProgress && g.HoldingLatches() {
 		// We only check for a merge if we are holding latches. In practice,
 		// this means that any request where concurrency.shouldAcquireLatches()
@@ -2143,65 +2168,98 @@ func (r *Replica) checkExecutionCanProceedBeforeStorageSnapshot(
 		// [1a]: see batcheval.declareKeysSubsume.
 		// [1b]: see batcheval.Subsume.
 		// [2]: see leasePostApply.
+		//
+		// 中文总结：
+		// 只有已经持有 latches 的请求才在这里等待 pending merge。
+		// 因为 latches 能保证我们没有和 Subsume / merge critical phase 的状态切换并发错过。
+		// 没有拿 latches 的特殊请求，比如 RequestLease，会在自己的路径里承担后续检查。
 		if err := shouldWaitForPendingMerge(ctx, ba, desc, mergeInProgress, mergeTxnID); err != nil {
 			// TODO(nvanbenschoten): we should still be able to serve reads
 			// below the closed timestamp in this case.
+			// 正常普通请求在 RHS range merge 期间不能继续执行，返回错误让外层等待/重试。
 			return kvserverpb.LeaseStatus{}, err
 		}
 	}
 
+	// 返回 lease status。
+	// 非零且 VALID 通常表示当前 replica 是 leaseholder；
+	// 零值可能表示请求被允许跳过 lease 检查或通过 follower read 服务。
 	return st, nil
 }
 
-// checkExecutionCanProceedAfterStorageSnapshot returns an error if a batch
-// request cannot be executed by the Replica. For read-only requests, this
-// method is called after the state of the storage engine is pinned via an
-// iterator. An error indicates that the request's timestamp is below the
-// Replica's GC threshold.
+// checkExecutionCanProceedAfterStorageSnapshot 在 storage engine 已经被 pin
+// 之后做第二轮检查。对于只读请求，这是在 PinEngineStateForIterators 之后调用的。
+//
+// 它做了两件事：
+//
+//  1. 再次校验请求 key 范围是否在 range 边界内。
+//     第一次校验已经在 checkExecutionCanProceedBeforeStorageSnapshot 做过，
+//     但那次是在 pin engine state 之前。两次检查之间可能发生了 range split，
+//     导致当前 range 的范围缩小了。对于 follower read，follower 上的 latches
+//     不能像 leaseholder 那样同步 split，所以必须再次检查。
+//
+//  2. GC threshold 检查。
+//     检查请求要读的时间戳是否低于 range 的 GC 阈值。如果低于，说明请求要读的
+//     数据可能已经被 GC 清掉了，无法安全返回结果。
+//
+// 为什么 GC 检查要放在 PinEngineStateForIterators 之后？
+//
+//   GC 请求在清理数据时，拿的是 GC threshold 对应时间戳的 latch——但 GC threshold
+//   是一个旧的时间戳（比如 ts=100）。而普通的读请求拿的是当前时间戳（ts=200）
+//   的 latch。两个不同时间戳的 latch 不会冲突！
+//
+//   所以普通的 latch 机制无法阻止"GC 正在删数据，读请求同时去读"的竞态。
+//
+//   Pebble 保证：在做实际的 SST 文件删除之前，内存中的 GC threshold 会先被更新。
+//   因此，只要在 pin 了 Pebble iterator（确保了往后不会看到新被删的 SST）之后，
+//   再检查内存中的 GC threshold，就能保证：
+//
+//     如果 GC threshold > 请求时间戳 → 数据已经被 GC → 返回错误
+//     如果 GC threshold <= 请求时间戳 → 数据还没被 GC → 可以安全读
+//
+//   反过来不行：如果先检查 GC threshold（数据还在），然后 pin iterator，
+//   中间 GC 执行了删除，那 iterator 看到的可能是被部分删除的数据。
 func (r *Replica) checkExecutionCanProceedAfterStorageSnapshot(
 	ctx context.Context, ba *kvpb.BatchRequest, st kvserverpb.LeaseStatus,
 ) error {
+	// 计算请求覆盖的 key 范围。
 	rSpan, err := keys.Range(ba.Requests)
 	if err != nil {
 		return err
 	}
 
+	// 从 Replica 内存状态中读 GC 检查所需字段。
+	// 短暂持 r.mu 读锁，复制所有需要的值后释放，减少锁竞争。
 	r.mu.RLock()
 	lease := r.shMu.state.Lease
 	spanConfExplicitlySet := r.mu.spanConfigExplicitlySet
 	ignoreStrictEnforcement := r.mu.conf.GCPolicy.IgnoreStrictEnforcement
-	gcThreshold := *r.shMu.state.GCThreshold
-	cachedProtectedTS := r.mu.cachedProtectedTS
-	confTTL := r.mu.conf.TTL()
+	gcThreshold := *r.shMu.state.GCThreshold          // 真正的 GC 阈值（数据不会被清理到低于此值）
+	cachedProtectedTS := r.mu.cachedProtectedTS       // 缓存的最新的 protected timestamp
+	confTTL := r.mu.conf.TTL()                        // 表的 TTL 配置（如 30d）
 	desc := r.descRLocked()
 	confSpan := r.mu.confSpan
 	excludeDataFromBackup := r.mu.conf.ExcludeDataFromBackup
 	r.mu.RUnlock()
 
-	// Ensure the request is entirely contained within the range's key bounds
-	// (even) after the storage engine has been pinned by the iterator. Given we
-	// perform this check before acquiring a storage snapshot, this is only ever
-	// meaningful in the context of follower reads. This is because latches on
-	// followers don't provide the synchronization with concurrent splits like
-	// they do on leaseholders.
+	// ──────────────────────────────────────────────
+	// 检查 1：span 仍在 range 边界内
+	// ──────────────────────────────────────────────
+	// follower read 路径上，latches 不提供 split 同步。
+	// 在 pin engine state 之前做过一次 span 检查，这里再做一次，
+	// 防止两次检查之间发生 split 导致请求读到不属于本 range 的数据。
 	cachedClosedTimestampPolicy := *r.cachedClosedTimestampPolicy.Load()
 	if err := checkSpanInRange(ctx, rSpan, desc, lease, cachedClosedTimestampPolicy); err != nil {
 		return err
 	}
 
-	// NB: For read-only requests, the GC threshold check is performed after the
-	// state of the storage engine has been pinned by the iterator. This is
-	// because GC requests don't acquire latches at the timestamp they are garbage
-	// collecting, so read traffic at / around the GC threshold will not be
-	// serialized with GC requests. Thus, we must check the in-memory GC threshold
-	// after we pin the state of the storage engine [1].
-	//
-	// [1]: This relies on the invariant that the in-memory GC threshold is bumped
-	// _before_ the actual garbage collection happens.
-	//
-	// TODO(aayush): The above description intentionally omits some details, as
-	// they are going to be changed as part of
-	// https://github.com/cockroachdb/cockroach/issues/55293.
+	// ──────────────────────────────────────────────
+	// 检查 2：请求时间戳在 GC 阈值之上
+	// ──────────────────────────────────────────────
+	// GC 请求和普通读请求用不同时间戳拿 latch → 不会冲突。
+	// 因此必须依赖"内存 GC threshold 先于实际数据删除"的不变式。
+	// 在 PinEngineStateForIterators 之后检查内存 GC threshold，
+	// 能保证 pin 住的 Pebble 状态里数据还没被删除。
 	return r.checkTSAboveGCThreshold(ctx, ba.EarliestActiveTimestamp(), st, ba.IsAdmin(), rSpan,
 		spanConfExplicitlySet, ignoreStrictEnforcement, gcThreshold, cachedProtectedTS, confTTL,
 		desc, confSpan, excludeDataFromBackup)

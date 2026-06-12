@@ -189,6 +189,10 @@ func (r *Replica) shouldBackpressureWrites() bool {
 // maybeBackpressureBatch blocks to apply backpressure if the replica deems
 // that backpressure is necessary.
 func (r *Replica) maybeBackpressureBatch(ctx context.Context, ba *kvpb.BatchRequest) error {
+	// 先判断这个 batch 是否“允许被 backpressure”。
+	// 不是所有请求都能在这里阻塞：比如 split 事务自身不能被挡住，
+	// 否则会出现 range 需要 split 才能解除 backpressure，
+	// 但 split 请求本身又被 backpressure 挡住的死锁。
 	if !canBackpressureBatch(ba) {
 		return nil
 	}
@@ -197,17 +201,26 @@ func (r *Replica) maybeBackpressureBatch(ctx context.Context, ba *kvpb.BatchRequ
 	// if one exists. This does not place a hard upper bound on the size of
 	// a range because we don't track all in-flight requests (like we do for
 	// the quota pool), but it does create an effective soft upper bound.
+	//
+	// 只要当前 range 仍然判断为“应该对写入施加 backpressure”，就循环等待。
+	// shouldBackpressureWrites 主要根据 range 当前大小、RangeMaxBytes、
+	// hard cap、历史最大 range size 等信息判断。
 	for first := true; r.shouldBackpressureWrites(); first = false {
 		if first {
+			// 第一次真正进入 backpressure 时，增加当前正在被 split backpressure
+			// 阻塞的请求数量指标；函数返回时再递减。
 			r.store.metrics.BackpressuredOnSplitRequests.Inc(1)
 			defer r.store.metrics.BackpressuredOnSplitRequests.Dec(1) //nolint:deferloop
 
 			if backpressureLogLimiter.ShouldLog() {
+				// 日志限频，避免大量写请求同时被 backpressure 时刷爆日志。
 				log.KvExec.Warningf(ctx, "applying backpressure to limit range growth on batch %s", ba)
 			}
 		}
 
 		// Register a callback on an ongoing split for this range in the splitQueue.
+		// splitC 用来等待 splitQueue 中这个 range 的 split 处理结果。
+		// channel 容量为 1，避免回调和等待方之间互相阻塞。
 		splitC := make(chan error, 1)
 		if !r.store.splitQueue.MaybeAddCallback(r.RangeID, processCallback{
 			onEnqueueResult: func(rank int, err error) {},
@@ -217,6 +230,8 @@ func (r *Replica) maybeBackpressureBatch(ctx context.Context, ba *kvpb.BatchRequ
 				default:
 					// Drop the error if the channel is already full. This prevents
 					// blocking if the callback is invoked multiple times.
+					// 如果 channel 已经有结果了，说明等待方还没取走或已经不需要，
+					// 这里直接丢弃，避免 split queue 的回调被阻塞。
 					return
 				}
 			},
@@ -225,6 +240,8 @@ func (r *Replica) maybeBackpressureBatch(ctx context.Context, ba *kvpb.BatchRequ
 			// no good way to prevent this race, so we conservatively allow the
 			// request to proceed instead of throwing an error that would surface
 			// to the client.
+			// 没有正在进行的 split，可能是刚判断需要 backpressure 后 split 已经完成。
+			// 这种竞态下不返回错误，直接放行，让请求继续执行。
 			return nil
 		}
 
@@ -233,6 +250,10 @@ func (r *Replica) maybeBackpressureBatch(ctx context.Context, ba *kvpb.BatchRequ
     https://www.cockroachlabs.com/docs/stable/common-errors.html#split-failed-while-applying-backpressure-are-rows-updated-in-a-tight-loop`
 
 		// Wait for the callback to be called.
+		// 等待 split queue 回调：
+		// - ctx 取消：说明请求超时或上层取消，返回带 hint 的错误。
+		// - split 完成但带错误：说明 split 失败，也返回带 hint 的错误。
+		// - split 成功：本轮等待结束，for 循环会重新检查 range 是否仍需 backpressure。
 		select {
 		case <-ctx.Done():
 			return errors.WithHint(errors.Wrapf(
@@ -246,5 +267,6 @@ func (r *Replica) maybeBackpressureBatch(ctx context.Context, ba *kvpb.BatchRequ
 			}
 		}
 	}
+	// range 大小已经不再触发 backpressure，允许请求继续进入后续执行路径。
 	return nil
 }

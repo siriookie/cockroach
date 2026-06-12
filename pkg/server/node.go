@@ -1728,50 +1728,77 @@ func checkNoUnknownRequest(reqs []kvpb.RequestUnion) *kvpb.UnsupportedRequestErr
 func (n *Node) batchInternal(
 	ctx context.Context, tenID roachpb.TenantID, args *kvpb.BatchRequest,
 ) (br *kvpb.BatchResponse, _ error) {
+	// 先检查 batch 里是否包含当前 server 不认识的 request 类型。
+	// 这通常发生在版本不兼容或请求 proto 不被当前二进制支持时。
 	if detail := checkNoUnknownRequest(args.Requests); detail != nil {
+		// 返回结构化 BatchResponse.Error，而不是普通 Go error，
+		// 这样 client 能按 KV error 语义处理 UnsupportedRequestError。
 		br = &kvpb.BatchResponse{}
 		br.Error = kvpb.NewError(detail)
 		return br, nil
 	}
 
+	// 为这个进入服务端的 BatchRequest 建立 tracing span。
+	// 远程请求可能带 TraceInfo，本地 internalClientAdapter 请求则可能复用本地 trace。
 	var reqSp spanForRequest
 	ctx, reqSp = n.setupSpanForIncomingRPC(ctx, tenID, args)
 	// NB: wrapped to delay br evaluation to its value when returning.
+	// 延迟结束服务端 span。这里用闭包是为了 defer 执行时读取最终 br，
+	// 因为 br 里可能需要附带远端收集到的 trace recording。
 	defer func() {
+		// 根据 cluster setting 决定返回给 secondary tenant 的 server trace 是否脱敏。
 		var redact redactOpt
 		if RedactServerTracesForSecondaryTenants.Get(&n.storeCfg.Settings.SV) {
 			redact = redactIfTenantRequest
 		} else {
 			redact = dontRedactEvenIfTenantRequest
 		}
+		// 结束 span；如果需要 recording，会把服务端 recording 写进 br.CollectedSpans。
 		reqSp.finish(br, redact)
 	}()
+	// 如果当前 ctx 上有 trace span，就记录服务端收到请求和发送响应的事件。
 	if log.HasSpan(ctx) {
 		log.Eventf(ctx, "node received request: %s", args.Summary())
 		defer log.Event(ctx, "node sending response")
 	}
 
+	// rangeTenantIDForAC 用于 admission control。
+	// 它表示请求目标 key 属于哪个 tenant 的 keyspace，用来给 KV admission 做更细粒度的归因。
 	var rangeTenantIDForAC roachpb.TenantID
 	// The computation of rangeTenantIDForAC fails open in case of error.
+	// 如果解析失败，下面保持 zero value，不阻塞请求继续执行。
 	if len(args.Requests) > 0 {
+		// 只用第一个 request 的 key 推断 tenant prefix。
+		// 一个 BatchRequest 到达服务端时通常已经被 DistSender 切成单 range batch。
 		k, err := keys.Addr(args.Requests[0].GetInner().Header().Key)
 		if err == nil {
+			// 尝试从 key 前缀解出 tenant ID；system tenant key 通常不会解出 secondary tenant。
 			_, tid, err := keys.DecodeTenantPrefix(roachpb.Key(k))
 			if err == nil {
 				rangeTenantIDForAC = tid
 			}
 		}
 	}
+	// 记录请求开始时间，用于 slow request stack history 和 node metrics。
 	tStart := timeutil.Now()
+	// 进入 KV admission control。
+	// 如果当前节点资源紧张，这里可能排队或返回错误；成功后会返回一个 handle。
 	handle, err := n.storeCfg.KVAdmissionController.AdmitKVWork(ctx, tenID, rangeTenantIDForAC, args)
 	if err != nil {
+		// admission control 拒绝或 ctx 取消时，作为普通错误返回给 Node.Batch，
+		// Node.Batch 会统一包装进 BatchResponse.Error。
 		return nil, err
 	}
+	// 把 admission handle 相关信息挂到 ctx 上，供后续 Store/Replica 执行路径使用。
 	ctx = handle.AnnotateCtx(ctx)
 
+	// Store/Replica 执行写请求时会统计写入字节数，admission control 完成时需要这些信息。
 	var writeBytes *kvadmission.StoreWriteBytes
 	defer func() {
+		// 通知 admission control：这次已经 admission 的 KV work 完成了。
+		// writeBytes 用于反馈这次实际产生的写入负载。
 		n.storeCfg.KVAdmissionController.AdmittedKVWorkDone(handle, writeBytes)
+		// writeBytes 可能持有 pooled resource；无论成功失败都需要释放。
 		writeBytes.Release()
 	}()
 
@@ -1787,47 +1814,69 @@ func (n *Node) batchInternal(
 	// unnecessarily, to prevent modifying the passed in request. We should clean
 	// up the contract of the Send method to allow modifying the request or more
 	// strictly enforce that the callee is not allowed to change it.
+	// 如果客户端要求 proxy fallback，就先保存一份原始 request 的浅拷贝。
+	// 原因是本地尝试执行时，后续 Store/Replica 代码可能会修改 args；
+	// 如果之后要拿它去做 proxy 转发，必须尽量使用未被本地执行污染的 request 信息。
 	var originalRequest *kvpb.BatchRequest
 	if args.ProxyRangeInfo != nil {
 		originalRequest = args.ShallowCopy()
 	}
+	// pErr 是 KV 层结构化错误，和普通 Go error 不同。
+	// Store/Replica 返回的 NotLeaseHolder、RangeKeyMismatch、TxnRetry 等都走 pErr。
 	var pErr *kvpb.Error
+	// 这是 batchInternal 最核心的一跳：把 BatchRequest 交给当前节点的 Stores。
+	// 后续路径是 Stores -> Store -> Replica -> read/write/admin execution。
 	br, writeBytes, pErr = n.stores.SendWithWriteBytes(ctx, args)
 	if pErr != nil {
+		// 如果本地执行失败，并且原始请求带 ProxyRangeInfo，
+		// 尝试让当前节点作为 proxy 把请求转发到客户端指定的 leaseholder。
 		if originalRequest != nil {
 			if proxyResponse := n.maybeProxyRequest(ctx, originalRequest, pErr); proxyResponse != nil {
 				// If the proxy request succeeded then return its result instead of
 				// our error. If not, use our original error.
+				// proxy 成功时，直接返回 proxyResponse，覆盖本地执行失败的结果。
 				return proxyResponse, nil
 			}
 		}
 
+		// 本地执行失败且没有成功 proxy 时，构造一个新的 BatchResponse，
+		// 最后会把 pErr 塞到 br.Error。
 		br = &kvpb.BatchResponse{}
 		if pErr.Index != nil && keyvissettings.Enabled.Get(&n.storeCfg.Settings.SV) {
 			// Tell the SpanStatsCollector about the requests in this BatchRequest,
 			// but stop when we reach the requests that were not attempted
 			// due to an error.
+			// key visualizer 需要知道哪些 key/span 被访问过。
+			// 如果错误带 Index，说明从这个 request 开始后面的请求没有执行，所以只统计错误前的部分。
 			for i, union := range args.Requests {
 				if int32(i) == pErr.Index.Index {
 					break
 				}
 				arg := union.GetInner()
+				// 把成功尝试过的 request span 计入 SpanStatsCollector。
 				n.spanStatsCollector.Increment(arg.Header().Span())
 			}
 		}
+		// 在 trace/event log 里记录 Store/Replica 返回的结构化 KV 错误。
 		log.VErrEventf(ctx, 3, "error from stores.Send: %s", pErr)
 	} else {
+		// 没有 KV 错误时，如果开启 key visualizer，就统计整个 batch 的所有 request span。
 		if keyvissettings.Enabled.Get(&n.storeCfg.Settings.SV) {
 			// Tell the SpanStatsCollector about the requests in this BatchRequest.
 			for _, union := range args.Requests {
 				arg := union.GetInner()
+				// 成功 batch 中每个 request 的 span 都计入 SpanStatsCollector。
 				n.spanStatsCollector.Increment(arg.Header().Span())
 			}
 		}
 	}
+	// Store/Replica 层约定：结构化 KV 错误通过返回值 pErr 返回，
+	// 不应该提前塞在 br.Error 中，否则 batchInternal 下面统一回填 br.Error 时会产生双重错误。
 	if br.Error != nil {
 		panic(kvpb.ErrorUnexpectedlySet(n.stores, br))
 	}
+	// 如果请求执行时间超过阈值，把当前 goroutine stack 记录到 trace history 中，
+	// 方便之后分析慢 KV 请求卡在什么执行栈上。
 	if timeutil.Since(tStart) > slowRequestHistoricalStackThreshold.Get(&n.storeCfg.Settings.SV) {
 		tracing.SpanFromContext(ctx).MaybeRecordStackHistory(tStart)
 	}
@@ -1839,19 +1888,29 @@ func (n *Node) batchInternal(
 	//
 	// To avoid log spam for now we only log the trace if the request was an
 	// ExportRequest.
+	// 如果客户端已经取消 ctx，而 Replica 后来才发现并返回错误，客户端可能已经不等响应了。
+	// 对 ExportRequest 这种重请求，服务端额外打印 trace，方便排查它取消前到底执行到了哪里。
 	if pErr != nil && ctx.Err() != nil && args.IsSingleExportRequest() {
+		// 取当前 tracing span。
 		if sp := tracing.SpanFromContext(ctx); sp != nil {
+			// 获取已经记录的 trace recording。
 			recording := sp.GetConfiguredRecording()
 			if recording.Len() != 0 {
+				// 把请求、错误和服务端 trace 打到日志里。
 				log.Dev.Infof(ctx, "batch request %s failed with error: %v\ntrace:\n%s", args.String(),
 					pErr.GoError(), recording)
 			}
 		}
 	}
 
+	// 记录这次 node-level KV batch 的总耗时和是否有 KV 错误。
 	n.metrics.callComplete(timeutil.Since(tStart), pErr)
+	// 统一把 Store/Replica 返回的 KV 结构化错误写进 BatchResponse.Error。
+	// 这样 Node.Batch 可以返回 (br, nil)，让 RPC transport 认为传输成功，
+	// 而 client 侧再从 br.Error 解释 KV 语义错误。
 	br.Error = pErr
 
+	// 返回 BatchResponse；普通 error 为 nil，表示 RPC 层成功。
 	return br, nil
 }
 
@@ -1911,28 +1970,44 @@ func (n *Node) maybeProxyRequest(
 // getLocalityComparison takes gatewayNodeID as input and returns the locality
 // comparison result between the gateway node and the current node. This result
 // indicates whether the two nodes are located in different regions or zones.
+// getLocalityComparison 用 gatewayNodeID 查出 gateway 节点的 Locality，
+// 再和当前节点 n.Descriptor.Locality 做比较，用于统计跨 zone / 跨 region 的 KV Batch 流量。
 func (n *Node) getLocalityComparison(
 	ctx context.Context, gatewayNodeID roachpb.NodeID,
 ) roachpb.LocalityComparisonType {
+	// Gossip 里保存了集群内 node descriptor 信息，包括每个节点的 locality。
+	// 这里需要通过 gatewayNodeID 去 gossip 里查 gateway node 的 descriptor。
 	gossip := n.storeCfg.Gossip
 	if gossip == nil {
+		// 某些测试或特殊启动路径可能没有配置 gossip；没有 gossip 就无法比较 locality。
 		log.Dev.VInfof(ctx, 2, "gossip is not configured")
+		// 返回 UNDEFINED 表示本次无法判断是否跨 region / zone。
 		return roachpb.LocalityComparisonType_UNDEFINED
 	}
 
 	// In separate-process multi-tenant mode the gatewayNodeID is 0.
+	// separate-process tenant 模式下，tenant SQL gateway 不是 KV node，
+	// 因此 BatchRequest 里可能没有 KV GatewayNodeID，值为 0。
 	if gatewayNodeID == 0 {
+		// 如果 ctx 里能取到 tenant ID，说明这是 tenant 请求。
+		// 这类请求没有可用于 gossip 查询的 KV nodeID，直接返回 UNDEFINED。
 		if _, ok := roachpb.ClientTenantFromContext(ctx); ok {
 			return roachpb.LocalityComparisonType_UNDEFINED
 		}
 	}
+	// 根据 gatewayNodeID 从 gossip 中查 gateway node 的 descriptor。
+	// descriptor 中包含 gateway 的 Locality 信息。
 	gatewayNodeDesc, err := gossip.GetNodeDescriptor(gatewayNodeID)
 	if err != nil {
+		// descriptor 查不到时，通常说明 gossip 信息缺失/过期，或者 gatewayNodeID 不可识别。
 		log.Dev.VInfof(ctx, 5,
 			"failed to perform look up for node descriptor %v", err)
+		// 无法拿到 gateway locality 时，返回 UNDEFINED，不影响请求本身继续执行。
 		return roachpb.LocalityComparisonType_UNDEFINED
 	}
 
+	// 将当前节点 locality 和 gateway 节点 locality 做比较。
+	// 返回值会区分 same locality / cross zone / cross region 等情况，供 metrics 使用。
 	return n.Descriptor.Locality.Compare(gatewayNodeDesc.Locality)
 }
 
@@ -1947,22 +2022,38 @@ func (n *Node) incrementBatchCounters(ba *kvpb.BatchRequest) {
 }
 
 // Batch implements the kvpb.InternalServer interface.
+// Batch 是 KV Internal RPC 的服务端入口：
+// - 远程请求通过 gRPC/DRPC 到达这里；
+// - 本地请求通过 internalClientAdapter 也会直接调用这里；
+// - 这里做节点级包装，然后把请求交给 batchInternal -> Stores -> Store -> Replica。
 func (n *Node) Batch(ctx context.Context, args *kvpb.BatchRequest) (*kvpb.BatchResponse, error) {
+	// 统计本节点接收到的 BatchRequest 总数，以及 batch 内每种 KV method 的次数。
 	n.incrementBatchCounters(args)
 
 	// NB: Node.Batch is called directly for "local" calls. We don't want to
 	// carry the associated log tags forward as doing so makes adding additional
 	// log tags more expensive and makes local calls differ from remote calls.
+	// 重置并重新挂上当前 Node 的 ambient log tags。
+	// 这里特别考虑本地调用：本地调用不是从 gRPC server 新进来的，如果沿用调用方 ctx
+	// 里的旧 tags，会让本地路径和远程路径日志表现不一致，也会增加 tag 叠加成本。
 	ctx = n.storeCfg.AmbientCtx.ResetAndAnnotateCtxPrealloc(ctx)
 
+	// 根据 GatewayNodeID 判断请求来源和当前节点的 locality 关系，
+	// 用于跨 locality / 跨 region 的请求大小统计。
 	comparisonResult := n.getLocalityComparison(ctx, args.GatewayNodeID)
+	// 记录进入本节点的 BatchRequest 大小，以及它是否来自同 locality。
 	n.metrics.updateCrossLocalityMetricsOnBatchRequest(comparisonResult, int64(args.Size()))
 
+	// 从 ctx 中取调用方 tenant ID。
+	// 系统租户 / KV node 内部请求可能没有 tenant 信息，此时默认按 system tenant 处理。
 	tenantID, ok := roachpb.ClientTenantFromContext(ctx)
 	if !ok {
+		// 没有显式 tenant ID，认为是 system tenant。
 		tenantID = roachpb.SystemTenantID
 	} else {
 		// We had this tag before the ResetAndAnnotateCtx() call above.
+		// ResetAndAnnotateCtxPrealloc 会清理掉旧 log tags；
+		// 如果这是 tenant 请求，需要把 tenant tag 补回来，方便后续日志定位租户来源。
 		ctx = logtags.AddTag(ctx, "tenant", tenantID)
 	}
 
@@ -1970,7 +2061,10 @@ func (n *Node) Batch(ctx context.Context, args *kvpb.BatchRequest) (*kvpb.BatchR
 	// pprof labels in the BatchRequest, then we apply them to the context that is
 	// going to execute the BatchRequest. These labels will help correlate server
 	// side CPU profile samples to the sender.
+	// 如果客户端在 BatchRequest 里带了 pprof labels，并且当前节点正在采集带 labels 的 CPU profile，
+	// 就把这些 labels 挂到服务端执行 ctx 上。这样 profile 里能把 server 侧 CPU 样本关联回请求来源。
 	if len(args.ProfileLabels) != 0 && n.execCfg.Settings.CPUProfileType() == cluster.CPUProfileWithLabels {
+		// undo 用来在本次 Batch 处理完成后恢复原 ctx labels，避免污染后续请求。
 		var undo func()
 		ctx, undo = pprofutil.SetProfilerLabels(ctx, args.ProfileLabels...)
 		defer undo()
@@ -1981,31 +2075,47 @@ func (n *Node) Batch(ctx context.Context, args *kvpb.BatchRequest) (*kvpb.BatchR
 	// for the locality of the origin of the request. The replica stats aggregate
 	// all incoming BatchRequests and which localities they come from in order to
 	// compute per second stats used for the rebalancing decisions.
+	// tenant 请求可能没有设置 GatewayNodeID，但 QPS-based rebalancing 需要知道请求来源 locality。
+	// 对 tenant 请求，如果 GatewayNodeID 为空，就用当前节点 ID 作为 gateway node 的近似值。
 	if args.GatewayNodeID == 0 && tenantID != roachpb.SystemTenantID {
 		args.GatewayNodeID = n.Descriptor.NodeID
 	}
 
+	// 进入真正的 KV server 处理：
+	// batchInternal 会建立服务端 tracing/admission，然后调用 n.stores.SendWithWriteBytes，
+	// 继续下钻到 Store 和 Replica。
 	br, err := n.batchInternal(ctx, tenantID, args)
 
 	// We always return errors via BatchResponse.Error so structure is
 	// preserved; plain errors are presumed to be from the RPC
 	// framework and not from cockroach.
+	// CockroachDB 的 KV 层错误要尽量放进 BatchResponse.Error 里返回，
+	// 这样 kvpb.Error 的结构化信息（比如 NotLeaseHolder、RangeKeyMismatch、Retryable error）
+	// 不会被普通 Go error / RPC framework error 吃掉。
 	if err != nil {
+		// batchInternal 可能还没来得及构造 response；这里兜底创建一个空 BatchResponse。
 		if br == nil {
 			br = &kvpb.BatchResponse{}
 		}
+		// 不允许同时返回普通 err 和已经填好的 br.Error。
+		// 否则 client 不知道该以哪个错误为准，这是服务端代码 bug。
 		if br.Error != nil {
 			log.Dev.Fatalf(
 				ctx, "attempting to return both a plain error (%s) and kvpb.Error (%s)", err, br.Error,
 			)
 		}
+		// 把普通 error 转成 kvpb.Error，统一塞进 BatchResponse.Error。
 		br.Error = kvpb.NewError(err)
 	}
 
+	// 记录本节点返回的 BatchResponse 大小，以及它对应的 locality 关系。
 	n.metrics.updateCrossLocalityMetricsOnBatchResponse(comparisonResult, int64(br.Size()))
+	// test build 下，如果这次返回了 KV error，并且测试注册了错误事件回调，就触发测试钩子。
 	if buildutil.CrdbTestBuild && br.Error != nil && n.testingErrorEvent != nil {
 		n.testingErrorEvent(ctx, args, errors.DecodeError(ctx, br.Error.EncodedError))
 	}
+	// RPC framework 看到 nil error，说明传输层成功；
+	// 真正的 KV 层错误如果有，会在 br.Error 里让客户端继续处理。
 	return br, nil
 }
 

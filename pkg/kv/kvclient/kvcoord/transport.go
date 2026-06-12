@@ -175,21 +175,29 @@ func (gt *grpcTransport) IsExhausted() bool {
 	return gt.nextReplicaIdx >= len(gt.replicas)
 }
 
-// SendNext invokes the specified RPC on the supplied client when the
-// client is ready. On success, the reply is sent on the channel;
-// otherwise an error is sent.
+// SendNext 向当前排到的下一个 replica 同步发送 BatchRequest RPC。
+// 如果 transport 已经耗尽（所有 replica 都已尝试过），调用此方法会 panic。
+//
+// SendNext 还负责将远端收集到的 tracing span（如果有）导入本地 trace。
 func (gt *grpcTransport) SendNext(
 	ctx context.Context, ba *kvpb.BatchRequest,
 ) (*kvpb.BatchResponse, error) {
+	// 取出当前要尝试的 replica 描述符（由 nextReplicaIdx 指向）。
 	r := gt.replicas[gt.nextReplicaIdx]
+	// 连接到该 replica 所在节点，获取 InternalClient（内部 RPC 客户端）。
+	// NextInternalClient 内部会递增 nextReplicaIdx，所以下次调用 SendNext
+	// 会自动走到下一个 replica。
 	iface, err := gt.NextInternalClient(ctx)
 	if err != nil {
 		return nil, err
 	}
+	// 通过已建立的连接发送批量请求，并获得响应。
 	return gt.sendBatch(ctx, r.NodeID, iface, ba)
 }
 
 // NB: nodeID is unused, but accessible in stack traces.
+// nodeID 在函数体里没有直接使用；保留这个参数主要是为了让 panic / goroutine
+// stack trace 里能看到当前 sendBatch 试图发往哪个节点，方便排查 RPC 卡顿或崩溃。
 func (gt *grpcTransport) sendBatch(
 	ctx context.Context,
 	nodeID roachpb.NodeID,
@@ -199,16 +207,29 @@ func (gt *grpcTransport) sendBatch(
 	// Bail out early if the context is already canceled. (GRPC will
 	// detect this pretty quickly, but the first check of the context
 	// in the local server comes pretty late)
+	// 先检查 ctx 是否已经取消。
+	// 远程 gRPC/DRPC 路径通常也能较快感知 ctx cancel，但本地 internalClientAdapter
+	// 进入真正的 server.Batch 之前可能较晚才检查 ctx，所以这里先快速失败。
 	if ctx.Err() != nil {
+		// 把 ctx.Err() 包一层上下文，说明请求在真正发送 Batch 前就已经被取消。
 		return nil, errors.Wrap(ctx.Err(), "aborted before batch send")
 	}
 
+	// 统计所有尝试发送的 BatchRequest 数量；无论最终是本地调用还是远程 RPC，都会计数。
 	gt.opts.metrics.SentCount.Inc(1)
+	// 如果 iface 是 internalClientAdapter，说明这是发给本节点的本地调用，
+	// 不经过网络、grpc.ClientConn 和 protobuf 远程序列化。
 	if rpc.IsLocal(iface) {
+		// 单独统计本地发送次数，用于观察 DistSender 有多少请求走了 local fast path。
 		gt.opts.metrics.LocalSentCount.Inc(1)
 	}
+	// 在 trace/event log 里记录即将发送 batch，方便排查请求卡在哪一段。
 	log.VEvent(ctx, 2, "sending batch request")
+	// 这是 transport 真正跨过 client 边界的位置：
+	// - 如果 iface 是 internalClientAdapter，则本地调用 Node.Batch。
+	// - 如果 iface 是 baseInternalClient / batchStreamPoolClient，则通过 gRPC/DRPC 发给远端节点。
 	reply, err := iface.Batch(ctx, ba)
+	// 记录 Batch 调用已经返回；此时 reply/err 可能成功，也可能包含 RPC 层错误。
 	log.VEvent(ctx, 2, "received batch response")
 
 	// We don't have any strong reason to keep verifying the checksum of the
@@ -217,13 +238,21 @@ func (gt *grpcTransport) sendBatch(
 	// TODO(ibrahim): There is a path to remove Value checksum computations and
 	// verifications. More details are available in:
 	// https://github.com/cockroachdb/cockroach/issues/145541#issuecomment-2917225539
+	// 仅在 crdb test build 中做额外响应校验。
+	// 生产路径不做这一步，避免每次 RPC 都付出额外校验成本。
 	if buildutil.CrdbTestBuild {
 		// If we queried a remote node, perform extra validation.
+		// 只有远程请求才做校验；本地请求共享同一个进程内对象/调用路径，不走远程编码传输。
 		if reply != nil && !rpc.IsLocal(iface) {
+			// 只有 RPC 本身没有返回错误时才校验 response 内容。
 			if err == nil {
+				// response 中每个单独结果都应该能和原 batch 中对应 request 匹配。
 				for i := range reply.Responses {
+					// Verify 会检查 response 是否符合对应 request 的预期，
+					// 历史上这类测试校验抓到过远程响应编码/校验和相关 bug。
 					err = reply.Responses[i].GetInner().Verify(ba.Requests[i].GetInner())
 					if err != nil {
+						// 发现校验失败时记录开发日志，然后跳出循环，把 err 留给后续统一返回。
 						log.Dev.Errorf(ctx, "verification of response for %s failed: %v", ba.Requests[i].GetInner(), err)
 						break
 					}
@@ -239,20 +268,30 @@ func (gt *grpcTransport) sendBatch(
 	// requests - see setupSpanForIncomingRPC. For local RPCs, the Tracer is
 	// shared between the client and the server, and the server span is a child of
 	// the server span.
+	// 如果是远程 RPC，服务端可能把自己收集到的 tracing spans 放在 reply.CollectedSpans。
+	// 这里把远端 recording 导入当前本地 span，这样一条 trace 里能看到跨节点执行细节。
 	if reply != nil && len(reply.CollectedSpans) != 0 {
+		// 从当前 ctx 中取出本地 tracing span，作为远程 spans 的导入目标。
 		span := tracing.SpanFromContext(ctx)
 		if span == nil {
+			// 有远程 spans 却没有本地 recording span，说明调用方没有正确建立 trace 上下文。
 			return nil, errors.Errorf(
 				"trying to ingest remote spans but there is no recording span set up")
 		}
+		// 把远端收集到的 spans 合并进当前 trace recording。
 		span.ImportRemoteRecording(reply.CollectedSpans)
 		// The field is cleared by the sender because if the spans are re-imported
 		// by accident, duplicate spans may occur.
+		// 清空已导入的 CollectedSpans，防止上层误把同一批远程 span 再导入一次，造成重复 trace。
 		reply.CollectedSpans = nil
 	}
+	// err 表示 RPC/client 调用层面的错误，比如网络错误、连接断开、本地调用返回错误等。
 	if err != nil {
+		// 包上 BatchRequest 的字符串表示，方便日志里看到这次失败发的是什么 batch。
 		return nil, errors.Wrapf(err, "ba: %s RPC error", ba.String())
 	}
+	// RPC 层成功，返回 BatchResponse。注意 BatchResponse 内部仍可能携带 KV 层的 Error，
+	// 这部分由 DistSender / 上层调用者继续解释和处理。
 	return reply, nil
 }
 

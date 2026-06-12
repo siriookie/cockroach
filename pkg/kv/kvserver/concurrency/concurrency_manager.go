@@ -262,13 +262,43 @@ func NewManager(cfg Config) Manager {
 	return m
 }
 
-// SequenceReq implements the RequestSequencer interface.
+// SequenceReq 实现了 RequestSequencer 接口。
+//
+// 它是并发控制管理器的入口。每个 KV 请求在真正 evaluation 之前都会调用这里。
+// 这个函数负责：
+//  1. 获取 latch（键范围互斥锁），防止和其它并发请求产生读写冲突
+//  2. 检查/等待事务锁（lock table），解决跨事务冲突
+//
+// 参数：
+//   - prev: 可选的上一轮 Guard。nil = 首次进入；
+//     non-nil = 冲突重试（例如从 HandleLockConflictError 回来）
+//   - req: 请求（包含 LatchSpans、LockSpans、Txn 等）
+//   - evalKind: 本次执行策略
+//
+// 根据 prev 和 evalKind 的组合，有 4 种 branch：
+//
+//   branch 1: prev==nil + PessimisticEval（首次悲观执行）
+//     全新 Guard → 插入 latches + 等待冲突释放 + 扫描锁表 + 可能入队列等待
+//
+//   branch 2: prev==nil + OptimisticEval（首次乐观执行）
+//     全新 Guard → AcquireOptimistic（只插入 latches 不等待）+
+//     ScanOptimistic（拍锁表快照不排队） → 立即返回，不等待任何冲突
+//
+//   branch 3: prev!=nil + PessimisticEval（释放 latches 后重试）
+//     复用 prev Guard，要求 prev 已不持有 latches
+//     → 重新获取 latches + 重新扫描锁表
+//
+//   branch 4: prev!=nil + PessimisticAfterFailedOptimisticEval（乐观失败降级）
+//     乐观执行发现冲突后，Guard 还持有上一轮插入的 latches（没等待过）
+//     → WaitUntilAcquired 真正等待这些 latches 被获取
+//     → 再用悲观方式扫描锁表
 func (m *managerImpl) SequenceReq(
 	ctx context.Context, prev *Guard, req Request, evalKind RequestEvalKind,
 ) (*Guard, Response, *Error) {
 	var g *Guard
-	var branch int
+	var branch int // 传入 sequenceReqWithGuard，用于区分 4 种路径的日志/断言
 	if prev == nil {
+		// —— 首次进入：创建全新的 Guard ——
 		switch evalKind {
 		case PessimisticEval:
 			branch = 1
@@ -277,82 +307,120 @@ func (m *managerImpl) SequenceReq(
 			branch = 2
 			log.Event(ctx, "optimistically sequencing request")
 		case PessimisticAfterFailedOptimisticEval:
+			// 首次进入不能是"乐观失败后的悲观执行"
 			panic("retry should have non-nil guard")
 		default:
 			panic("unexpected evalKind")
 		}
-		g = newGuard(req)
+		g = newGuard(req) // 从 sync.Pool 分配 Guard
 	} else {
+		// —— 冲突重试：复用之前的 Guard ——
 		g = prev
 		switch evalKind {
 		case PessimisticEval:
+			// 例如：从 HandleLockConflictError / HandleTransactionPushError 回来
 			branch = 3
-			g.AssertNoLatches()
+			g.AssertNoLatches() // 断言上一轮已经释放了 latches
 			log.Event(ctx, "re-sequencing request")
 		case OptimisticEval:
+			// 乐观失败后必须走 PessimisticAfterFailedOptimisticEval
 			panic("optimistic eval cannot happen when re-sequencing")
 		case PessimisticAfterFailedOptimisticEval:
+			// 乐观执行冲突后的重试：持有上一轮的 latches（只插入过但没等）
 			branch = 4
 			if !shouldIgnoreLatches(g.Req) {
-				g.AssertLatches()
+				g.AssertLatches() // 断言 latches 还在
 			}
 			log.Event(ctx, "re-sequencing request after optimistic sequencing failed")
 		default:
 			panic("unexpected evalKind")
 		}
 	}
-	g.EvalKind = evalKind
+	g.EvalKind = evalKind // 记录当前执行策略，CheckOptimisticNoConflicts 等会用到
+
+	// 进入核心逻辑：获取 latch → 检查锁表 → (可能)等待
 	resp, err := m.sequenceReqWithGuard(ctx, g, branch)
 	if resp != nil || err != nil {
-		// Ensure that we release the guard if we return a response or an error.
+		// 如果 manager 直接返回了响应（如 PushTxn 经 txnWaitQueue 完成）
+		// 或遇到错误（如 latch 获取失败），释放 Guard 后返回。
 		m.FinishReq(ctx, g)
 		return nil, resp, err
 	}
+	// 返回持有 latches 的 Guard，调用方可以安全地开始 evaluation
 	return g, nil, nil
 }
 
+// sequenceReqWithGuard 是 SequenceReq 的核心，执行实际的 latch 获取和锁表检查。
+//
+// 整体流程（for 循环）：
+//
+//  1. 如果还没持有 latches：
+//     - OptimisticEval → AcquireOptimistic：插入 latches 但不等待冲突释放
+//     - 其它 → Acquire：插入 latches + 等待所有冲突释放（可能阻塞）
+//
+//  2. 扫描锁表：
+//     - OptimisticEval → ScanOptimistic：拍锁表快照，不入等待队列
+//     - 其它 → ScanAndEnqueue：扫描冲突锁 + 入等待队列 + 可能 Push 锁持有者
+//
+//  3. 是否需要等待（ShouldWait）：
+//     如果 ScanAndEnqueue 发现有冲突的锁且没有 Push 成功，
+//     释放 latches，通过 lockTableWaiter 等待锁释放或被 Push，
+//     然后 continue 回到步骤 1 重新获取 latches。
+//     这是保证"不在持锁状态下阻塞等锁"以避免死锁。
+//
+//  4. 返回：latches 已持有 + 没有冲突锁 → 调用方可以安全 evaluation
+//
+// 关键设计理念：
+//  latch 和 lock table 的关系类似于 mutex 和 condition variable：
+//  - latch = mutex：短时持有，提供对 key range 的互斥访问
+//  - lock table = condition variable：跨事务的等待/唤醒机制
+//  在等待条件变量（等锁）之前必须先释放 mutex（latch），
+//  被唤醒后重新获取 mutex（latch），这正是 for 循环做的事。
 func (m *managerImpl) sequenceReqWithGuard(
 	ctx context.Context, g *Guard, branch int,
 ) (Response, *Error) {
-	// Some requests don't need to acquire latches at all.
+	// 步骤 0：特殊请求可以跳过 latch 获取
 	if shouldIgnoreLatches(g.Req) {
+		// 例如：不一致读、RequestLease 等不需要互斥保护
 		log.Event(ctx, "not acquiring latches")
 		return nil, nil
 	}
 
-	// Check if this is a request that waits on latches, but does not acquire
-	// them.
+	// Barrier 类型的请求：只等待已有的冲突 latch 释放，自己不获取 latch
 	if shouldWaitOnLatchesWithoutAcquiring(g.Req) {
 		log.Event(ctx, "waiting on latches without acquiring")
 		return nil, m.lm.WaitFor(ctx, g.Req.LatchSpans, g.Req.PoisonPolicy, g.Req.Batch)
 	}
 
-	// Provide the manager with an opportunity to intercept the request. It
-	// may be able to serve the request directly, and even if not, it may be
-	// able to update its internal state based on the request.
+	// 步骤 0.5：给 manager 一个拦截请求的机会
+	// 某些并发控制相关的请求可以在这里直接处理完成，
+	// 例如 PushTxn 可以通过 txnWaitQueue 等待目标事务完成
 	resp, err := m.maybeInterceptReq(ctx, g.Req)
 	if resp != nil || err != nil {
 		return resp, err
 	}
 
-	// Only the first iteration can sometimes already be holding latches -- we
-	// use this to assert below.
+	// 主循环：在"获取 latches → 检查锁 → (等锁 → 释放 latches → 重试)"之间循环
 	firstIteration := true
 	for {
+		// ============================================================
+		// 步骤 1: 获取 latches（如果还没持有）
+		// ============================================================
 		if !g.HoldingLatches() {
 			if g.EvalKind == OptimisticEval {
 				if !firstIteration {
-					// The only way we loop more than once is when conflicting locks are
-					// found -- see below where that happens and the comment there on
-					// why it will never happen with OptimisticEval.
+					// 乐观执行不会循环——ScanOptimistic 不会返回 ShouldWait=true
 					panic("optimistic eval should not loop in sequenceReqWithGuard")
 				}
+				// 乐观获取：插入 latches 但不等待冲突释放。
+				// 后续 evaluation 结束时通过 CheckOptimisticNoConflicts 验证。
 				log.Event(ctx, "optimistically acquiring latches")
 				g.lg = m.lm.AcquireOptimistic(g.Req)
 				g.lm = m.lm
 			} else {
-				// Acquire latches for the request. This synchronizes the request
-				// with all conflicting in-flight requests.
+				// 悲观获取：插入 latches + 等待所有冲突 latch 释放。
+				// 这是标准的互斥锁行为——如果 key range 重叠且有冲突的访问类型，
+				// 会在此阻塞直到对方释放。
 				log.Event(ctx, "acquiring latches")
 				g.lg, err = m.lm.Acquire(ctx, g.Req)
 				if err != nil {
@@ -361,6 +429,8 @@ func (m *managerImpl) sequenceReqWithGuard(
 				g.lm = m.lm
 			}
 		} else {
+			// 已经持有 latches → 只能是 PessimisticAfterFailedOptimisticEval
+			// 乐观执行失败后，latches 已经插入但没等过，现在真正等待
 			if !firstIteration {
 				panic(errors.AssertionFailedf("second or later iteration cannot be holding latches"))
 			}
@@ -371,6 +441,7 @@ func (m *managerImpl) sequenceReqWithGuard(
 					g.EvalKind, g.HoldingLatches(), branch, firstIteration, debugutil.Stack())))
 			}
 			log.Event(ctx, "optimistic failed, so waiting for latches")
+			// 乐观执行先插入了 latches 但没有等；现在悲观重试，真正等待
 			g.lg, err = m.lm.WaitUntilAcquired(ctx, g.lg)
 			if err != nil {
 				return nil, err
@@ -378,13 +449,15 @@ func (m *managerImpl) sequenceReqWithGuard(
 		}
 		firstIteration = false
 
-		// Some requests don't want the wait on locks.
+		// ============================================================
+		// 步骤 2: 检查/等待事务锁（lock table）
+		// ============================================================
+		// 如果请求没有声明 lock spans（例如纯读且不需要等锁），跳过
 		if g.Req.LockSpans.Empty() {
 			return nil, nil
 		}
 
-		// Set the request's MaxWaitQueueLength based on the cluster setting, if not
-		// already set.
+		// 设置最大排队长度（如果之前没设置过）
 		if g.Req.MaxLockWaitQueueLength == 0 {
 			g.Req.MaxLockWaitQueueLength = int(MaxLockWaitQueueLength.Get(&m.st.SV))
 		}
@@ -393,10 +466,11 @@ func (m *managerImpl) sequenceReqWithGuard(
 			if g.ltg != nil {
 				panic("Optimistic locking should not have a non-nil lockTableGuard")
 			}
+			// 乐观执行：拍锁表快照，不入等待队列，不等待
 			log.Event(ctx, "optimistically scanning lock table for conflicting locks")
 			g.ltg = m.lt.ScanOptimistic(g.Req)
 		} else {
-			// Scan for conflicting locks.
+			// 悲观执行：扫描冲突锁 + 入等待队列 + (可能) Push 锁持有者
 			log.Event(ctx, "scanning lock table for conflicting locks")
 			g.ltg, err = m.lt.ScanAndEnqueue(g.Req, g.ltg)
 			if err != nil {
@@ -404,18 +478,29 @@ func (m *managerImpl) sequenceReqWithGuard(
 			}
 		}
 
-		// Wait on conflicting locks, if necessary. Note that this will never be
-		// true if ScanOptimistic was called above. Therefore it will also never
-		// be true if latchManager.AcquireOptimistic was called.
+		// ============================================================
+		// 步骤 3: 是否需要等待冲突锁释放
+		// ============================================================
+		// ScanOptimistic 永远不会返回 ShouldWait=true，
+		// 所以乐观执行总是直接返回（不需要等待）
 		if g.ltg.ShouldWait() {
+			// 关键：在等待锁之前必须先释放 latches！
+			// 否则可能死锁：持有 latch A 等锁 B，锁 B 的持有者在等 latch A
 			m.lm.Release(ctx, g.moveLatchGuard())
 
 			log.Event(ctx, "waiting in lock wait-queues")
+			// 通过 lockTableWaiter 等待：
+			//   - 监听锁状态变化（锁释放 / 事务状态变更）
+			//   - 尝试 Push 锁持有者事务
+			//   - 检测死锁
+			// 等待结束后回到 for 循环顶部，重新获取 latches
 			if err := m.ltw.WaitOn(ctx, g.Req, g.ltg); err != nil {
 				return nil, err
 			}
-			continue
+			continue // 回到循环顶部重新 Acquire latches
 		}
+
+		// 步骤 4: 成功！latches 已持有 + 无冲突锁 → 返回
 		return nil, nil
 	}
 }

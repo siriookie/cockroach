@@ -742,10 +742,20 @@ func NewRangeController(
 func (rc *rangeController) WaitForEval(
 	ctx context.Context, pri admissionpb.WorkPriority,
 ) (waited bool, err error) {
+	// 是否启用昂贵日志。这里会被同时用作 traceIndividualWaits，
+	// 因为生产环境里 expensive logging 通常和详细 tracing 的需求一致。
 	expensiveLoggingEnabled := log.ExpensiveLogEnabled(ctx, 2)
+	// 把具体优先级转换成 work class：
+	// - RegularWorkClass：普通/用户相关 work。
+	// - ElasticWorkClass：bulk/export/低优先级弹性 work。
+	// 后面是否需要等 token，主要按 work class 判断。
 	wc := admissionpb.WorkClassFromPri(pri)
+	// 记录一次“请求开始等待 eval admission”的指标。
 	rc.opts.EvalWaitMetrics.OnWaiting(wc)
+	// 读取当前配置：哪些 work class 需要在 evaluation 前等待 replication tokens。
+	// waitCategoryChangeCh 会在相关 cluster setting 变化时被 signal。
 	waitCategory, waitCategoryChangeCh := rc.opts.WaitForEvalConfig.Current()
+	// 根据当前配置判断这类 work 是否直接绕过 WaitForEval。
 	bypass := waitCategory.Bypass(wc)
 	if knobs := rc.opts.Knobs; knobs != nil &&
 		knobs.OverrideBypassAdmitWaitForEval != nil {
@@ -755,6 +765,7 @@ func (rc *rangeController) WaitForEval(
 		//   request would block here.
 		// - to prevent the entry from being subject to replication admission
 		//   control.
+		// 测试可以强行覆盖 bypass/waited，模拟“需要绕过”或“已经等待过”的情况。
 		bypass, waited = rc.opts.Knobs.OverrideBypassAdmitWaitForEval(ctx)
 	}
 	if bypass {
@@ -762,21 +773,31 @@ func (rc *rangeController) WaitForEval(
 			log.VEventf(ctx, 2, "r%v/%v bypassed request (pri=%v)",
 				rc.opts.RangeID, rc.opts.LocalReplicaID, pri)
 		}
+		// 这类 work 当前配置下不需要等待 replication tokens，记录 bypass 指标后返回。
 		rc.opts.EvalWaitMetrics.OnBypassed(wc, 0 /* duration */)
 		return waited, nil
 	}
+	// 普通 work 只需要确保能满足 quorum/必要节点的 token 条件。
+	// Elastic work 更保守：要求所有处于 StateReplicate 的 replicate handles 都可继续，
+	// 避免低优先级 work 把任意一个 follower 的复制流继续压爆。
 	waitForAllReplicateHandles := false
 	if wc == admissionpb.ElasticWorkClass {
 		waitForAllReplicateHandles = true
 	}
+	// 小数组放栈上，避免常见 replica 数量下频繁分配 slice。
 	var handlesScratch [5]tokenWaitingHandleInfo
 	handles := handlesScratch[:]
+	// WaitForEval 内部会用 reflect.Select 等多个 channel；
+	// 这里复用 scratch，减少等待循环中的临时分配。
 	var scratch [7]reflect.SelectCase
 	selectCasesScratch := scratch[:0:cap(scratch)]
 
+	// start 用于统计整个等待耗时，包括后续因为配置/replica 变化导致的 retry。
 	start := rc.opts.Clock.PhysicalTime()
 retry:
 	// Snapshot the waiter sets and the refresh channel.
+	// 拿一份当前 voter/non-voter 等待集合快照。
+	// 后面真正等待时不持有 rc.mu，避免阻塞 Raft 事件更新这些集合。
 	rc.mu.RLock()
 	vss := rc.mu.voterSets
 	nvs := rc.mu.nonVoterSet
@@ -785,6 +806,8 @@ retry:
 
 	if refreshCh == nil {
 		// RangeControllerImpl is closed.
+		// refreshCh 为 nil 表示 RangeController 已关闭。
+		// 关闭中的 controller 不再参与 admission，直接 bypass，让上层走 fallback。
 		waitDuration := rc.opts.Clock.PhysicalTime().Sub(start)
 		if expensiveLoggingEnabled {
 			log.VEventf(ctx, 2,
@@ -795,42 +818,68 @@ retry:
 		return false, nil
 	}
 	for _, vs := range vss {
+		// 一个 voter set 对应一个需要满足 quorum 的副本集合。
+		// quorumCount 是这个集合里提交 Raft entry 所需的多数派数量。
 		quorumCount := (len(vs) + 2) / 2
+		// 已经具备 eval tokens、并且没有本地 send queue 堆积的 voter 数量。
 		votersHaveEvalTokensCount := 0
+		// handles 保存本轮需要等待的 token handle。
+		// 每个 voter set 单独清空重用。
 		handles = handles[:0]
+		// requiredWait 表示即使 quorum 看起来够了，仍然存在必须等待的关键 replica。
+		// 典型关键 replica 是当前 leader 或 leaseholder。
 		requiredWait := false
 		// First check the voter set, which participate in quorum.
 		for _, v := range vs {
+			// 检查这个 voter 的 eval token 是否可用。
+			// handle 如果非空，表示 token 不足时可以等待它被 signal。
 			available, handle := v.evalTokenCounter.TokensAvailable(wc)
 			if available && !v.hasSendQ {
+				// 这个 voter 既有 token，又没有 send queue backlog，
+				// 可以算作“已经满足 quorum 条件”的 voter。
 				votersHaveEvalTokensCount++
 				continue
 			}
 
 			// Don't have eval tokens, and have a handle OR have a send-queue and no handle.
+			//
+			// token 不可用，或者虽然 token 可用但有 send queue backlog，
+			// 都要加入等待候选集合。hasSendQ 会让它不计入 partOfQuorum，
+			// 因为 send queue 堆积也说明复制流没有真正健康。
 			handleInfo := tokenWaitingHandleInfo{
 				handle: handle,
+				// leader/leaseholder 是必须关注的关键 replica。
+				// 对 elastic work，还要求所有 StateReplicate replica 都不能被忽略。
 				requiredWait: v.isLeader || v.isLeaseHolder ||
 					(waitForAllReplicateHandles && v.isStateReplicate),
+				// 没有 send queue 的 voter 才能用于满足 quorum 等待数量。
 				partOfQuorum: !v.hasSendQ,
 			}
 			handles = append(handles, handleInfo)
 			if !requiredWait && handleInfo.requiredWait {
+				// 只要有一个关键 replica 需要等待，整轮就必须等待。
 				requiredWait = true
 			}
 		}
 		// If we don't need to wait for all replicate handles, then we will never
 		// wait the non-voter streams having positive tokens, so we can skip
 		// checking them.
+		//
+		// non-voter 不参与 quorum。普通 work 不需要为了 non-voter 等；
+		// 只有 elastic work 才会要求 StateReplicate 的 non-voter 也别被继续压垮。
 		if waitForAllReplicateHandles {
 			for _, nv := range nvs {
+				// 检查 non-voter 的 eval token。
 				available, handle := nv.evalTokenCounter.TokensAvailable(wc)
 				if available || !nv.isStateReplicate {
 					// Ignore non-voters without tokens which are not in StateReplicate,
 					// as we won't be waiting for them.
+					// token 可用，或者这个 non-voter 不处于 StateReplicate，
+					// 都不需要为它等待。
 					continue
 				}
 				// Don't have eval tokens, and have a handle for the non-voter.
+				// elastic work 下，StateReplicate non-voter token 不足也必须等。
 				handleInfo := tokenWaitingHandleInfo{
 					handle:       handle,
 					requiredWait: true,
@@ -842,11 +891,15 @@ retry:
 					// possible that the leaseholder and leader have tokens, but all
 					// other (non-)voters are not in StateReplicate or have tokens
 					// available.
+					// 标记本轮必须等待，因为至少一个 elastic non-voter 复制流缺 token。
 					requiredWait = true
 				}
 			}
 		}
 
+		// 还差多少个 voter 才能满足 quorum。
+		// 例如 3 voter 的 range quorumCount=2，如果只有 1 个 voter token 可用，
+		// remainingForQuorum=1，说明至少还得等一个 voter 的 token。
 		remainingForQuorum := quorumCount - votersHaveEvalTokensCount
 		if remainingForQuorum < 0 {
 			remainingForQuorum = 0
@@ -863,12 +916,20 @@ retry:
 			// parameter, to output trace statements, since expensiveLoggingEnabled
 			// is a superset of when tracing is enabled (and in a production setting
 			// is likely to be identical, so there isn't much waste).
+			//
+			// 真正进入等待：
+			// - 等 token handle 被 signal。
+			// - 或等配置变化。
+			// - 或等 replica set / waiter set 刷新。
+			// - 或 ctx 被取消。
 			state, selectCasesScratch = WaitForEval(ctx, waitCategoryChangeCh, refreshCh, handles,
 				remainingForQuorum, expensiveLoggingEnabled, selectCasesScratch)
 			switch state {
 			case WaitSuccess:
+				// 当前 voter set 的等待条件满足了，继续检查下一个 voter set。
 				continue
 			case ContextCanceled:
+				// 上层请求超时/取消，不能继续等 token，返回 ctx.Err()。
 				waitDuration := rc.opts.Clock.PhysicalTime().Sub(start)
 				if expensiveLoggingEnabled {
 					log.VEventf(ctx, 2, "r%v/%v canceled request (pri=%v wait-duration=%v)",
@@ -877,9 +938,11 @@ retry:
 				rc.opts.EvalWaitMetrics.OnErrored(wc, waitDuration)
 				return false, ctx.Err()
 			case ConfigRefreshWaitSignaled:
+				// admission 相关配置变化了，重新读取最新配置。
 				waitCategory, waitCategoryChangeCh = rc.opts.WaitForEvalConfig.Current()
 				bypass = waitCategory.Bypass(wc)
 				if bypass {
+					// 新配置已经不要求这类 work 等 token，记录 bypass 后返回。
 					waitDuration := rc.opts.Clock.PhysicalTime().Sub(start)
 					if expensiveLoggingEnabled {
 						log.VEventf(ctx, 2,
@@ -889,17 +952,22 @@ retry:
 					rc.opts.EvalWaitMetrics.OnBypassed(wc, waitDuration)
 					return false, nil
 				}
+				// 新配置仍然需要等待，但等待规则可能变化了，重新构造等待集合。
 				goto retry
 			case ReplicaRefreshWaitSignaled:
+				// replica 集合或 waiter set 变化了，比如 Raft 状态变化、split/merge、
+				// follower 复制状态变化等。重新拿快照，再判断是否仍需要等待。
 				goto retry
 			}
 		}
 	}
+	// 所有 voter set 都满足要求：要么 quorum token 足够，要么关键 replica 也不需要等。
 	waitDuration := rc.opts.Clock.PhysicalTime().Sub(start)
 	// TODO(alyshan): We should have an API to log and additionally record
 	// structured events on the span. Currently this duplicates some info
 	// on the trace since logging calls will record to the span (in verbose mode).
 	if span := tracing.SpanFromContext(ctx); span != nil {
+		// 把等待耗时记录进 tracing span，方便诊断请求为什么卡在 replication admission。
 		span.RecordStructured(&kvpb.QuorumReplicationFlowAdmissionEvent{
 			WaitDurationNanos: waitDuration,
 		})
@@ -908,6 +976,7 @@ retry:
 		log.VEventf(ctx, 2, "r%v/%v admitted request (pri=%v wait-duration=%v wait-for-all=%v)",
 			rc.opts.RangeID, rc.opts.LocalReplicaID, pri, waitDuration, waitForAllReplicateHandles)
 	}
+	// 记录成功通过 eval admission 的指标。
 	rc.opts.EvalWaitMetrics.OnAdmitted(wc, waitDuration)
 	return true, nil
 }

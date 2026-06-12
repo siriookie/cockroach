@@ -6,11 +6,34 @@
       "Bash(ls:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(Get-Content -Raw D:\\\\opensource\\\\cockroach\\\\pkg\\\\kv\\\\kvclient\\\\kvcoord\\\\txn_lock_gatekeeper.go)",
+      "Bash(Format-Hex)",
+      "Bash(Select-Object -First 5)",
+      "PowerShell(Out-File *)",
+      "Bash(./dev build *)",
+      "Bash(go vet *)",
+      "Bash(go build *)",
+      "Bash(gofmt -e D:/opensource/cockroach/pkg/kv/kvclient/kvcoord/txn_lock_gatekeeper.go)",
+      "Bash(gofmt -e D:/opensource/cockroach/pkg/kv/kvclient/kvcoord/transport.go)",
+      "Bash(echo \"exit code: $?\")",
+      "Bash(python3 -c \"print\\('test'\\)\")",
+      "Bash(python -c \"print\\('test'\\)\")",
+      "Bash(python3 *)",
+      "Bash(python docs/tech-notes/append_translation.py)",
+      "Bash(python docs/tech-notes/append_translation2.py)",
+      "Bash(python docs/tech-notes/append_translation3.py)",
+      "Bash(python docs/tech-notes/append_translation4.py)",
+      "Bash(gofmt -e D:/opensource/cockroach/pkg/kv/kvserver/replica_send.go)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(gofmt -e D:/opensource/cockroach/pkg/kv/kvserver/concurrency/concurrency_manager.go)",
+      "Bash(gofmt -e D:/opensource/cockroach/pebble/db.go)",
+      "Bash(gofmt -e D:/opensource/cockroach/pkg/kv/kvserver/replica.go)",
+      "Bash(gofmt -e D:/opensource/cockroach/pkg/kv/kvserver/replica_read.go)"
     ]
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "gopls-mcp"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }
